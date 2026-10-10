@@ -6,12 +6,24 @@
     {
       "source": "api/runtime/v1/sandbox-api.proto",
       "vendored": "sandbox-api.proto",
-      "sha256": "a0053b7d6b5f9f4ce1e344e96741192a98a11e79d6b1cac4d17fea5a36b716ab"
+      "sha256": "329244de71c012d9e32fec111d784af09b86d0052dd12356e514698a771a16e1",
+      "upstream_sha256": "a0053b7d6b5f9f4ce1e344e96741192a98a11e79d6b1cac4d17fea5a36b716ab"
     },
     {
       "source": "LICENSE",
       "vendored": "LICENSE",
       "sha256": "0b81e2ea9cf9c447b3317b84e5bbaca9f3cf98a5d08ef8d754a3286f21c3392a"
     }
-  ]
+  ],
+  "scheduler_extensions": {
+    "repository": "https://github.com/hky1999/sandboxd.git",
+    "revision": "faf0210b2feada672930e4caf99a11a519364055",
+    "source": "api/runtime/v1/sandbox-api.proto",
+    "sha256": "1e62015a43ead81d0976a10e9f902ebaf4399dd9c285a15287cdb6f281121219",
+    "fields": [
+      "CheckpointRequest.checkpoint_id=7",
+      "CheckpointRequest.include_filesystem=8",
+      "CheckpointResponse.success=1"
+    ]
+  }
 }

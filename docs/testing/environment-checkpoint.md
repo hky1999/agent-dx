@@ -6,7 +6,7 @@
 
 1. API Server 从本地缓存解析归属，携带已认证身份、operation ID 和预期状态版本直达 adxlet。
 2. adxlet 串行执行本实例的请求。先确认后端支持 checkpoint，使用 Execd 控制接口准备 checkpoint（配置 runtime_control 时走双向 gRPC，否则走 HTTP），再关闭本机路由。
-3. sandboxd 完成 `leave_running=false` 的完整 checkpoint。确认源执行已停止、删除成功后，释放本机资源。
+3. sandboxd 完成 `leave_running=false` 的完整 checkpoint。当前调度器分支携带固定扩展字段 `checkpoint_id` 与 `include_filesystem=true`，检查点身份取存储分配目录的最后一级名称；只有明确返回 `success=true` 才确认 RPC 完成。未确认完成的调用保持结果未知。确认源执行已停止、删除成功后，释放本机资源。
 4. 存储后端完成制品持久化；adxlet 将 Paused 状态、恢复点和过期时间一次提交给 Coordinator。Coordinator 写入 Redis、释放 Shard 占用并撤销发布路由，API Server 才返回暂停成功。
 5. 恢复时检查过期时间和制品，进行本机资源准入，通过 sandboxd 的 `Start.checkpoint_info` 恢复。后端自行生成物理 ID。
 6. Execd 确认新执行身份、重新开放服务，本机绑定完成后，adxlet 提交 Running。Coordinator 增量恢复 Shard 资源占用、发布新路由。
@@ -35,7 +35,7 @@ adxlet 配置增加可选的 `checkpoint_dir`，例如：
 {"checkpoint_dir": "/opt/adx/data/checkpoints"}
 ```
 
-统一部署配置中填写到 `role: adxlet` 的 `config`。也可设置互斥的 `checkpoint_storage` 选择本地或 S3；两者均未设置时不启用暂停／恢复。该目录必须是 adxlet 与 sandboxd 都可读写、以相同绝对路径访问的节点目录；本地制品需在 adxlet 重启后保留。不要将该目录用作其他组件的文件仓库。
+统一部署配置中填写到 `role: adxlet` 的 `config`。也可设置互斥的 `checkpoint_storage` 选择本地或 S3；两者均未设置时不启用暂停／恢复。使用维护的 sandboxd `faf0210b2feada672930e4caf99a11a519364055` 时，该目录必须位于 sandboxd 的 `rootDir/checkpoints` 下，且为真实目录。该目录必须是 adxlet 与 sandboxd 都可读写、以相同绝对路径访问的节点目录；本地制品需在 adxlet 重启后保留。不要将该目录用作其他组件的文件仓库。
 
 sandboxd 必须支持 checkpoint／restore，并通过 runtime capabilities 提供 Execd 的 checkpoint handoff 和 restore environment 路径。adxlet 从能力信息注入这两个路径。Firecracker 的 Linux/KVM、guest kernel、initrd 和网络条件由运行环境提供；本阶段不会替部署环境启动 sandboxd。
 
@@ -76,3 +76,5 @@ python build/e2e/firecracker/sdk_checkpoint.py \
 用例检查创建、命令与文件、暂停、恢复后的内存计数器和 PID、二进制文件、删除。可通过 `--restart-command` 指定选定 adxlet 的重启及就绪检查脚本，验证暂停期间重启。进程重启脚本属于部署测试夹具，不通过 SDK 实现。
 
 真实 FC 本地验收与 Kubernetes Buildkite 验收分开记录；组件测试通过不表示后者已通过。
+
+本分支对检查点身份、可写文件标志、未确认成功和无身份目录增加本地 RPC 测试。这些检查不证明目标环境的实际暂停恢复，也不证明资源 generation 条件 RPC 已接入；这两项需要独立物理验收和后续控制面扩展。

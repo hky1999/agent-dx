@@ -18,6 +18,7 @@ struct Server {
     requests: Arc<Mutex<Vec<String>>>,
     starts: Arc<Mutex<Vec<StartRequest>>>,
     network_updates: Arc<Mutex<Vec<SetNetworkPolicyRequest>>>,
+    checkpoints: Arc<Mutex<Vec<CheckpointRequest>>>,
     unready: Arc<std::sync::atomic::AtomicUsize>,
     running: Arc<Mutex<bool>>,
     xpu: Arc<Mutex<Vec<XpuAllocation>>>,
@@ -32,6 +33,7 @@ struct Server {
     settled_error: Option<tonic::Code>,
     settled_error_after_start: bool,
     retain_after_delete: bool,
+    checkpoint_success: bool,
 }
 impl Default for Server {
     fn default() -> Self {
@@ -39,6 +41,7 @@ impl Default for Server {
             requests: Arc::default(),
             starts: Arc::default(),
             network_updates: Arc::default(),
+            checkpoints: Arc::default(),
             unready: Arc::default(),
             running: Arc::default(),
             xpu: Arc::default(),
@@ -53,6 +56,7 @@ impl Default for Server {
             settled_error: None,
             settled_error_after_start: false,
             retain_after_delete: false,
+            checkpoint_success: true,
         }
     }
 }
@@ -163,6 +167,7 @@ impl sandbox_service_server::SandboxService for Server {
     ) -> Result<Response<CheckpointResponse>, Status> {
         let r = request.into_inner();
         assert_eq!(r.id, "generated-backend-id");
+        self.checkpoints.lock().unwrap().push(r.clone());
         self.requests
             .lock()
             .unwrap()
@@ -175,7 +180,9 @@ impl sandbox_service_server::SandboxService for Server {
         )
         .unwrap();
         *self.running.lock().unwrap() = r.leave_running;
-        Ok(Response::new(CheckpointResponse {}))
+        Ok(Response::new(CheckpointResponse {
+            success: self.checkpoint_success,
+        }))
     }
     async fn wait(&self, _: Request<WaitRequest>) -> Result<Response<WaitResponse>, Status> {
         Err(Status::unimplemented("unused"))
@@ -1102,6 +1109,60 @@ async fn workload_checkpoint_keeps_backend_running() {
         .unwrap()
         .iter()
         .any(|r| r == "checkpoint:leave_running=true"));
+}
+
+#[tokio::test]
+async fn checkpoint_carries_managed_identity_and_writable_files() {
+    use prost::Message;
+    #[derive(Clone, PartialEq, Message)]
+    struct ManagedCheckpointFields {
+        #[prost(string, tag = "7")]
+        checkpoint_id: String,
+        #[prost(bool, tag = "8")]
+        include_filesystem: bool,
+    }
+    let server = Server::default();
+    let (adapter, _harness) = connect(server.clone()).await;
+    adapter.start(&spec(), "i-1", 1, &[]).await.unwrap();
+    let checkpoint = tempfile::tempdir().unwrap();
+    adapter
+        .checkpoint("i-1", checkpoint.path(), Duration::from_secs(60))
+        .await
+        .unwrap();
+    let requests = server.checkpoints.lock().unwrap();
+    let fields = ManagedCheckpointFields::decode(requests[0].encode_to_vec().as_slice()).unwrap();
+    assert_eq!(
+        fields.checkpoint_id,
+        checkpoint.path().file_name().unwrap().to_str().unwrap()
+    );
+    assert!(fields.include_filesystem);
+}
+
+#[tokio::test]
+async fn checkpoint_requires_confirmed_success() {
+    let server = Server {
+        checkpoint_success: false,
+        ..Default::default()
+    };
+    let (adapter, _harness) = connect(server).await;
+    adapter.start(&spec(), "i-1", 1, &[]).await.unwrap();
+    let checkpoint = tempfile::tempdir().unwrap();
+    assert!(adapter
+        .checkpoint("i-1", checkpoint.path(), Duration::from_secs(60))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn checkpoint_rejects_directory_without_identity_before_rpc() {
+    let server = Server::default();
+    let (adapter, _harness) = connect(server.clone()).await;
+    adapter.start(&spec(), "i-1", 1, &[]).await.unwrap();
+    assert!(adapter
+        .checkpoint("i-1", std::path::Path::new("/"), Duration::from_secs(60))
+        .await
+        .is_err());
+    assert!(server.checkpoints.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

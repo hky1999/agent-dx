@@ -304,10 +304,16 @@ message CheckpointRequest {
   // the runtime. Firecracker maps the values onto its snapshot types;
   // runtimes without incremental checkpoints ignore the field.
   string snapshot_type = 6;
+  // Scheduler-managed artifact identity; fixed extension from sandboxd faf0210b.
+  string checkpoint_id = 7;
+  // Capture the writable filesystem at the same point as process memory.
+  bool include_filesystem = 8;
 }
 
-// CheckpointResponse is empty after the checkpoint artifact is complete.
-message CheckpointResponse {}
+// A managed checkpoint is complete only when success is explicitly confirmed.
+message CheckpointResponse {
+  bool success = 1;
+}
 
 // DeleteRequest describes a force-delete request.
 message DeleteRequest {

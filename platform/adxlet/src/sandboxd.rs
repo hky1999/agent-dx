@@ -1096,6 +1096,14 @@ impl Sandboxd {
                 "absolute checkpoint directory and positive timeout required".into(),
             ));
         }
+        let checkpoint_id = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                Error::Invalid("checkpoint directory needs an artifact identity".into())
+            })?
+            .to_owned();
         let mut state = self.cell(runtime_id).lock_owned().await;
         if matches!(*state, StartState::Uncertain) {
             return Err(unavailable("execution outcome requires reconciliation"));
@@ -1117,6 +1125,8 @@ impl Sandboxd {
             compress: false,
             leave_running,
             snapshot_type: "Full".into(),
+            checkpoint_id,
+            include_filesystem: true,
         });
         // The caller passes the remaining operation budget. Do not add a new
         // transport allowance that would extend the user-visible deadline.
@@ -1126,10 +1136,11 @@ impl Sandboxd {
         *state = StartState::Uncertain;
         tokio::spawn(async move {
             match client.checkpoint(request).await {
-                Ok(_) => {
+                Ok(response) if response.get_ref().success => {
                     *state = StartState::Settled;
                     Ok(())
                 }
+                Ok(_) => Err(unavailable("checkpoint completion was not confirmed")),
                 Err(error) => {
                     if matches!(
                         error.code(),
