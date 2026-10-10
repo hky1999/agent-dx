@@ -264,9 +264,14 @@ fn status(children: &[ManagedService]) -> Value {
 pub async fn run(deployment: Deployment) -> Result<()> {
     deployment.validate()?;
     let guard = acquire_lock(&deployment.state_dir)?;
-    let config_directory = deployment
-        .state_dir
-        .join(format!("config-{}", std::process::id()));
+    // PID values are reused after container or process restarts. Reserve a
+    // separate private parent and preserve it even if rendering fails.
+    let config_directory = tempfile::Builder::new()
+        .prefix(&format!("config-{}-", std::process::id()))
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir_in(&deployment.state_dir)?
+        .keep()
+        .join("services");
     let process_specs = deployment.render(&config_directory)?;
     // Validate the complete executable set before starting anything.
     for process in &process_specs {

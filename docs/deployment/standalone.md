@@ -78,7 +78,7 @@ sudo adxctl status
 
 CLI 为 API Server 注入共享 Redis 地址和 namespace，发现轮询间隔 `config.discovery.poll_seconds` 默认 5 秒，可配置为 1–86400 秒。adxlet 的发现配置采用自身协议，由 CLI 分别生成。
 
-`validate` 校验部署结构和 CLI 约束；TLS 文件内容、组件字段、sandboxd 和网络连通性由组件启动与真实请求检查。sandboxd 可以晚于 supervisor 启动：adxlet 会保持存活并重复等待后端就绪，在此期间不会向 Coordinator 注册或接收新实例；配置错误仍会使进程退出。`render` 的输出目录必须尚不存在；生成目录 0700、文件 0600，可能包含 Redis 连接凭证，不应上传为公开日志。`run`/`start` 都在前台运行 supervisor，systemd 或 Pod 可直接托管该进程。
+`validate` 校验部署结构和 CLI 约束；TLS 文件内容、组件字段、sandboxd 和网络连通性由组件启动与真实请求检查。sandboxd 可以晚于 supervisor 启动：adxlet 会保持存活并重复等待后端就绪，在此期间不会向 Coordinator 注册或接收新实例；配置错误仍会使进程退出。`render` 的输出目录必须尚不存在；生成目录 0700、文件 0600，可能包含 Redis 连接凭证，不应上传为公开日志。`run`/`start` 都在前台运行 supervisor，systemd 或 Pod 可直接托管该进程。 每次启动在 `state_dir` 内原子预留新的 0700 私有配置目录，并在其 `services/` 子目录生成配置；容器或进程 PID 复用不会覆盖旧配置。启动失败时保留配置用于排查，旧目录不自动删除，维护时只清理已经退出且没有服务引用的目录。
 
 状态输出中的 PID 不能代替业务就绪。通过公共 SDK 创建一个小实例、执行命令后显式删除，检查完整调用链：
 

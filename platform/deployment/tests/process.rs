@@ -106,6 +106,69 @@ async fn repeated_exits_keep_restarting_until_recovery_and_scoped_stop() {
     recovery.expect("service must recover after more than six consecutive exits");
 }
 #[tokio::test]
+async fn supervisor_restart_preserves_previous_private_configuration() {
+    let temp = tempfile::Builder::new()
+        .prefix("adx-config-restart-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = temp.path();
+    install_test_binary(root, "adx-coordinator", "#!/bin/sh\nexec sleep 100\n");
+    let services = json!([{"id":"coordinator","role":"coordinator"}]);
+    let deployment = test_deployment(root, services.clone());
+    let state = deployment.state_dir.clone();
+    let previous = state.join(format!("config-{}", std::process::id()));
+    std::fs::create_dir_all(&previous).unwrap();
+    std::fs::set_permissions(&previous, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let sentinel = previous.join("previous-private-config");
+    std::fs::write(&sentinel, b"preserved-private-configuration").unwrap();
+    std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o600)).unwrap();
+    for _ in 0..2 {
+        let mut task = tokio::spawn(supervisor::run(test_deployment(root, services.clone())));
+        tokio::select! {
+            outcome = &mut task => panic!("restart did not become ready: {outcome:?}"),
+            status = wait_until_ready(&state) => {
+                assert!(service_status(&status, "coordinator").get("pid").is_some_and(serde_json::Value::is_number));
+            }
+        }
+        supervisor::request(&state, Request::Stop, Duration::from_secs(5))
+            .await
+            .unwrap();
+        task.await.unwrap().unwrap();
+        assert_eq!(
+            std::fs::read(&sentinel).unwrap(),
+            b"preserved-private-configuration"
+        );
+        assert_eq!(
+            std::fs::metadata(&sentinel).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    let generated = std::fs::read_dir(&state)
+        .unwrap()
+        .filter_map(|entry| {
+            let path = entry.unwrap().path();
+            (path.is_dir()
+                && path != previous
+                && path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("config-")))
+            .then_some(path)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        generated.len(),
+        2,
+        "each successful start owns a separate private configuration"
+    );
+    for path in generated {
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+}
+
+#[tokio::test]
 async fn spawn_failures_keep_retrying_and_clear_failure_after_recovery() {
     let temp_directory = tempfile::Builder::new()
         .prefix("adx-spawn-")

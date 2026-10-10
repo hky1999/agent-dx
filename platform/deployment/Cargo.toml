@@ -30,7 +30,7 @@ tonic = "0.12"
 tower = { version = "0.5", features = ["util"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 libc = "0.2"
+tempfile = "3"
 [dev-dependencies]
 flate2 = "1"
-tempfile = "3"
 tokio-stream = { version = "0.1", features = ["net"] }
