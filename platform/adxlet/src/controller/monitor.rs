@@ -112,8 +112,8 @@ impl Controller {
             }
         } else if self.record.state == EnvironmentState::Failed {
             let held = self.record.resources_held;
-            // Failed creates release capacity independently of backend cleanup.
-            // Retrying cleanup must not delay publication of that released ledger.
+            // An unknown physical outcome continues to own its reservation.
+            // Confirmed cleanup advances the revision before publishing release.
             let cleanup = self.cleanup().await;
             let released = held && !self.record.resources_held;
             if released {

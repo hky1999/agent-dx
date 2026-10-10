@@ -1,6 +1,6 @@
 //! sandboxd PR #56 adapter. The RPC task outlives a canceled caller so cleanup
-//! cannot race its client task. Failed starts are terminal; reconciliation removes
-//! any backend that arrives after the failed create released its reservation.
+//! cannot race its client task. Failed starts are terminal; their reservations
+//! remain held until cleanup confirms removal of the runtime and late starts.
 use crate::RuntimeDriver;
 use adx_core::{EnvironmentSpec, Error, Result};
 use async_trait::async_trait;

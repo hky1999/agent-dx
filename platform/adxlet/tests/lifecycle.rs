@@ -15,6 +15,9 @@ struct Dependencies {
     start_entered: Semaphore,
     start_release: Semaphore,
     block_start: bool,
+    block_cleanup: std::sync::atomic::AtomicBool,
+    cleanup_entered: Semaphore,
+    cleanup_release: Semaphore,
     actual: std::sync::atomic::AtomicBool,
     fail_cleanup: std::sync::atomic::AtomicBool,
 }
@@ -29,6 +32,9 @@ impl Dependencies {
             start_entered: Semaphore::new(0),
             start_release: Semaphore::new(0),
             block_start,
+            block_cleanup: std::sync::atomic::AtomicBool::new(false),
+            cleanup_entered: Semaphore::new(0),
+            cleanup_release: Semaphore::new(0),
             actual: std::sync::atomic::AtomicBool::new(false),
             fail_cleanup: std::sync::atomic::AtomicBool::new(false),
         })
@@ -71,6 +77,10 @@ impl RuntimeDriver for Dependencies {
     }
     async fn remove(&self, _runtime_id: &str) -> Result<()> {
         self.event("remove")?;
+        self.cleanup_entered.add_permits(1);
+        if self.block_cleanup.load(std::sync::atomic::Ordering::SeqCst) {
+            self.cleanup_release.acquire().await.unwrap().forget();
+        }
         self.actual
             .store(false, std::sync::atomic::Ordering::SeqCst);
         Ok(())
@@ -321,7 +331,7 @@ async fn failed_readiness_is_cleaned_before_resources_are_reused() {
     assert!(environment.create().await.is_err());
     assert_eq!(
         *deps.events.lock().unwrap(),
-        ["start", "ready", "commit:Failed", "retire", "remove"]
+        ["start", "ready", "retire", "remove", "commit:Failed"]
     );
     assert_eq!(node.used(), Resources::default());
 }
@@ -368,7 +378,7 @@ async fn failed_create_cleans_late_runtime_after_reservation_was_released() {
 }
 
 #[tokio::test]
-async fn failed_create_releases_reservation_even_when_cleanup_and_commit_fail() {
+async fn failed_create_keeps_reservation_when_cleanup_and_commit_fail() {
     let deps = Dependencies::new(true);
     let node = node(&deps)
         .with_operation_timeout(Duration::from_millis(10))
@@ -378,9 +388,8 @@ async fn failed_create_releases_reservation_even_when_cleanup_and_commit_fail() 
     deps.fail_cleanup
         .store(true, std::sync::atomic::Ordering::SeqCst);
     assert!(environment.create().await.is_err());
-    assert_eq!(node.used(), Resources::default());
-    // Publishing the released reservation is retried even if backend cleanup
-    // continues failing. Neither failure may reclaim another reservation.
+    assert_eq!(node.used(), resources());
+    // Publication may retry, but an unknown physical outcome keeps its budget.
     *deps.fail_at.lock().unwrap() = None;
     deps.events.lock().unwrap().clear();
     assert!(node.monitor_environments().await.is_err());
@@ -392,16 +401,32 @@ async fn failed_create_releases_reservation_even_when_cleanup_and_commit_fail() 
         .any(|e| e == "commit:Failed"));
     let failed = environment.sync().await.unwrap().record;
     assert_eq!(failed.state, EnvironmentState::Failed);
-    assert!(!failed.resources_held);
+    assert!(failed.resources_held);
+    assert_eq!(node.used(), resources());
+    deps.fail_cleanup
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    environment.tick().await.unwrap();
+    let retired = environment.sync().await.unwrap().record;
+    assert!(!retired.resources_held);
+    assert!(retired.revision > failed.revision);
     assert_eq!(node.used(), Resources::default());
 }
 
 #[tokio::test]
-async fn failed_create_releases_scalar_and_devices_before_cleanup_succeeds() {
+async fn failed_create_keeps_scalar_and_devices_until_cleanup_succeeds() {
     use adx_core::scheduling::*;
     for kind in [DeviceKind::Gpu, DeviceKind::Npu] {
         let deps = Dependencies::new(false);
         let node = node(&deps);
+        node.update_capacity(
+            Resources {
+                cpu_millis: 2,
+                memory_bytes: 2048,
+                disk_bytes: 2048,
+            },
+            Duration::from_secs(30),
+        )
+        .unwrap();
         node.update_devices(
             vec![Device {
                 id: 0,
@@ -433,22 +458,26 @@ async fn failed_create_releases_scalar_and_devices_before_cleanup_succeeds() {
         assert!(first.create().await.is_err());
         let failed = first.sync().await.unwrap().record;
         assert_eq!(failed.state, EnvironmentState::Failed);
-        assert!(!failed.resources_held);
-        assert_eq!(node.used(), Resources::default());
-        // The same scalar capacity and physical card are available to another
-        // Environment; repeated cleanup of the failed one must not release them.
+        assert!(failed.resources_held);
+        assert_eq!(node.used(), resources());
+        // Spare scalar capacity cannot make the still-owned card available.
         *deps.fail_at.lock().unwrap() = None;
         first_spec.id = "b".into();
         assigned.environment_id = "b".into();
         let second = node.environment(first_spec, assigned).unwrap();
-        second.create().await.unwrap();
+        assert_eq!(second.create().await.unwrap_err(), Error::NoCapacity);
         assert!(first.tick().await.is_err());
         assert_eq!(node.used(), resources());
         deps.fail_cleanup
             .store(false, std::sync::atomic::Ordering::SeqCst);
         first.tick().await.unwrap();
+        assert_eq!(node.used(), Resources::default());
+        second.create().await.unwrap();
         assert_eq!(node.used(), resources());
         assert!(second.sync().await.unwrap().record.resources_held);
+        assert!(!first.sync().await.unwrap().record.resources_held);
+        second.delete().await.unwrap();
+        assert_eq!(node.used(), Resources::default());
     }
 }
 
@@ -462,7 +491,7 @@ async fn failed_create_cleanup_retries_while_journal_publication_is_unavailable(
     deps.fail_cleanup
         .store(true, std::sync::atomic::Ordering::SeqCst);
     assert!(environment.create().await.is_err());
-    assert_eq!(node.used(), Resources::default());
+    assert_eq!(node.used(), resources());
     *deps.fail_at.lock().unwrap() = Some("commit:Failed".into());
     deps.events.lock().unwrap().clear();
     assert!(node.monitor_environments().await.is_err());
@@ -472,7 +501,7 @@ async fn failed_create_cleanup_retries_while_journal_publication_is_unavailable(
         .unwrap()
         .iter()
         .any(|event| event == "remove"));
-    assert_eq!(node.used(), Resources::default());
+    assert_eq!(node.used(), resources());
 }
 
 #[tokio::test]
@@ -491,7 +520,7 @@ async fn node_without_any_valid_capacity_sample_rejects_new_environments() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn timed_out_start_releases_capacity_before_cleanup() {
+async fn timed_out_start_releases_capacity_after_confirmed_cleanup() {
     let deps = Dependencies::new(true);
     let node = node(&deps)
         .with_operation_timeout(Duration::from_secs(2))
@@ -503,7 +532,7 @@ async fn timed_out_start_releases_capacity_before_cleanup() {
     assert!(task.await.unwrap().is_err());
     assert_eq!(
         *deps.events.lock().unwrap(),
-        ["start", "commit:Failed", "retire", "remove"]
+        ["start", "retire", "remove", "commit:Failed"]
     );
     assert_eq!(node.used(), Resources::default());
 }
@@ -979,4 +1008,60 @@ async fn local_gpu_npu_tokens_transfer_and_stale_release_cannot_free_cards() {
     assert_eq!(next.devices, token.devices);
     manager.release_local("other", &next).unwrap();
     assert_eq!(manager.used(), Resources::default());
+}
+
+#[tokio::test]
+async fn failed_start_keeps_capacity_while_physical_cleanup_is_in_flight() {
+    let deps = Dependencies::new(false);
+    *deps.fail_at.lock().unwrap() = Some("ready".into());
+    deps.block_cleanup
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let node = node(&deps);
+    let first = node.environment(spec("a"), assignment("a")).unwrap();
+    let task = tokio::spawn(async move { first.create().await });
+    deps.cleanup_entered.acquire().await.unwrap().forget();
+    assert!(deps.actual.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(node.used(), resources());
+    let second = node.environment(spec("b"), assignment("b")).unwrap();
+    assert_eq!(second.create().await.unwrap_err(), Error::NoCapacity);
+    assert!(!deps
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|e| e == "commit:Failed"));
+    deps.cleanup_release.add_permits(1);
+    assert!(task.await.unwrap().is_err());
+    assert!(!deps.actual.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(node.used(), Resources::default());
+}
+
+#[tokio::test(start_paused = true)]
+async fn cleanup_timeout_keeps_capacity_until_a_later_confirmed_retirement() {
+    let deps = Dependencies::new(false);
+    *deps.fail_at.lock().unwrap() = Some("ready".into());
+    deps.block_cleanup
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let node = node(&deps)
+        .with_operation_timeout(Duration::from_secs(2))
+        .unwrap();
+    let first = node.environment(spec("a"), assignment("a")).unwrap();
+    let creating = first.clone();
+    let task = tokio::spawn(async move { creating.create().await });
+    deps.cleanup_entered.acquire().await.unwrap().forget();
+    tokio::time::advance(Duration::from_secs(3)).await;
+    assert!(task.await.unwrap().is_err());
+    let unknown = first.sync().await.unwrap().record;
+    assert!(unknown.resources_held);
+    assert_eq!(node.used(), resources());
+    assert!(deps.actual.load(std::sync::atomic::Ordering::SeqCst));
+    deps.block_cleanup
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    *deps.fail_at.lock().unwrap() = None;
+    first.tick().await.unwrap();
+    let retired = first.sync().await.unwrap().record;
+    assert!(!retired.resources_held);
+    assert!(retired.revision > unknown.revision);
+    assert!(!deps.actual.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(node.used(), Resources::default());
 }

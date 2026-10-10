@@ -657,7 +657,6 @@ impl Controller {
             Ok(stages) => stages,
             Err(start_error) => {
                 self.transition(Event::Fail)?;
-                self.release_capacity()?;
                 self.record.restart_pending = restart
                     && !restore_checkpoint
                     && self
@@ -668,8 +667,11 @@ impl Controller {
                         .as_ref()
                         .is_some_and(|p| self.record.restart_attempts < p.max_attempts);
                 self.restart_after = None;
-                let commit = self.sync().await;
+                // A failed start may still have created a physical runtime.
+                // Cleanup releases its reservation only after confirmed removal;
+                // publish that outcome, retaining the reservation if it is unknown.
                 let cleanup = self.cleanup().await;
+                let commit = self.sync().await;
                 return match (cleanup, commit) {
                     (Ok(()), Ok(_)) => Err(start_error),
                     (cleanup, commit) => Err(Error::Unavailable(format!(
