@@ -168,6 +168,9 @@ impl sandbox_service_server::SandboxService for Server {
         let r = request.into_inner();
         assert_eq!(r.id, "generated-backend-id");
         self.checkpoints.lock().unwrap().push(r.clone());
+        std::fs::create_dir(&r.checkpoint_dir).map_err(|_| {
+            Status::failed_precondition("managed checkpoint needs absent destination")
+        })?;
         self.requests
             .lock()
             .unwrap()
@@ -1136,6 +1139,62 @@ async fn checkpoint_carries_managed_identity_and_writable_files() {
         checkpoint.path().file_name().unwrap().to_str().unwrap()
     );
     assert!(fields.include_filesystem);
+}
+
+#[tokio::test]
+async fn checkpoint_releases_only_empty_reserved_destination() {
+    let server = Server::default();
+    let (adapter, _harness) = connect(server.clone()).await;
+    adapter.start(&spec(), "i-1", 1, &[]).await.unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let checkpoint = parent.path().join("reserved-artifact");
+    std::fs::create_dir(&checkpoint).unwrap();
+    adapter
+        .checkpoint("i-1", &checkpoint, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(checkpoint.join("memory")).unwrap(), b"state");
+    assert_eq!(server.checkpoints.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn checkpoint_preserves_nonempty_destination_without_rpc() {
+    let server = Server::default();
+    let (adapter, _harness) = connect(server.clone()).await;
+    adapter.start(&spec(), "i-1", 1, &[]).await.unwrap();
+    let checkpoint = tempfile::tempdir().unwrap();
+    std::fs::write(checkpoint.path().join("existing"), b"owned artifact").unwrap();
+    assert!(adapter
+        .checkpoint("i-1", checkpoint.path(), Duration::from_secs(60))
+        .await
+        .is_err());
+    assert_eq!(
+        std::fs::read(checkpoint.path().join("existing")).unwrap(),
+        b"owned artifact"
+    );
+    assert!(server.checkpoints.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn checkpoint_rejects_symlink_parent_without_removing_target() {
+    let server = Server::default();
+    let (adapter, _harness) = connect(server.clone()).await;
+    adapter.start(&spec(), "i-1", 1, &[]).await.unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let actual = parent.path().join("actual");
+    std::fs::create_dir(&actual).unwrap();
+    std::fs::create_dir(actual.join("reserved")).unwrap();
+    std::os::unix::fs::symlink(&actual, parent.path().join("redirect")).unwrap();
+    assert!(adapter
+        .checkpoint(
+            "i-1",
+            &parent.path().join("redirect/reserved"),
+            Duration::from_secs(60)
+        )
+        .await
+        .is_err());
+    assert!(actual.join("reserved").is_dir());
+    assert!(server.checkpoints.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

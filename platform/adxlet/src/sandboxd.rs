@@ -1112,6 +1112,35 @@ impl Sandboxd {
             return Err(Error::Conflict);
         }
         let id = self.physical_id(runtime_id).await?.ok_or(Error::NotFound)?;
+        // Local storage reserves an empty directory. Managed sandboxd publishes
+        // a fully synced staging directory by rename into an absent destination.
+        // Remove only that empty reservation; never discard a partial artifact
+        // or follow a parent symlink before the backend validates its own root.
+        let parent = path
+            .parent()
+            .ok_or_else(|| Error::Invalid("checkpoint parent is required".into()))?;
+        let canonical_parent = tokio::fs::canonicalize(parent).await.map_err(unavailable)?;
+        if canonical_parent != parent {
+            return Err(Error::Invalid(
+                "checkpoint parent must be canonical without symlinks".into(),
+            ));
+        }
+        match tokio::fs::symlink_metadata(path).await {
+            Ok(metadata) if metadata.is_dir() => {
+                tokio::fs::remove_dir(path).await.map_err(|error| {
+                    Error::Invalid(format!(
+                        "checkpoint destination must be absent or empty: {error}"
+                    ))
+                })?;
+            }
+            Ok(_) => {
+                return Err(Error::Invalid(
+                    "checkpoint destination must be a directory without symlinks".into(),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(unavailable(error)),
+        }
         let mut request = Request::new(proto::CheckpointRequest {
             id,
             checkpoint_dir: path
