@@ -48,17 +48,31 @@ enum StartState {
     Started(IpAddr),
     Settled,
     Failed,
+    // An RPC error cannot prove that a late physical creation is impossible.
+    StartUncertain,
     // Checkpoint may still be executing after its transport failed.
-    Uncertain,
+    CheckpointUncertain,
 }
 type Cell = Arc<tokio::sync::Mutex<StartState>>;
+
+#[derive(Clone)]
+struct BackendIdentity {
+    id: String,
+    resource_generation: String,
+}
+
+const RESOURCE_GENERATION_LABEL: &str = "akernel.scheduler/resource-generation";
+
+fn valid_resource_generation(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_whitespace)
+}
 
 #[derive(Clone)]
 pub struct Sandboxd {
     client: SandboxServiceClient<Channel>,
     config: Config,
     starts: Arc<Mutex<BTreeMap<String, Cell>>>,
-    backend_ids: Arc<Mutex<BTreeMap<String, String>>>,
+    backend_ids: Arc<Mutex<BTreeMap<String, BackendIdentity>>>,
 }
 
 fn unavailable(error: impl std::fmt::Display) -> Error {
@@ -256,10 +270,13 @@ impl Sandboxd {
         if matches!(*state, StartState::Failed) {
             return Err(Error::Conflict);
         }
-        if matches!(*state, StartState::Uncertain) {
+        if matches!(
+            *state,
+            StartState::StartUncertain | StartState::CheckpointUncertain
+        ) {
             return Err(unavailable("start outcome requires reconciliation"));
         }
-        *state = StartState::Failed;
+        *state = StartState::StartUncertain;
         let mut client = self.client.clone();
         let backend_ids = self.backend_ids.clone();
         let logical_id = runtime_id.to_string();
@@ -278,7 +295,13 @@ impl Sandboxd {
                 backend_ids
                     .lock()
                     .expect("shared state lock poisoned")
-                    .insert(logical_id, response.id.clone());
+                    .insert(
+                        logical_id,
+                        BackendIdentity {
+                            id: response.id.clone(),
+                            resource_generation: response.resource_generation.clone(),
+                        },
+                    );
             }
             if response.code != 0 {
                 return Err(unavailable(response.message));
@@ -286,6 +309,12 @@ impl Sandboxd {
             if response.id.is_empty() {
                 return Err(unavailable("Start returned no backend identity"));
             }
+            if !valid_resource_generation(&response.resource_generation) {
+                return Err(unavailable("Start returned no valid resource generation"));
+            }
+            // A completed successful Start has a known incarnation even when
+            // its IP is malformed. Cleanup still requires its retirement receipt.
+            *state = StartState::Failed;
             let ip: IpAddr = response
                 .sandbox_ip
                 .parse()
@@ -332,10 +361,15 @@ impl Sandboxd {
         let response = self
             .client
             .clone()
-            .list(self.request(proto::ListSandboxesRequest {
-                id: physical.clone().unwrap_or_default(),
-                selector,
-            }))
+            .list(
+                self.request(proto::ListSandboxesRequest {
+                    id: physical
+                        .as_ref()
+                        .map(|value| value.id.clone())
+                        .unwrap_or_default(),
+                    selector,
+                }),
+            )
             .await;
         let mut sandboxes = match response {
             Ok(response) => response.into_inner().sandboxes,
@@ -347,6 +381,9 @@ impl Sandboxd {
         let mut discovered = BTreeMap::new();
         for sandbox in &mut sandboxes {
             if !sandbox.labels.contains_key("adx.environment_id") {
+                if !logical_id.is_empty() {
+                    return Err(unavailable("backend lost execution ownership labels"));
+                }
                 continue;
             }
             let environment = &sandbox.labels["adx.environment_id"];
@@ -361,11 +398,22 @@ impl Sandboxd {
                 .get("adx.runtime_id")
                 .filter(|id| adx_core::valid_runtime_id(environment, generation, id))
                 .ok_or_else(|| unavailable("managed runtime has invalid execution labels"))?;
+            let resource_generation = sandbox
+                .labels
+                .get(RESOURCE_GENERATION_LABEL)
+                .filter(|value| valid_resource_generation(value))
+                .ok_or_else(|| unavailable("managed runtime has no valid resource generation"))?;
             if sandbox.id.is_empty()
                 || environment.is_empty()
                 || (!logical_id.is_empty() && logical != logical_id)
                 || discovered
-                    .insert(logical.clone(), sandbox.id.clone())
+                    .insert(
+                        logical.clone(),
+                        BackendIdentity {
+                            id: sandbox.id.clone(),
+                            resource_generation: resource_generation.clone(),
+                        },
+                    )
                     .is_some()
             {
                 return Err(unavailable("ambiguous managed runtime identity"));
@@ -374,33 +422,51 @@ impl Sandboxd {
         }
         let mut ids = self.backend_ids.lock().expect("shared state lock poisoned");
         for (logical, physical) in &discovered {
-            if ids
-                .get(logical)
-                .is_some_and(|previous| previous != physical)
-            {
+            if ids.get(logical).is_some_and(|previous| {
+                previous.id != physical.id
+                    || (!previous.resource_generation.is_empty()
+                        && previous.resource_generation != physical.resource_generation)
+            }) {
                 return Err(unavailable("backend identity changed during execution"));
             }
         }
         ids.extend(discovered);
         Ok(sandboxes)
     }
-    async fn physical_id(&self, logical_id: &str) -> Result<Option<String>> {
-        if let Some(id) = self
+    async fn physical_identity(&self, logical_id: &str) -> Result<Option<BackendIdentity>> {
+        let cached = self
             .backend_ids
             .lock()
             .expect("shared state lock poisoned")
             .get(logical_id)
-            .cloned()
+            .cloned();
+        if cached
+            .as_ref()
+            .is_some_and(|value| valid_resource_generation(&value.resource_generation))
         {
-            return Ok(Some(id));
+            return Ok(cached);
         }
         self.list_id(logical_id).await?;
-        Ok(self
+        let identity = self
             .backend_ids
             .lock()
             .expect("shared state lock poisoned")
             .get(logical_id)
-            .cloned())
+            .cloned();
+        if identity
+            .as_ref()
+            .is_some_and(|value| !valid_resource_generation(&value.resource_generation))
+        {
+            return Err(unavailable("backend resource generation remains unknown"));
+        }
+        Ok(identity)
+    }
+
+    async fn physical_id(&self, logical_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .physical_identity(logical_id)
+            .await?
+            .map(|value| value.id))
     }
 
     pub async fn has_managed_environments(&self) -> Result<bool> {
@@ -1036,29 +1102,27 @@ impl RuntimeDriver for Sandboxd {
 
     async fn remove(&self, runtime_id: &str) -> Result<()> {
         let mut state = self.cell(runtime_id).lock_owned().await;
-        let failed_start = matches!(*state, StartState::Failed);
-        if matches!(*state, StartState::Uncertain) {
-            if self.list_id(runtime_id).await?.is_empty() {
-                return Err(unavailable(
-                    "cannot confirm cleanup while Start outcome is unknown",
-                ));
-            }
-            *state = StartState::Settled;
-        }
-        if let Some(physical) = self.physical_id(runtime_id).await? {
-            match self
+        let failed_start = matches!(*state, StartState::Failed | StartState::StartUncertain);
+        if let Some(physical) = self.physical_identity(runtime_id).await? {
+            let response = self
                 .client
                 .clone()
-                .delete(self.request(proto::DeleteRequest {
-                    id: physical,
-                    timeout: 0,
+                .delete_if_generation(self.request(proto::DeleteIfGenerationRequest {
+                    id: physical.id,
+                    expected_generation: physical.resource_generation.clone(),
                 }))
                 .await
-            {
-                Ok(_) => (),
-                Err(error) if error.code() == Code::NotFound => (),
-                Err(error) => return Err(unavailable(error)),
+                .map_err(unavailable)?
+                .into_inner();
+            if response.retired_generation != physical.resource_generation {
+                return Err(unavailable(
+                    "Delete returned a mismatched retirement receipt",
+                ));
             }
+        } else if !matches!(*state, StartState::Idle | StartState::Failed) {
+            return Err(unavailable(
+                "cannot confirm cleanup while the physical operation outcome is unknown",
+            ));
         }
         if self
             .list_id(runtime_id)
@@ -1066,7 +1130,7 @@ impl RuntimeDriver for Sandboxd {
             .iter()
             .any(|x| x.id == runtime_id)
         {
-            return Err(unavailable("runtime remains after Delete"));
+            return Err(unavailable("runtime remains after conditional Delete"));
         }
         self.backend_ids
             .lock()
@@ -1105,13 +1169,19 @@ impl Sandboxd {
             })?
             .to_owned();
         let mut state = self.cell(runtime_id).lock_owned().await;
-        if matches!(*state, StartState::Uncertain) {
+        if matches!(
+            *state,
+            StartState::StartUncertain | StartState::CheckpointUncertain
+        ) {
             return Err(unavailable("execution outcome requires reconciliation"));
         }
         if matches!(*state, StartState::Failed) {
             return Err(Error::Conflict);
         }
-        let id = self.physical_id(runtime_id).await?.ok_or(Error::NotFound)?;
+        let physical = self
+            .physical_identity(runtime_id)
+            .await?
+            .ok_or(Error::NotFound)?;
         // Local storage reserves an empty directory. Managed sandboxd publishes
         // a fully synced staging directory by rename into an absent destination.
         // Remove only that empty reservation; never discard a partial artifact
@@ -1141,8 +1211,8 @@ impl Sandboxd {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(unavailable(error)),
         }
-        let mut request = Request::new(proto::CheckpointRequest {
-            id,
+        let checkpoint = proto::CheckpointRequest {
+            id: physical.id,
             checkpoint_dir: path
                 .to_str()
                 .ok_or_else(|| Error::Invalid("checkpoint path is not UTF-8".into()))?
@@ -1156,15 +1226,19 @@ impl Sandboxd {
             snapshot_type: "Full".into(),
             checkpoint_id,
             include_filesystem: true,
+        };
+        let mut request = Request::new(proto::CheckpointIfGenerationRequest {
+            checkpoint: Some(checkpoint),
+            expected_generation: physical.resource_generation,
         });
         // The caller passes the remaining operation budget. Do not add a new
         // transport allowance that would extend the user-visible deadline.
         request.set_timeout(duration);
         let mut client = self.client.clone();
         // Retain the operation guard on caller cancellation, as with Start.
-        *state = StartState::Uncertain;
+        *state = StartState::CheckpointUncertain;
         tokio::spawn(async move {
-            match client.checkpoint(request).await {
+            match client.checkpoint_if_generation(request).await {
                 Ok(response) if response.get_ref().success => {
                     *state = StartState::Settled;
                     Ok(())

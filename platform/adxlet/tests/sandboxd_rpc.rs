@@ -19,6 +19,17 @@ struct Server {
     starts: Arc<Mutex<Vec<StartRequest>>>,
     network_updates: Arc<Mutex<Vec<SetNetworkPolicyRequest>>>,
     checkpoints: Arc<Mutex<Vec<CheckpointRequest>>>,
+    conditional_deletes: Arc<Mutex<Vec<DeleteIfGenerationRequest>>>,
+    conditional_checkpoints: Arc<Mutex<Vec<CheckpointIfGenerationRequest>>>,
+    legacy_deletes: Arc<std::sync::atomic::AtomicUsize>,
+    legacy_checkpoints: Arc<std::sync::atomic::AtomicUsize>,
+    resource_generation: Arc<Mutex<String>>,
+    omit_start_generation: bool,
+    omit_inventory_generation: bool,
+    delete_error: Option<tonic::Code>,
+    checkpoint_error: Option<tonic::Code>,
+    lose_delete_reply_once: Arc<std::sync::atomic::AtomicBool>,
+    retired_generation: Option<String>,
     unready: Arc<std::sync::atomic::AtomicUsize>,
     running: Arc<Mutex<bool>>,
     xpu: Arc<Mutex<Vec<XpuAllocation>>>,
@@ -42,6 +53,17 @@ impl Default for Server {
             starts: Arc::default(),
             network_updates: Arc::default(),
             checkpoints: Arc::default(),
+            conditional_deletes: Arc::default(),
+            conditional_checkpoints: Arc::default(),
+            legacy_deletes: Arc::default(),
+            legacy_checkpoints: Arc::default(),
+            resource_generation: Arc::new(Mutex::new("physical-generation-1".into())),
+            omit_start_generation: false,
+            omit_inventory_generation: false,
+            delete_error: None,
+            checkpoint_error: None,
+            lose_delete_reply_once: Arc::default(),
+            retired_generation: None,
             unready: Arc::default(),
             running: Arc::default(),
             xpu: Arc::default(),
@@ -104,6 +126,11 @@ impl sandbox_service_server::SandboxService for Server {
         Ok(Response::new(StartResponse {
             id: "generated-backend-id".into(),
             sandbox_ip: self.ip.clone(),
+            resource_generation: if self.omit_start_generation {
+                String::new()
+            } else {
+                self.resource_generation.lock().unwrap().clone()
+            },
             ..Default::default()
         }))
     }
@@ -111,6 +138,8 @@ impl sandbox_service_server::SandboxService for Server {
         &self,
         request: Request<DeleteRequest>,
     ) -> Result<Response<DeleteResponse>, Status> {
+        self.legacy_deletes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.requests
             .lock()
             .unwrap()
@@ -119,6 +148,42 @@ impl sandbox_service_server::SandboxService for Server {
             *self.running.lock().unwrap() = false;
         }
         Ok(Response::new(DeleteResponse::default()))
+    }
+    async fn delete_if_generation(
+        &self,
+        request: Request<DeleteIfGenerationRequest>,
+    ) -> Result<Response<DeleteIfGenerationResponse>, Status> {
+        let request = request.into_inner();
+        self.conditional_deletes
+            .lock()
+            .unwrap()
+            .push(request.clone());
+        if let Some(code) = self.delete_error {
+            return Err(Status::new(code, "conditional delete did not complete"));
+        }
+        if request.expected_generation != *self.resource_generation.lock().unwrap() {
+            return Err(Status::failed_precondition("physical generation changed"));
+        }
+        assert_eq!(request.id, "generated-backend-id");
+        self.requests
+            .lock()
+            .unwrap()
+            .push(format!("delete:{}", request.id));
+        if !self.retain_after_delete {
+            *self.running.lock().unwrap() = false;
+        }
+        if self
+            .lose_delete_reply_once
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(Status::unavailable("retired but reply lost"));
+        }
+        Ok(Response::new(DeleteIfGenerationResponse {
+            retired_generation: self
+                .retired_generation
+                .clone()
+                .unwrap_or(request.expected_generation),
+        }))
     }
     async fn list(
         &self,
@@ -133,7 +198,13 @@ impl sandbox_service_server::SandboxService for Server {
             }
             return Ok(Response::new(ListSandboxesResponse::default()));
         }
-        let labels = self.labels.lock().unwrap().clone();
+        let mut labels = self.labels.lock().unwrap().clone();
+        if !self.omit_inventory_generation {
+            labels.insert(
+                "akernel.scheduler/resource-generation".into(),
+                self.resource_generation.lock().unwrap().clone(),
+            );
+        }
         if request
             .selector
             .iter()
@@ -165,27 +236,32 @@ impl sandbox_service_server::SandboxService for Server {
         &self,
         request: Request<CheckpointRequest>,
     ) -> Result<Response<CheckpointResponse>, Status> {
-        let r = request.into_inner();
-        assert_eq!(r.id, "generated-backend-id");
-        self.checkpoints.lock().unwrap().push(r.clone());
-        std::fs::create_dir(&r.checkpoint_dir).map_err(|_| {
-            Status::failed_precondition("managed checkpoint needs absent destination")
-        })?;
-        self.requests
+        self.legacy_checkpoints
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.save_checkpoint(request.into_inner())
+            .map_err(|error| *error)
+    }
+    async fn checkpoint_if_generation(
+        &self,
+        request: Request<CheckpointIfGenerationRequest>,
+    ) -> Result<Response<CheckpointResponse>, Status> {
+        let request = request.into_inner();
+        self.conditional_checkpoints
             .lock()
             .unwrap()
-            .push(format!("checkpoint:leave_running={}", r.leave_running));
-        assert_eq!(r.timeout_seconds, 60);
-        assert_eq!(r.snapshot_type, "Full");
-        std::fs::write(
-            std::path::Path::new(&r.checkpoint_dir).join("memory"),
-            b"state",
+            .push(request.clone());
+        if let Some(code) = self.checkpoint_error {
+            return Err(Status::new(code, "conditional checkpoint unavailable"));
+        }
+        if request.expected_generation != *self.resource_generation.lock().unwrap() {
+            return Err(Status::failed_precondition("physical generation changed"));
+        }
+        self.save_checkpoint(
+            request
+                .checkpoint
+                .ok_or_else(|| Status::invalid_argument("checkpoint required"))?,
         )
-        .unwrap();
-        *self.running.lock().unwrap() = r.leave_running;
-        Ok(Response::new(CheckpointResponse {
-            success: self.checkpoint_success,
-        }))
+        .map_err(|error| *error)
     }
     async fn wait(&self, _: Request<WaitRequest>) -> Result<Response<WaitResponse>, Status> {
         Err(Status::unimplemented("unused"))
@@ -221,6 +297,35 @@ impl sandbox_service_server::SandboxService for Server {
             .unwrap()
             .push(request.into_inner());
         Ok(Response::new(SetNetworkPolicyResponse {}))
+    }
+}
+impl Server {
+    fn save_checkpoint(
+        &self,
+        r: CheckpointRequest,
+    ) -> Result<Response<CheckpointResponse>, Box<Status>> {
+        assert_eq!(r.id, "generated-backend-id");
+        self.checkpoints.lock().unwrap().push(r.clone());
+        std::fs::create_dir(&r.checkpoint_dir).map_err(|_| {
+            Box::new(Status::failed_precondition(
+                "managed checkpoint needs absent destination",
+            ))
+        })?;
+        self.requests
+            .lock()
+            .unwrap()
+            .push(format!("checkpoint:leave_running={}", r.leave_running));
+        assert_eq!(r.timeout_seconds, 60);
+        assert_eq!(r.snapshot_type, "Full");
+        std::fs::write(
+            std::path::Path::new(&r.checkpoint_dir).join("memory"),
+            b"state",
+        )
+        .unwrap();
+        *self.running.lock().unwrap() = r.leave_running;
+        Ok(Response::new(CheckpointResponse {
+            success: self.checkpoint_success,
+        }))
     }
 }
 struct Harness {
@@ -573,7 +678,7 @@ async fn cleanup_waits_for_start_after_caller_cancellation() {
 }
 
 #[tokio::test]
-async fn settled_start_errors_release_resources_after_confirmed_cleanup() {
+async fn status_metadata_cannot_prove_absent_start_settlement() {
     for code in [tonic::Code::Unknown, tonic::Code::Internal] {
         for remains in [false, true] {
             let server = Server {
@@ -583,7 +688,11 @@ async fn settled_start_errors_release_resources_after_confirmed_cleanup() {
             };
             let (adapter, _server) = connect(server.clone()).await;
             assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
-            adapter.remove("i-1").await.unwrap();
+            if remains {
+                adapter.remove("i-1").await.unwrap();
+            } else {
+                assert!(adapter.remove("i-1").await.is_err());
+            }
             assert!(!*server.running.lock().unwrap());
             assert_eq!(server.starts.lock().unwrap().len(), 1);
             if remains {
@@ -599,7 +708,7 @@ async fn settled_start_errors_release_resources_after_confirmed_cleanup() {
 }
 
 #[tokio::test]
-async fn failed_start_releases_absent_backend_without_repeating_start() {
+async fn failed_start_holds_absent_backend_without_repeating_start() {
     let server = Server {
         transport_error: true,
         ..Default::default()
@@ -607,12 +716,9 @@ async fn failed_start_releases_absent_backend_without_repeating_start() {
     let (adapter, _server) = connect(server.clone()).await;
     assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
     assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
-    adapter.remove("i-1").await.unwrap();
+    assert!(adapter.remove("i-1").await.is_err());
     assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
-    assert_eq!(
-        *server.requests.lock().unwrap(),
-        vec!["start:", "list:", "list:"]
-    );
+    assert_eq!(*server.requests.lock().unwrap(), vec!["start:", "list:"]);
 }
 
 #[tokio::test]
@@ -623,10 +729,10 @@ async fn late_backend_of_failed_start_is_deleted_not_adopted() {
     };
     let (adapter, _server) = connect(server.clone()).await;
     assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
-    adapter.remove("i-1").await.unwrap();
+    assert!(adapter.remove("i-1").await.is_err());
     *server.running.lock().unwrap() = true;
-    // Reconciliation discovers the original execution after its failed create
-    // released capacity. It cleans that backend rather than repeating Start.
+    // Reconciliation discovers and retires the original execution before its
+    // reservation can be released. It never repeats Start for this execution.
     adapter.remove("i-1").await.unwrap();
     assert!(!*server.running.lock().unwrap());
     assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
@@ -697,7 +803,7 @@ fn lifecycle_assignment() -> Assignment {
 }
 
 #[tokio::test]
-async fn failed_create_monitor_removes_late_backend_after_capacity_release() {
+async fn unknown_start_holds_capacity_until_late_backend_is_retired() {
     let server = Server {
         transport_error: true,
         ..Default::default()
@@ -707,15 +813,23 @@ async fn failed_create_monitor_removes_late_backend_after_capacity_release() {
     let node = lifecycle_node(adapter, &hooks);
     let environment = node.environment(spec(), lifecycle_assignment()).unwrap();
     assert!(environment.create().await.is_err());
-    assert_eq!(node.used(), Resources::default());
-    assert_eq!(
-        environment.sync().await.unwrap().record.state,
-        EnvironmentState::Failed
-    );
+    assert_eq!(node.used(), spec().resources);
+    let failed = environment.sync().await.unwrap().record;
+    assert_eq!(failed.state, EnvironmentState::Failed);
+    assert!(failed.resources_held);
+    let held_revision = failed.revision;
+    // Empty inventory is only a point-in-time observation. The interrupted
+    // daemon operation may still publish the original sandbox later.
+    assert!(node.monitor_environments().await.is_err());
+    assert_eq!(node.used(), spec().resources);
     *server.running.lock().unwrap() = true;
     node.monitor_environments().await.unwrap();
     assert!(!*server.running.lock().unwrap());
     assert_eq!(node.used(), Resources::default());
+    let retired = environment.sync().await.unwrap().record;
+    assert_eq!(retired.state, EnvironmentState::Failed);
+    assert!(!retired.resources_held);
+    assert!(retired.revision > held_revision);
     assert!(environment.create().await.is_err());
     assert_eq!(server.starts.lock().unwrap().len(), 1);
     assert_eq!(
@@ -828,6 +942,174 @@ async fn delete_ack_without_absence_is_not_success() {
 }
 
 #[tokio::test]
+async fn physical_fence_delete_never_falls_back_or_accepts_not_found() {
+    for code in [
+        tonic::Code::Unimplemented,
+        tonic::Code::NotFound,
+        tonic::Code::Unavailable,
+    ] {
+        let server = Server {
+            delete_error: Some(code),
+            ..Default::default()
+        };
+        let (adapter, _harness) = connect(server.clone()).await;
+        adapter.start(&spec(), "i-1", 1, &[]).await.unwrap();
+        assert!(adapter.remove("i-1").await.is_err(), "status {code:?}");
+        assert!(*server.running.lock().unwrap());
+        assert_eq!(
+            server
+                .legacy_deletes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+}
+
+#[tokio::test]
+async fn physical_fence_mismatched_receipt_keeps_capacity_despite_absent_inventory() {
+    let server = Server {
+        retired_generation: Some("other-generation".into()),
+        ..Default::default()
+    };
+    let (adapter, _harness) = connect(server.clone()).await;
+    let hooks = Arc::new(LifecycleHooks::default());
+    let node = lifecycle_node(adapter, &hooks);
+    let environment = node.environment(spec(), lifecycle_assignment()).unwrap();
+    environment.create().await.unwrap();
+    assert!(environment.delete().await.is_err());
+    assert!(!*server.running.lock().unwrap());
+    assert_eq!(node.used(), spec().resources);
+    assert!(environment.sync().await.unwrap().record.resources_held);
+}
+
+#[tokio::test]
+async fn physical_fence_reused_id_cannot_be_deleted_or_checkpointed() {
+    let server = Server::default();
+    let (adapter, _harness) = connect(server.clone()).await;
+    adapter.start(&spec(), "i-1", 1, &[]).await.unwrap();
+    *server.resource_generation.lock().unwrap() = "replacement-generation".into();
+    assert!(adapter.is_running("i-1").await.is_err());
+    assert!(adapter.remove("i-1").await.is_err());
+    let checkpoint = tempfile::tempdir().unwrap();
+    assert!(adapter
+        .checkpoint("i-1", checkpoint.path(), Duration::from_secs(60))
+        .await
+        .is_err());
+    assert!(*server.running.lock().unwrap());
+    assert!(server.checkpoints.lock().unwrap().is_empty());
+    assert_eq!(
+        server
+            .legacy_deletes
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert_eq!(
+        server
+            .legacy_checkpoints
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert_eq!(
+        server.conditional_deletes.lock().unwrap()[0].expected_generation,
+        "physical-generation-1"
+    );
+    assert_eq!(
+        server.conditional_checkpoints.lock().unwrap()[0].expected_generation,
+        "physical-generation-1"
+    );
+}
+
+#[tokio::test]
+async fn physical_fence_missing_start_and_inventory_generation_blocks_cleanup() {
+    let server = Server {
+        omit_start_generation: true,
+        omit_inventory_generation: true,
+        ..Default::default()
+    };
+    let (adapter, _harness) = connect(server.clone()).await;
+    assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
+    assert!(adapter.remove("i-1").await.is_err());
+    assert!(*server.running.lock().unwrap());
+    assert!(server.conditional_deletes.lock().unwrap().is_empty());
+    assert_eq!(
+        server
+            .legacy_deletes
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+}
+
+#[tokio::test]
+async fn missing_start_generation_can_be_reconciled_from_matching_inventory() {
+    let server = Server {
+        omit_start_generation: true,
+        ..Default::default()
+    };
+    let (adapter, _harness) = connect(server.clone()).await;
+    assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
+    adapter.remove("i-1").await.unwrap();
+    assert!(!*server.running.lock().unwrap());
+    assert_eq!(
+        server.conditional_deletes.lock().unwrap()[0].expected_generation,
+        "physical-generation-1"
+    );
+    assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
+    assert_eq!(server.starts.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn lost_delete_response_holds_budget_until_matching_receipt_is_replayed() {
+    let server = Server {
+        lose_delete_reply_once: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        ..Default::default()
+    };
+    let (adapter, _harness) = connect(server.clone()).await;
+    let hooks = Arc::new(LifecycleHooks::default());
+    let node = lifecycle_node(adapter, &hooks);
+    let environment = node.environment(spec(), lifecycle_assignment()).unwrap();
+    environment.create().await.unwrap();
+    assert!(environment.delete().await.is_err());
+    assert!(!*server.running.lock().unwrap());
+    assert_eq!(node.used(), spec().resources);
+    node.monitor_environments().await.unwrap();
+    assert_eq!(node.used(), Resources::default());
+    assert!(!environment.sync().await.unwrap().record.resources_held);
+    let requests = server.conditional_deletes.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], requests[1]);
+    assert_eq!(requests[0].expected_generation, "physical-generation-1");
+    assert_eq!(server.starts.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn conditional_checkpoint_unavailable_never_uses_legacy_mutation() {
+    let server = Server {
+        checkpoint_error: Some(tonic::Code::Unimplemented),
+        ..Default::default()
+    };
+    let (adapter, _harness) = connect(server.clone()).await;
+    adapter.start(&spec(), "i-1", 1, &[]).await.unwrap();
+    let checkpoint = tempfile::tempdir().unwrap();
+    assert!(adapter
+        .checkpoint("i-1", checkpoint.path(), Duration::from_secs(60))
+        .await
+        .is_err());
+    assert!(*server.running.lock().unwrap());
+    assert!(server.checkpoints.lock().unwrap().is_empty());
+    assert_eq!(
+        server
+            .legacy_checkpoints
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert_eq!(
+        server.conditional_checkpoints.lock().unwrap()[0].expected_generation,
+        "physical-generation-1"
+    );
+    adapter.remove("i-1").await.unwrap();
+}
+
+#[tokio::test]
 async fn concrete_gpu_and_npu_cards_reach_the_pinned_backend_protocol() {
     use adx_core::scheduling::*;
     let server = Server::default();
@@ -874,18 +1156,18 @@ async fn concrete_gpu_and_npu_cards_reach_the_pinned_backend_protocol() {
 }
 
 #[tokio::test]
-async fn rejected_start_can_be_cleaned_without_uncertain_outcome() {
+async fn rejected_start_without_physical_receipt_remains_uncertain() {
     let (adapter, _server) = connect(Server {
         settled_error: Some(tonic::Code::InvalidArgument),
         ..Default::default()
     })
     .await;
     assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
-    adapter.remove("i-1").await.unwrap();
+    assert!(adapter.remove("i-1").await.is_err());
 }
 
 #[tokio::test]
-async fn every_start_error_is_failed_and_absence_allows_cleanup() {
+async fn every_start_status_requires_physical_settlement_proof() {
     for code in [
         tonic::Code::InvalidArgument,
         tonic::Code::Unimplemented,
@@ -893,14 +1175,14 @@ async fn every_start_error_is_failed_and_absence_allows_cleanup() {
         tonic::Code::Unauthenticated,
     ] {
         // Every failed create is terminal for this execution identity.
-        // A backend arriving later is handled by reconciliation.
+        // Neither a status code nor empty inventory proves physical settlement.
         let (adapter, _server) = connect(Server {
             unsettled_error: Some(code),
             ..Default::default()
         })
         .await;
         assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
-        adapter.remove("i-1").await.unwrap();
+        assert!(adapter.remove("i-1").await.is_err());
         assert!(
             adapter.start(&spec(), "i-1", 1, &[]).await.is_err(),
             "status {code:?}"

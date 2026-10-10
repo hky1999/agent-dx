@@ -24,8 +24,12 @@ service SandboxService {
   rpc Start(StartRequest) returns (StartResponse) {}
   // Checkpoint saves a running sandbox into a caller-owned directory.
   rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse) {}
+  // Checkpoint one exact server-owned physical incarnation.
+  rpc CheckpointIfGeneration(CheckpointIfGenerationRequest) returns (CheckpointResponse) {}
   // Delete force-deletes a sandbox.
   rpc Delete(DeleteRequest) returns (DeleteResponse) {}
+  // Delete or replay the durable retirement receipt for an exact incarnation.
+  rpc DeleteIfGeneration(DeleteIfGenerationRequest) returns (DeleteIfGenerationResponse) {}
   // Wait waits for a sandbox to exit.
   rpc Wait(WaitRequest) returns (WaitResponse) {}
   // List lists sandboxes by filters.
@@ -285,6 +289,8 @@ message StartResponse {
   string id = 3;
   // SandboxIP is the address assigned to the sandbox network endpoint.
   string sandbox_ip = 4;
+  // Server-owned physical incarnation, independent of ADX ownership generation.
+  string resource_generation = 5;
 }
 
 // CheckpointRequest describes a synchronous checkpoint operation.
@@ -315,6 +321,11 @@ message CheckpointResponse {
   bool success = 1;
 }
 
+message CheckpointIfGenerationRequest {
+  CheckpointRequest checkpoint = 1;
+  string expected_generation = 2;
+}
+
 // DeleteRequest describes a force-delete request.
 message DeleteRequest {
   // ID is the sandbox ID.
@@ -326,6 +337,15 @@ message DeleteRequest {
 
 // DeleteResponse is returned after sandbox delete.
 message DeleteResponse {}
+
+message DeleteIfGenerationRequest {
+  string id = 1;
+  string expected_generation = 2;
+}
+
+message DeleteIfGenerationResponse {
+  string retired_generation = 1;
+}
 
 // WaitRequest describes a sandbox wait request.
 message WaitRequest {
