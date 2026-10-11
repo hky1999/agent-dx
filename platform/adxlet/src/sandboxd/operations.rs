@@ -68,7 +68,10 @@ impl OperationRecord {
         }
         for intent in self.start.iter().chain(self.action.iter()) {
             if uuid::Uuid::parse_str(&intent.id).is_err()
-                || !matches!(intent.kind.as_str(), "start" | "checkpoint" | "delete")
+                || !matches!(
+                    intent.kind.as_str(),
+                    "start" | "start_operation" | "checkpoint" | "delete"
+                )
                 || intent.fingerprint.len() != 64
                 || intent.deadline_unix_millis == 0
                 || !intent.fingerprint.bytes().all(|b| b.is_ascii_hexdigit())
@@ -93,6 +96,10 @@ impl OperationRecord {
             .is_some_and(|backend| valid_resource_generation(&backend.resource_generation));
         if matches!(self.state, StartState::Idle)
             || (matches!(self.state, StartState::StartUncertain) && self.start.is_none())
+            || (matches!(self.state, StartState::NotCreated)
+                && (self.start.is_none()
+                    || self.backend.is_some()
+                    || self.retired_generation.is_some()))
             || (matches!(
                 self.state,
                 StartState::Started(_)

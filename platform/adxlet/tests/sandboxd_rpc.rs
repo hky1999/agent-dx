@@ -1,5 +1,6 @@
 //! Local gRPC/UDS contract tests against the pinned protocol, not sandboxd E2E.
 use adx_core::{Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Resources};
+use adxlet::sandboxd::proto::sandbox_service_server::SandboxService;
 use adxlet::{
     sandboxd::{connect_when_ready, proto::*, start_request, Config, Sandboxd},
     Adxlet, Durability, Readiness, Routes, RuntimeDriver, StateSink,
@@ -45,6 +46,13 @@ struct Server {
     settled_error_after_start: bool,
     retain_after_delete: bool,
     checkpoint_success: bool,
+    untracked_start_service: bool,
+    not_created_on_start: bool,
+    hide_inventory: bool,
+    drop_before_admission: bool,
+    start_operations: Arc<Mutex<Vec<StartOperationRequest>>>,
+    start_queries: Arc<Mutex<Vec<GetStartOperationRequest>>>,
+    start_outcomes: Arc<Mutex<HashMap<String, StartOperationResponse>>>,
 }
 impl Default for Server {
     fn default() -> Self {
@@ -79,11 +87,137 @@ impl Default for Server {
             settled_error_after_start: false,
             retain_after_delete: false,
             checkpoint_success: true,
+            untracked_start_service: false,
+            not_created_on_start: false,
+            hide_inventory: false,
+            drop_before_admission: false,
+            start_operations: Arc::default(),
+            start_queries: Arc::default(),
+            start_outcomes: Arc::default(),
         }
     }
 }
 #[tonic::async_trait]
 impl sandbox_service_server::SandboxService for Server {
+    async fn pause(&self, _: Request<PauseRequest>) -> Result<Response<PauseResponse>, Status> {
+        Err(Status::unimplemented("outside this lifecycle test"))
+    }
+    async fn resume(&self, _: Request<PauseRequest>) -> Result<Response<PauseResponse>, Status> {
+        Err(Status::unimplemented("outside this lifecycle test"))
+    }
+    async fn restore(&self, _: Request<RestoreRequest>) -> Result<Response<StartResponse>, Status> {
+        Err(Status::unimplemented("outside this lifecycle test"))
+    }
+    async fn delete_checkpoint(
+        &self,
+        _: Request<DeleteCheckpointRequest>,
+    ) -> Result<Response<DeleteCheckpointResponse>, Status> {
+        Err(Status::unimplemented("outside this lifecycle test"))
+    }
+    async fn resize_resources(
+        &self,
+        _: Request<ResizeResourcesRequest>,
+    ) -> Result<Response<ResizeResourcesResponse>, Status> {
+        Err(Status::unimplemented("outside this lifecycle test"))
+    }
+    async fn shrink_resources(
+        &self,
+        _: Request<ShrinkResourcesRequest>,
+    ) -> Result<Response<ResizeResourcesResponse>, Status> {
+        Err(Status::unimplemented("outside this lifecycle test"))
+    }
+    async fn start_operation(
+        &self,
+        request: Request<StartOperationRequest>,
+    ) -> Result<Response<StartOperationResponse>, Status> {
+        if self.untracked_start_service {
+            return Err(Status::unimplemented("durable creation is unsupported"));
+        }
+        let request = request.into_inner();
+        self.start_operations.lock().unwrap().push(request.clone());
+        if self
+            .start_outcomes
+            .lock()
+            .unwrap()
+            .get(&request.operation_id)
+            .is_some_and(|outcome| outcome.state == StartOperationState::NotCreated as i32)
+        {
+            return Err(Status::failed_precondition("late creation is sealed"));
+        }
+        if self.drop_before_admission {
+            return Err(Status::unavailable("request lost before durable admission"));
+        }
+        let mut outcome = StartOperationResponse {
+            operation_id: request.operation_id.clone(),
+            request_fingerprint: request.request_fingerprint,
+            deadline_unix_millis: request.deadline_unix_millis,
+            state: StartOperationState::Pending as i32,
+            result: None,
+        };
+        if self.not_created_on_start {
+            outcome.state = StartOperationState::NotCreated as i32;
+            self.start_outcomes
+                .lock()
+                .unwrap()
+                .insert(request.operation_id, outcome.clone());
+            return Ok(Response::new(outcome));
+        }
+        let response = self.start(Request::new(request.start.unwrap())).await;
+        if let Ok(response) = &response {
+            outcome.state = StartOperationState::Started as i32;
+            outcome.result = Some(response.get_ref().clone());
+        } else if *self.running.lock().unwrap() {
+            // The daemon retains completion even if the caller loses its reply.
+            outcome.state = StartOperationState::Started as i32;
+            outcome.result = Some(StartResponse {
+                id: "generated-backend-id".into(),
+                sandbox_ip: self.ip.clone(),
+                resource_generation: self.resource_generation.lock().unwrap().clone(),
+                ..Default::default()
+            });
+        }
+        self.start_outcomes
+            .lock()
+            .unwrap()
+            .insert(request.operation_id, outcome.clone());
+        response.map(|_| Response::new(outcome))
+    }
+    async fn get_start_operation(
+        &self,
+        request: Request<GetStartOperationRequest>,
+    ) -> Result<Response<StartOperationResponse>, Status> {
+        if self.untracked_start_service {
+            return Err(Status::unimplemented("durable creation is unsupported"));
+        }
+        let request = request.into_inner();
+        self.start_queries.lock().unwrap().push(request.clone());
+        let mut outcome = self
+            .start_outcomes
+            .lock()
+            .unwrap()
+            .get(&request.operation_id)
+            .cloned()
+            .unwrap_or(StartOperationResponse {
+                operation_id: request.operation_id,
+                request_fingerprint: request.request_fingerprint,
+                deadline_unix_millis: request.deadline_unix_millis,
+                state: StartOperationState::Unknown as i32,
+                result: None,
+            });
+        let expired = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            >= u128::from(request.deadline_unix_millis);
+        if self.drop_before_admission && request.seal_missing && expired {
+            outcome.state = StartOperationState::NotCreated as i32;
+            self.start_outcomes
+                .lock()
+                .unwrap()
+                .insert(outcome.operation_id.clone(), outcome.clone());
+        }
+        Ok(Response::new(outcome))
+    }
     async fn start(
         &self,
         request: Request<StartRequest>,
@@ -192,7 +326,10 @@ impl sandbox_service_server::SandboxService for Server {
         let request = request.into_inner();
         let id = request.id;
         self.requests.lock().unwrap().push(format!("list:{id}"));
-        if !*self.running.lock().unwrap() || (!id.is_empty() && id != "generated-backend-id") {
+        if self.hide_inventory
+            || !*self.running.lock().unwrap()
+            || (!id.is_empty() && id != "generated-backend-id")
+        {
             if !id.is_empty() {
                 return Err(Status::not_found("sandbox not found"));
             }
@@ -325,6 +462,7 @@ impl Server {
         *self.running.lock().unwrap() = r.leave_running;
         Ok(Response::new(CheckpointResponse {
             success: self.checkpoint_success,
+            ..Default::default()
         }))
     }
 }
@@ -341,6 +479,13 @@ async fn connect(server: Server) -> (Sandboxd, Harness) {
     connect_with_env(server, HashMap::new()).await
 }
 async fn connect_with_env(server: Server, env: HashMap<String, String>) -> (Sandboxd, Harness) {
+    connect_with_timeout(server, env, Duration::from_secs(2)).await
+}
+async fn connect_with_timeout(
+    server: Server,
+    env: HashMap<String, String>,
+    timeout: Duration,
+) -> (Sandboxd, Harness) {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("rpc.sock");
     let listener = UnixListener::bind(&socket).unwrap();
@@ -356,7 +501,7 @@ async fn connect_with_env(server: Server, env: HashMap<String, String>) -> (Sand
         Config {
             env,
             operation_journal: Some(directory.path().join("operations.sqlite")),
-            rpc_timeout: Duration::from_secs(2),
+            rpc_timeout: timeout,
             runtime_logs: Some(adxlet::runtime_logs::RuntimeLogPolicy {
                 directory: directory.path().join("runtime-logs"),
                 ..Default::default()
@@ -381,6 +526,146 @@ async fn discovers_runtime_classes_from_sandboxd_uds() {
         adapter.available_runtime_classes().await.unwrap(),
         ["runsc"]
     );
+}
+#[tokio::test]
+async fn refuses_untracked_start_service_without_creating_physical_execution() {
+    let server = Server {
+        untracked_start_service: true,
+        ..Default::default()
+    };
+    let starts = server.starts.clone();
+    let (adapter, _server) = connect(server).await;
+    let result = adapter.start(&spec(), "i-1", 1, &[]).await;
+    assert!(
+        result.is_err(),
+        "creation requires the durable operation RPC"
+    );
+    assert!(
+        starts.lock().unwrap().is_empty(),
+        "an unsupported service must never receive legacy Start"
+    );
+}
+
+#[tokio::test]
+async fn lost_start_reply_reopens_and_queries_original_identity_before_retirement() {
+    let server = Server {
+        transport_error_after_start: true,
+        hide_inventory: true,
+        ..Default::default()
+    };
+    let (adapter, harness) = connect(server.clone()).await;
+    assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
+    let original = server.start_operations.lock().unwrap()[0].clone();
+    drop(adapter);
+    let adapter = reconnect_with_journal(&harness).await;
+    adapter.remove("i-1").await.unwrap();
+    assert!(!*server.running.lock().unwrap());
+    let query = server.start_queries.lock().unwrap()[0].clone();
+    assert_eq!(query.operation_id, original.operation_id);
+    assert_eq!(query.request_fingerprint, original.request_fingerprint);
+    assert_eq!(query.deadline_unix_millis, original.deadline_unix_millis);
+    assert_eq!(server.starts.lock().unwrap().len(), 1);
+    assert_eq!(
+        server.conditional_deletes.lock().unwrap()[0].expected_generation,
+        "physical-generation-1"
+    );
+    assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
+}
+
+#[tokio::test]
+async fn durably_rejected_start_settles_and_remains_terminal_after_reopen() {
+    let server = Server {
+        not_created_on_start: true,
+        ..Default::default()
+    };
+    let (adapter, harness) = connect(server.clone()).await;
+    assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
+    adapter.remove("i-1").await.unwrap();
+    drop(adapter);
+    let adapter = reconnect_with_journal(&harness).await;
+    adapter.remove("i-1").await.unwrap();
+    assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
+    assert!(server.starts.lock().unwrap().is_empty());
+    assert!(server.conditional_deletes.lock().unwrap().is_empty());
+    assert_eq!(server.start_operations.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn start_query_mismatched_fingerprint_cannot_authorize_retirement() {
+    let server = Server {
+        transport_error_after_start: true,
+        hide_inventory: true,
+        ..Default::default()
+    };
+    let (adapter, _server) = connect(server.clone()).await;
+    assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
+    for outcome in server.start_outcomes.lock().unwrap().values_mut() {
+        outcome.request_fingerprint = "b".repeat(64);
+    }
+    assert!(adapter.remove("i-1").await.is_err());
+    assert!(*server.running.lock().unwrap());
+    assert!(server.conditional_deletes.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn missing_creation_is_sealed_after_deadline_and_late_dispatch_is_rejected() {
+    let server = Server {
+        drop_before_admission: true,
+        ..Default::default()
+    };
+    let (adapter, _server) =
+        connect_with_timeout(server.clone(), HashMap::new(), Duration::from_millis(30)).await;
+    assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
+    assert!(adapter.remove("i-1").await.is_err());
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    adapter.remove("i-1").await.unwrap();
+    let request = server.start_operations.lock().unwrap()[0].clone();
+    let error = server
+        .start_operation(Request::new(request))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(server.starts.lock().unwrap().is_empty());
+    assert!(server
+        .start_queries
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|query| query.seal_missing));
+}
+
+#[tokio::test]
+async fn legacy_unknown_creation_cannot_use_new_protocol_missing_seal() {
+    let server = Server {
+        drop_before_admission: true,
+        ..Default::default()
+    };
+    let (adapter, harness) =
+        connect_with_timeout(server.clone(), HashMap::new(), Duration::from_millis(30)).await;
+    assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
+    drop(adapter);
+    let db =
+        rusqlite::Connection::open(harness._directory.path().join("operations.sqlite")).unwrap();
+    let payload: String = db
+        .query_row(
+            "SELECT payload FROM operations WHERE runtime_id='i-1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut record: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    record["start"]["kind"] = "start".into();
+    db.execute(
+        "UPDATE operations SET payload=?1 WHERE runtime_id='i-1'",
+        [record.to_string()],
+    )
+    .unwrap();
+    drop(db);
+    let adapter = reconnect_with_journal(&harness).await;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert!(adapter.remove("i-1").await.is_err());
+    assert!(!server.start_queries.lock().unwrap()[0].seal_missing);
+    assert!(server.start_outcomes.lock().unwrap().is_empty());
 }
 fn spec() -> EnvironmentSpec {
     EnvironmentSpec {
@@ -843,6 +1128,59 @@ async fn unknown_start_holds_capacity_until_late_backend_is_retired() {
         .unwrap()
         .iter()
         .all(|r| r.state != EnvironmentState::Running));
+}
+
+#[tokio::test]
+async fn durable_non_creation_returns_node_reservation_without_runtime_deletion() {
+    let server = Server {
+        not_created_on_start: true,
+        ..Default::default()
+    };
+    let (adapter, _server) = connect(server.clone()).await;
+    let hooks = Arc::new(LifecycleHooks::default());
+    let node = lifecycle_node(adapter, &hooks);
+    let environment = node.environment(spec(), lifecycle_assignment()).unwrap();
+    assert!(environment.create().await.is_err());
+    assert_eq!(node.used(), Resources::default());
+    let failed = environment.sync().await.unwrap().record;
+    assert_eq!(failed.state, EnvironmentState::Failed);
+    assert!(!failed.resources_held);
+    assert!(server.starts.lock().unwrap().is_empty());
+    assert!(server.conditional_deletes.lock().unwrap().is_empty());
+    assert_eq!(
+        hooks.activations.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+}
+
+#[tokio::test]
+async fn queried_start_with_lost_delete_reply_holds_budget_until_matching_receipt() {
+    let server = Server {
+        transport_error_after_start: true,
+        hide_inventory: true,
+        lose_delete_reply_once: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        ..Default::default()
+    };
+    let (adapter, _server) = connect(server.clone()).await;
+    let hooks = Arc::new(LifecycleHooks::default());
+    let node = lifecycle_node(adapter, &hooks);
+    let environment = node.environment(spec(), lifecycle_assignment()).unwrap();
+    assert!(environment.create().await.is_err());
+    assert!(!*server.running.lock().unwrap());
+    assert_eq!(node.used(), spec().resources);
+    assert!(environment.sync().await.unwrap().record.resources_held);
+    node.monitor_environments().await.unwrap();
+    assert_eq!(node.used(), Resources::default());
+    assert!(!environment.sync().await.unwrap().record.resources_held);
+    let deletes = server.conditional_deletes.lock().unwrap();
+    assert_eq!(deletes.len(), 2);
+    assert_eq!(deletes[0], deletes[1]);
+    assert_eq!(deletes[0].expected_generation, "physical-generation-1");
+    assert_eq!(server.start_queries.lock().unwrap().len(), 1);
+    assert_eq!(
+        hooks.activations.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
 }
 
 #[tokio::test]

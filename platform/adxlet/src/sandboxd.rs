@@ -58,6 +58,7 @@ enum StartState {
     Failed,
     // An RPC error cannot prove that a late physical creation is impossible.
     StartUncertain,
+    NotCreated,
     // Checkpoint may still be executing after its transport failed.
     CheckpointUncertain,
     DeleteUncertain,
@@ -308,12 +309,12 @@ impl Sandboxd {
         let intent = match previous {
             Some(intent) if intent.fingerprint != fingerprint => return Err(Error::Conflict),
             Some(intent) => intent,
-            None => OperationIntent::new("start", fingerprint, self.config.rpc_timeout)?,
+            None => OperationIntent::new("start_operation", fingerprint, self.config.rpc_timeout)?,
         };
         if let StartState::Started(ip) = *state {
             return Ok(ip);
         }
-        if matches!(*state, StartState::Failed) {
+        if matches!(*state, StartState::Failed | StartState::NotCreated) {
             return Err(Error::Conflict);
         }
         if matches!(
@@ -337,16 +338,38 @@ impl Sandboxd {
             .insert(START_OPERATION_LABEL.into(), intent.id.clone());
         // This write completes before dispatch. Cancellation or process loss can
         // leave a conservative unknown intent, never an unrecorded creation.
-        self.persist(runtime_id, &state, Some(intent)).await?;
+        self.persist(runtime_id, &state, Some(intent.clone()))
+            .await?;
         let mut client = self.client.clone();
         let backend_ids = self.backend_ids.clone();
         let logical_id = runtime_id.to_string();
         let adapter = self.clone();
         tokio::spawn(async move {
-            let response = match client.start(request).await {
+            let operation = proto::StartOperationRequest {
+                start: Some(request.into_inner()),
+                operation_id: intent.id.clone(),
+                request_fingerprint: intent.fingerprint.clone(),
+                deadline_unix_millis: intent.deadline_unix_millis,
+            };
+            let outcome = match client.start_operation(adapter.request(operation)).await {
                 Ok(response) => response.into_inner(),
                 Err(error) => return Err(unavailable(error)),
             };
+            let outcome_state = start_operation_state(&intent, &outcome)?;
+            if outcome_state == proto::StartOperationState::NotCreated {
+                *state = StartState::NotCreated;
+                adapter.persist(&logical_id, &state, None).await?;
+                return Err(unavailable("creation was durably rejected before dispatch"));
+            }
+            if !matches!(
+                outcome_state,
+                proto::StartOperationState::Started | proto::StartOperationState::Retired
+            ) {
+                return Err(unavailable("creation outcome requires reconciliation"));
+            }
+            let response = outcome
+                .result
+                .ok_or_else(|| unavailable("creation outcome has no physical identity"))?;
             if !response.id.is_empty() {
                 adx_observability::info!(
                     event = "sandbox_identity_mapped",
@@ -379,6 +402,9 @@ impl Sandboxd {
             // its IP is malformed. Cleanup still requires its retirement receipt.
             *state = StartState::Failed;
             adapter.persist(&logical_id, &state, None).await?;
+            if outcome_state == proto::StartOperationState::Retired {
+                return Err(unavailable("the original creation has already retired"));
+            }
             let ip: IpAddr = response
                 .sandbox_ip
                 .parse()
@@ -572,6 +598,65 @@ impl Sandboxd {
         Ok(identity)
     }
 
+    async fn reconcile_start(
+        &self,
+        runtime_id: &str,
+        state: &mut StartState,
+    ) -> Result<Option<BackendIdentity>> {
+        let intent = self
+            .operations
+            .lock()
+            .map_err(unavailable)?
+            .get(runtime_id)
+            .and_then(|record| record.start.clone())
+            .ok_or_else(|| unavailable("unknown creation has no durable operation identity"))?;
+        let response = self
+            .client
+            .clone()
+            .get_start_operation(self.request(proto::GetStartOperationRequest {
+                operation_id: intent.id.clone(),
+                request_fingerprint: intent.fingerprint.clone(),
+                deadline_unix_millis: intent.deadline_unix_millis,
+                seal_missing: intent.kind == "start_operation",
+            }))
+            .await
+            .map_err(unavailable)?
+            .into_inner();
+        match start_operation_state(&intent, &response)? {
+            proto::StartOperationState::NotCreated => {
+                *state = StartState::NotCreated;
+                self.persist(runtime_id, state, None).await?;
+                Ok(None)
+            }
+            proto::StartOperationState::Started | proto::StartOperationState::Retired => {
+                let result = response
+                    .result
+                    .filter(|result| {
+                        result.code == 0
+                            && !result.id.is_empty()
+                            && valid_resource_generation(&result.resource_generation)
+                    })
+                    .ok_or_else(|| unavailable("creation query has no valid original identity"))?;
+                let identity = BackendIdentity {
+                    id: result.id,
+                    resource_generation: result.resource_generation,
+                };
+                self.backend_ids
+                    .lock()
+                    .map_err(unavailable)?
+                    .insert(runtime_id.into(), identity.clone());
+                // A recovered failed creation is cleanup-only. A historical
+                // STARTED reply cannot turn it into a new successful execution.
+                *state = StartState::Failed;
+                self.persist(runtime_id, state, None).await?;
+                Ok(Some(identity))
+            }
+            proto::StartOperationState::Unknown | proto::StartOperationState::Pending => {
+                Err(unavailable("creation has no final settlement proof"))
+            }
+        }
+    }
+
     async fn physical_id(&self, logical_id: &str) -> Result<Option<String>> {
         Ok(self
             .physical_identity(logical_id)
@@ -615,6 +700,19 @@ impl Sandboxd {
             .map_err(unavailable)?
             .into_inner())
     }
+}
+
+fn start_operation_state(
+    intent: &OperationIntent,
+    response: &proto::StartOperationResponse,
+) -> Result<proto::StartOperationState> {
+    if response.operation_id != intent.id
+        || response.request_fingerprint != intent.fingerprint
+        || response.deadline_unix_millis != intent.deadline_unix_millis
+    {
+        return Err(unavailable("creation operation reply identity mismatch"));
+    }
+    proto::StartOperationState::try_from(response.state).map_err(unavailable)
 }
 
 pub fn start_request(
@@ -1213,7 +1311,16 @@ impl RuntimeDriver for Sandboxd {
     async fn remove(&self, runtime_id: &str) -> Result<()> {
         let mut state = self.cell(runtime_id).lock_owned().await;
         let failed_start = matches!(*state, StartState::Failed | StartState::StartUncertain);
-        if let Some(physical) = self.physical_identity(runtime_id).await? {
+        let mut physical = self.physical_identity(runtime_id).await?;
+        if physical.is_some() && matches!(*state, StartState::NotCreated) {
+            return Err(unavailable(
+                "a rejected creation unexpectedly has a physical execution",
+            ));
+        }
+        if physical.is_none() && matches!(*state, StartState::StartUncertain) {
+            physical = self.reconcile_start(runtime_id, &mut state).await?;
+        }
+        if let Some(physical) = physical {
             let request = proto::DeleteIfGenerationRequest {
                 id: physical.id,
                 expected_generation: physical.resource_generation.clone(),
@@ -1271,13 +1378,15 @@ impl RuntimeDriver for Sandboxd {
                 .or_default()
                 .retired_generation = Some(response.retired_generation);
             self.persist(runtime_id, &state, None).await?;
-        } else if !matches!(*state, StartState::Idle | StartState::Failed)
-            || (self.journal.is_some()
-                && !self
-                    .operations
-                    .lock()
-                    .expect("operation state lock poisoned")
-                    .contains_key(runtime_id))
+        } else if !matches!(
+            *state,
+            StartState::Idle | StartState::Failed | StartState::NotCreated
+        ) || (self.journal.is_some()
+            && !self
+                .operations
+                .lock()
+                .expect("operation state lock poisoned")
+                .contains_key(runtime_id))
         {
             return Err(unavailable(
                 "cannot confirm cleanup while the physical operation outcome is unknown",
@@ -1297,7 +1406,9 @@ impl RuntimeDriver for Sandboxd {
             .remove(runtime_id);
         // A failed create cannot become successful through a retry of the same
         // execution. Keep its identity terminal so a later backend is cleanup-only.
-        *state = if failed_start || self.journal.is_some() {
+        *state = if matches!(*state, StartState::NotCreated) {
+            StartState::NotCreated
+        } else if failed_start || self.journal.is_some() {
             StartState::Failed
         } else {
             StartState::Idle
@@ -1337,7 +1448,7 @@ impl Sandboxd {
         ) {
             return Err(unavailable("execution outcome requires reconciliation"));
         }
-        if matches!(*state, StartState::Failed) {
+        if matches!(*state, StartState::Failed | StartState::NotCreated) {
             return Err(Error::Conflict);
         }
         let physical = self
@@ -1388,6 +1499,7 @@ impl Sandboxd {
             snapshot_type: "Full".into(),
             checkpoint_id,
             include_filesystem: true,
+            ..Default::default()
         };
         let mut request = Request::new(proto::CheckpointIfGenerationRequest {
             checkpoint: Some(checkpoint),

@@ -22,13 +22,34 @@ option go_package = "github.com/inclusionAI/sandboxd/api/runtime/v1;v1";
 service SandboxService {
   // Start creates and starts a sandbox.
   rpc Start(StartRequest) returns (StartResponse) {}
-  // Checkpoint saves a running sandbox into a caller-owned directory.
+  // Creates at most once under a durable operation identity. Never fall back
+  // to Start when this RPC is unsupported or its outcome is unknown.
+  rpc StartOperation(StartOperationRequest) returns (StartOperationResponse) {}
+  // Reads durable historical results. UNKNOWN is not proof of non-creation;
+  // STARTED is not a claim that the original incarnation is currently alive.
+  rpc GetStartOperation(GetStartOperationRequest) returns (StartOperationResponse) {}
+  // Checkpoint saves a running sandbox and stops its source process.
   rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse) {}
-  // Checkpoint one exact server-owned physical incarnation.
+  // Checkpoints only the physical incarnation identified by the nested
+  // request's source sandbox and expected_generation. Fails on old servers
+  // instead of silently ignoring the generation precondition.
   rpc CheckpointIfGeneration(CheckpointIfGenerationRequest) returns (CheckpointResponse) {}
+  // Pause freezes all tasks in a running sandbox without terminating it.
+  // The sandbox keeps its identity, network, and control-plane linkage;
+  // Resume unfreezes it. This is the short-window parking primitive that
+  // preserves broker-level records (unlike Checkpoint, whose source
+  // termination is observed by the broker as sandbox death).
+  rpc Pause(PauseRequest) returns (PauseResponse) {}
+  // Resume unfreezes a previously paused sandbox.
+  rpc Resume(PauseRequest) returns (PauseResponse) {}
+  // Restore restores either a legacy local checkpoint or a verified,
+  // deterministic resume attempt and returns authoritative physical facts.
+  rpc Restore(RestoreRequest) returns (StartResponse) {}
+  // DeleteCheckpoint deletes one exact sandboxd-owned checkpoint artifact.
+  rpc DeleteCheckpoint(DeleteCheckpointRequest) returns (DeleteCheckpointResponse) {}
   // Delete force-deletes a sandbox.
   rpc Delete(DeleteRequest) returns (DeleteResponse) {}
-  // Delete or replay the durable retirement receipt for an exact incarnation.
+  // Fails on old servers instead of silently ignoring a generation precondition.
   rpc DeleteIfGeneration(DeleteIfGenerationRequest) returns (DeleteIfGenerationResponse) {}
   // Wait waits for a sandbox to exit.
   rpc Wait(WaitRequest) returns (WaitResponse) {}
@@ -36,10 +57,57 @@ service SandboxService {
   rpc List(ListSandboxesRequest) returns (ListSandboxesResponse) {}
   // Stats returns resource usage statistics for a sandbox.
   rpc Stats(StatsRequest) returns (StatsResponse) {}
+  // Apply a scheduler-approved monotonic increase with incarnation and limit checks.
+  rpc ResizeResources(ResizeResourcesRequest) returns (ResizeResourcesResponse) {}
+  // Apply a scheduler-approved memory decrease for one incarnation. The CPU
+  // numbers must equal the live limits; the daemon freezes the sandbox's host
+  // cgroup for the write window and never changes the scheduler lifecycle.
+  rpc ShrinkResources(ShrinkResourcesRequest) returns (ResizeResourcesResponse) {}
   // ListAvailableRuntimes lists runtime classes whose handlers are ready.
   rpc ListAvailableRuntimes(ListAvailableRuntimesRequest) returns (ListAvailableRuntimesResponse) {}
   // SetNetworkPolicy atomically replaces the network policy of a running sandbox.
   rpc SetNetworkPolicy(SetNetworkPolicyRequest) returns (SetNetworkPolicyResponse) {}
+}
+
+message StartOperationRequest {
+  StartRequest start = 1;
+  string operation_id = 2;
+  // Opaque full-request SHA256 supplied by the caller. The daemon separately
+  // hashes the complete nested protobuf request to detect changed payloads.
+  string request_fingerprint = 3;
+  uint64 deadline_unix_millis = 4;
+}
+
+message GetStartOperationRequest {
+  string operation_id = 1;
+  string request_fingerprint = 2;
+  uint64 deadline_unix_millis = 3;
+  // Explicitly fence a never-admitted operation after its deadline. A healthy
+  // admission index and authoritative physical checks are required. Callers
+  // must not enable this for operations sent through legacy Start.
+  bool seal_missing = 4;
+}
+
+enum StartOperationState {
+  START_OPERATION_STATE_UNKNOWN = 0;
+  START_OPERATION_STATE_PENDING = 1;
+  START_OPERATION_STATE_STARTED = 2;
+  // Durable rejection before physical side effects; later identical requests
+  // replay this outcome and cannot dispatch a creation.
+  START_OPERATION_STATE_NOT_CREATED = 3;
+  // Only a matching completed generation-conditional retirement receipt
+  // authorizes this outcome. Absence alone never authorizes it.
+  START_OPERATION_STATE_RETIRED = 4;
+}
+
+message StartOperationResponse {
+  string operation_id = 1;
+  string request_fingerprint = 2;
+  uint64 deadline_unix_millis = 3;
+  StartOperationState state = 4;
+  // Original bound sandbox ID and generation, including for PENDING/RETIRED.
+  // A successful result also retains its original IP and ports.
+  StartResponse result = 5;
 }
 
 // NetworkPolicyAction is the action selected by a network policy rule.
@@ -89,13 +157,12 @@ message NetworkEndpoint {
   PortRange port_range = 5;
 }
 
-// PortRange is an inclusive TCP or UDP port interval.
+// TrafficRule describes one ingress or egress packet rule.
 message PortRange {
   uint32 first = 1;
   uint32 last  = 2;
 }
 
-// TrafficRule describes one ingress or egress packet rule.
 message TrafficRule {
   NetworkPolicyAction action = 1;
   NetworkDirection direction = 2;
@@ -112,9 +179,8 @@ message TrafficRule {
   uint32 priority = 7;
 }
 
-// TrafficPolicy controls IPv4 packets crossing a sandbox's host endpoint.
+// TrafficPolicy controls IPv4 packets crossing a sandbox's host veth.
 message TrafficPolicy {
-  // DefaultAction is the shared ingress and egress default in schema v1.
   NetworkPolicyAction default_action = 1;
   repeated TrafficRule rules         = 2;
   TrafficPolicyMode mode             = 3;
@@ -139,9 +205,6 @@ message DNSPolicy {
 message NetworkPolicy {
   TrafficPolicy traffic = 1;
   DNSPolicy dns         = 2;
-  // SchemaVersion is omitted for the legacy exact-address schema. Version 2
-  // enables CIDRs, domain peers, port ranges, priorities, and independent
-  // ingress and egress defaults.
   uint32 schema_version = 3;
 }
 
@@ -217,13 +280,13 @@ message XpuAllocation {
   repeated uint32 device_ids = 2;
 }
 
-// CheckpointInfo selects checkpoint restore mode for Start.
+// StartRequest describes a sandbox start request.
+// CheckpointInfo references a previously published checkpoint for a
+// cooperative restore during Start (upstream contract).
 message CheckpointInfo {
-  // CheckpointDir is the caller-owned directory containing runtime artifacts.
   string checkpoint_dir = 1;
 }
 
-// StartRequest describes a sandbox start request.
 message StartRequest {
   // SandboxID is an optional caller-provided sandbox ID. sandboxd generates one when empty.
   string sandbox_id = 1;
@@ -270,12 +333,7 @@ message StartRequest {
   // NetworkPolicy is the sandbox's initial packet and DNS policy. It can be
   // replaced while the sandbox is running with SetNetworkPolicy.
   NetworkPolicy network_policy = 20;
-  // CheckpointInfo restores the new sandbox from caller-owned runtime artifacts.
   CheckpointInfo checkpoint_info = 21;
-  // InjectEntrypoint is the absolute in-sandbox path where sandboxd injects
-  // the effective Entrypoint/Cmd configuration from an OCI or Nydus image
-  // rootfs. Empty disables injection. It does not replace the sandbox's own
-  // command.
   string inject_entrypoint = 22;
 }
 
@@ -287,43 +345,87 @@ message StartResponse {
   string message = 2;
   // ID is the unique sandbox ID.
   string id = 3;
-  // SandboxIP is the address assigned to the sandbox network endpoint.
+  // Address assigned to the sandbox network endpoint (agent-dx upstream field).
   string sandbox_ip = 4;
-  // Server-owned physical incarnation, independent of ADX ownership generation.
+  // Physical incarnation assigned by the daemon when this sandbox was created.
   string resource_generation = 5;
+  // Concrete mappings; moved from 4 to 6 in the agent-dx scheduler branch.
+  // This branch intentionally does not preserve the YuanRong ports-at-4 contract.
+  repeated string ports = 6;
 }
 
-// CheckpointRequest describes a synchronous checkpoint operation.
+// CheckpointRequest preserves agent-dx upstream fields 1-6. Scheduler
+// extensions start at 7; old YuanRong request numbers are not accepted here.
 message CheckpointRequest {
-  // ID is the source sandbox ID.
   string id = 1;
-  // CheckpointDir is an absolute caller-owned output directory.
   string checkpoint_dir = 2;
-  // TimeoutSeconds bounds the complete checkpoint operation and must be non-zero.
   uint32 timeout_seconds = 3;
-  // Compress enables runtime-supported checkpoint compression.
   bool compress = 4;
-  // LeaveRunning keeps the source sandbox running after a successful checkpoint.
   bool leave_running = 5;
-  // SnapshotType requests a specific checkpoint flavor: Full, Incremental,
-  // or SoftDirty. Empty (the default) leaves the automatic tier selection to
-  // the runtime. Firecracker maps the values onto its snapshot types;
-  // runtimes without incremental checkpoints ignore the field.
   string snapshot_type = 6;
-  // Scheduler-managed artifact identity; fixed extension from sandboxd faf0210b.
+  // Immutable scheduler artifact identity.
   string checkpoint_id = 7;
-  // Capture the writable filesystem at the same point as process memory.
+  // Capture writable files at the same consistency point as memory state.
   bool include_filesystem = 8;
+  string trace_id = 9;
+  // Legacy internal timeout alias; new clients use timeout_seconds at 3.
+  int64 timeout = 10;
 }
 
-// A managed checkpoint is complete only when success is explicitly confirmed.
+// CheckpointResponse is returned after the checkpoint artifact is published.
 message CheckpointResponse {
   bool success = 1;
+  string message = 2;
+  string artifact_path = 3;
+  int64 artifact_size = 4;
+  string artifact_sha256 = 5;
+  // Physical lifetime bound to the published source manifest; empty for legacy artifacts.
+  string source_generation = 6;
 }
 
+// CheckpointIfGenerationRequest checkpoints one exact physical incarnation.
 message CheckpointIfGenerationRequest {
+  // Checkpoint is the checkpoint command for the source sandbox.
   CheckpointRequest checkpoint = 1;
+  // ExpectedGeneration must equal the source sandbox's current
+  // akernel.scheduler/resource-generation value at checkpoint time.
   string expected_generation = 2;
+}
+
+// PauseRequest targets one running sandbox. Resume takes the same shape.
+message PauseRequest {
+  // SandboxID is the sandbox to freeze or unfreeze.
+  string id = 1;
+  string trace_id = 2;
+}
+
+// PauseResponse is empty once the freeze (or unfreeze) has taken effect.
+message PauseResponse {}
+
+// DeleteCheckpointRequest binds cleanup to one committed physical artifact.
+message DeleteCheckpointRequest {
+  string checkpoint_dir = 1;
+  string checkpoint_id = 2;
+  string source_sandbox_id = 3;
+  int64 expected_size = 4;
+  string expected_sha256 = 5;
+}
+
+// DeleteCheckpointResponse is empty after an exact or already-complete delete.
+message DeleteCheckpointResponse {}
+
+// RestoreRequest preserves the legacy config/checkpoint_dir wire fields and
+// adds the immutable identity required by deterministic cross-node resume.
+message RestoreRequest {
+  StartRequest config = 1;
+  string checkpoint_dir = 2;
+  // CheckpointID identifies the immutable logical snapshot. When set, all
+  // deterministic identity fields are required.
+  string checkpoint_id = 3;
+  // ExpectedSHA256 binds the caller-owned artifact to SnapshotInfo.
+  string expected_sha256 = 4;
+  // ExpectedSize binds the caller-owned artifact to SnapshotInfo.
+  int64 expected_size = 5;
 }
 
 // DeleteRequest describes a force-delete request.
@@ -337,15 +439,6 @@ message DeleteRequest {
 
 // DeleteResponse is returned after sandbox delete.
 message DeleteResponse {}
-
-message DeleteIfGenerationRequest {
-  string id = 1;
-  string expected_generation = 2;
-}
-
-message DeleteIfGenerationResponse {
-  string retired_generation = 1;
-}
 
 // WaitRequest describes a sandbox wait request.
 message WaitRequest {
@@ -379,6 +472,11 @@ message ListSandboxesResponse {
 
 // SandboxState is the persisted lifecycle state of a sandbox.
 enum SandboxState {
+  reserved 3 to 5;
+  reserved "SANDBOX_STATE_CHECKPOINTING";
+  reserved "SANDBOX_STATE_CHECKPOINTED";
+  reserved "SANDBOX_STATE_RESTORING";
+
   SANDBOX_STATE_RUNNING = 0;
   SANDBOX_STATE_EXITED  = 1;
   SANDBOX_STATE_UNKNOWN = 2;
@@ -416,6 +514,13 @@ message SandboxStatus {
   LinuxSandboxResources resources = 14;
   // MetricLabels contains sandbox metadata intended for metric dimensions.
   map<string, string> metric_labels = 15;
+  // Ports contains the concrete host/container mappings owned by this sandbox.
+  repeated string ports = 16;
+  // Ip is the sandbox's IP inside the sandboxd bridge (W18: the LLM proxy
+  // sees this as the connection source after the host routes 10.88/16;
+  // resolvers join it back to this sandbox). Empty when network resources
+  // are absent (e.g. DisableCgroup/debug sandboxes).
+  string ip = 17;
 }
 
 // KeyValue represents a string key-value pair.
@@ -458,6 +563,17 @@ message HugepageLimit {
   uint64 limit = 2;
 }
 
+// SandboxPhysicalPhase records whether a sandbox's durable physical facts are
+// complete enough to publish through List/Inspect.
+enum SandboxPhysicalPhase {
+  // UNSPECIFIED is reserved for metadata written before physical phases were introduced.
+  SANDBOX_PHYSICAL_PHASE_UNSPECIFIED = 0;
+  // INTENT may own resources but is not a published physical sandbox.
+  SANDBOX_PHYSICAL_PHASE_INTENT = 1;
+  // COMMITTED has a materialized runtime, spec, resources, filesystem and network facts.
+  SANDBOX_PHYSICAL_PHASE_COMMITTED = 2;
+}
+
 // SandboxMetadata contains the persisted metadata for a sandbox.
 message SandboxMetadata {
   // ID is the sandbox ID.
@@ -472,6 +588,15 @@ message SandboxMetadata {
   string stderr = 7;
   // MetricLabels contains sandbox metadata intended for metric dimensions.
   map<string, string> metric_labels = 8;
+  // Ports contains the concrete host/container mappings persisted with the sandbox.
+  repeated string ports = 9;
+  // PhysicalPhase controls whether this physical record is publishable.
+  SandboxPhysicalPhase physical_phase = 10;
+  // RestoreIdentity is present only for sandboxes created by Restore.
+  RestoreIdentity restore_identity = 11;
+  // ResourceFacts contains sandboxd-owned cgroup, interface and other physical
+  // allocations needed to clean an INTENT even before an OCI spec exists.
+  map<string, string> resource_facts = 12;
 }
 
 // SandboxMetadataList contains persisted sandbox metadata entries.
@@ -500,14 +625,82 @@ message StatsResponse {
   uint64 cpu_kernel_ns = 5;
   // CPU usage in user mode in nanoseconds.
   uint64 cpu_user_ns = 6;
+  // Effective cgroup CPU quota/period in microseconds. Quota -1 is unlimited.
+  // A false known flag distinguishes unsupported/missing readings from zero.
+  int64 cpu_quota_usec = 7;
+  uint64 cpu_period_usec = 8;
+  bool cpu_limits_known = 9;
+
+  // Server-owned physical incarnation; changes whenever an ID is recreated.
+  string resource_generation = 10;
+  // Persisted elastic initial/ceiling policy, empty for non-elastic sandboxes.
+  string elastic_policy = 11;
+  // Cumulative pressure counters for this physical generation; false means unknown.
+  bool cpu_pressure_known = 12;
+  uint64 cpu_periods = 13;
+  uint64 cpu_throttled_periods = 14;
+  uint64 cpu_throttled_ns = 15;
+  bool memory_pressure_known = 16;
+  uint64 memory_high_events = 17;
+  uint64 memory_oom_events = 18;
+  uint64 memory_oom_kill_events = 19;
+
+  // Source validity of the matching numeric field: true only when the daemon
+  // parsed the exact kernel cgroup file (cpu.stat usage_usec, memory.current,
+  // memory.max, memory.peak) under strict bounded rules. False covers missing,
+  // malformed, or overflowing sources and the cgroup v1 backend, which cannot
+  // prove source presence; the legacy numeric fallback may still be populated,
+  // so consumers must consult the flag before trusting the number. Servers
+  // predating these fields default them to false for the same reason.
+  bool cpu_usage_known = 20;
+  bool memory_usage_known = 21;
+  bool memory_limit_known = 22;
+  // memory_max_usage_bytes is a measured memory.peak only when this is true;
+  // otherwise the server may have substituted current usage as the legacy
+  // fallback, which is not an observed peak.
+  bool memory_peak_known = 23;
+
+  // Monotonic per-incarnation resource revision. It starts at 1 when the
+  // physical incarnation is created and advances by one for every accepted
+  // grow/shrink operation, including partially applied ones; resource_revision
+  // itself is only a proven fact when resource_revision_known is true. An
+  // incarnation whose state is unknown (created before this contract, or a
+  // damaged record) reports false and rejects revision-conditioned operations
+  // rather than guessing an initial value.
+  uint64 resource_revision = 24;
+  bool resource_revision_known = 25;
+  // Enforced memory.high observation. unlimited has its own flag instead of
+  // masquerading as a finite 0; a false known flag means the number is unknown
+  // or belongs to the cgroup v1 backend, which has no memory.high.
+  uint64 memory_high_bytes = 26;
+  bool memory_high_known = 27;
+  bool memory_high_unlimited = 28;
+  // Kernel-observed frozen state of the sandbox's host cgroup (cgroup.events
+  // frozen). It is the freeze fact, not the freeze request.
+  bool frozen = 29;
+  bool frozen_known = 30;
+  // Operation identity of the last journal-recorded resource operation for
+  // this incarnation. The controller closes an UNKNOWN outcome only by
+  // matching this operation_id at the post-operation revision with
+  // resource_operation_pending false and correct, unfrozen limits; an equal
+  // target number alone never closes it.
+  string resource_operation_id = 31;
+  bool resource_operation_pending = 32;
+  // Absolute cgroup v2 directory behind this Stats read, proven by the
+  // daemon under the same physical lock as the resource revision identity.
+  // Empty when the backend cannot prove one (cgroup v1) or the incarnation's
+  // revision state does not verify. It is a read-only locator for event
+  // watchers; it is never a write target and never replaces the revision
+  // journal's identity verification.
+  string memory_cgroup_path = 33;
 }
 
 // ListAvailableRuntimesRequest requests the runtime classes currently available
 // for new sandbox creation.
 message ListAvailableRuntimesRequest {}
 
-// RuntimeInfo describes one initialized runtime handler and its optional
-// checkpoint/restore application handoff interface.
+// ListAvailableRuntimesResponse contains the available runtime class snapshot.
+// RuntimeInfo describes one runtime handler's capabilities.
 message RuntimeInfo {
   // RuntimeClass is the handler name accepted by sandbox start requests.
   string runtime_class = 1;
@@ -519,11 +712,77 @@ message RuntimeInfo {
   string restore_env_path = 4;
 }
 
-// ListAvailableRuntimesResponse contains the available runtime class snapshot.
 message ListAvailableRuntimesResponse {
   // RuntimeClasses contains the sorted handler names accepted by sandbox start requests.
   // Configured runtime classes whose handlers failed to initialize are excluded.
   repeated string runtime_classes = 1;
   // Runtimes contains detailed capabilities in runtime_classes order.
   repeated RuntimeInfo runtimes = 2;
+}
+
+// RestoreIdentity binds a deterministic target sandbox to one exact restore request.
+message RestoreIdentity {
+  // CheckpointID is the opaque checkpoint artifact identity.
+  string checkpoint_id = 1;
+  // RequestSHA256 is the digest of the normalized logical restore request.
+  string request_sha256 = 2;
+}
+
+// ResourceLimits uses kernel cgroup units and finite, positive limits only.
+message ResourceLimits {
+  int64 cpu_quota_usec = 1;
+  uint64 cpu_period_usec = 2;
+  uint64 memory_limit_bytes = 3;
+}
+
+// The scheduler must reserve node capacity before sending this request. A
+// transport failure is an uncertain outcome: retain reservation until Stats
+// reconciles it. Matching target retries are idempotent within an incarnation.
+// The operation_id binds the full request fingerprint (identity, revision,
+// numbers, deadline, type); the same ID replays only its recorded outcome and
+// a different fingerprint under the same ID is rejected. expected_revision
+// must equal the incarnation's current resource revision; a request without a
+// proven revision is rejected instead of silently skipping the compare.
+message ResizeResourcesRequest {
+  string sandbox_id = 1;
+  string resource_generation = 2;
+  ResourceLimits expected = 3;
+  ResourceLimits target = 4;
+  // Required absolute command expiry, checked again under the resource lock.
+  int64 deadline_unix_ms = 5;
+  string operation_id = 6;
+  uint64 expected_revision = 7;
+}
+
+// ShrinkResources carries the same field contract as ResizeResources. It is a
+// separate operation type in the fingerprint and on the wire: memory may only
+// decrease and the CPU numbers must equal the live limits exactly. The
+// response reuses ResizeResourcesResponse without changing the independent
+// operation semantics.
+message ShrinkResourcesRequest {
+  string sandbox_id = 1;
+  string resource_generation = 2;
+  ResourceLimits expected = 3;
+  ResourceLimits target = 4;
+  // Required absolute command expiry, checked again under the resource lock.
+  int64 deadline_unix_ms = 5;
+  string operation_id = 6;
+  uint64 expected_revision = 7;
+}
+
+message ResizeResourcesResponse {
+  StatsResponse actual = 1;
+  // Complete includes successful soft-limit application and hard-limit readback.
+  bool complete = 2;
+  // A partial write is returned with actual limits, never disguised as no-op.
+  string update_error = 3;
+}
+
+// Deletes only the physical incarnation identified by expected_generation.
+message DeleteIfGenerationRequest {
+  string id = 1;
+  string expected_generation = 2;
+}
+message DeleteIfGenerationResponse {
+  string retired_generation = 1;
 }
