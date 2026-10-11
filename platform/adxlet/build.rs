@@ -7,6 +7,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let file = directory.join("sandbox-api.proto");
     println!("cargo:rerun-if-changed={}", file.display());
-    tonic_build::configure().compile_protos(&[file], &[directory])?;
+    tonic_build::configure()
+        .type_attribute(".", "#[derive(serde::Serialize)]")
+        .compile_protos(&[file], &[directory])?;
     Ok(())
 }

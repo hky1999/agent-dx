@@ -268,6 +268,7 @@ add(
         'proxy_address': f'{host}:18443',
         'tls': tls('node' if node == 'node1' else 'node2', {'coordinator': 'coordinator', 'apiserver': 'apiserver'}),
         'sandboxd_socket': str(R / 'sandboxd.sock'),
+        'sandboxd_operation_journal': str(R / 'operations' / 'sandboxd.sqlite'),
         'proxy_socket': str(P / 'proxy/route.sock'),
         'resource_source': {'kind': 'sandboxd', 'socket': str(P / 'resource.sock'), 'valid_for_seconds': 6},
         'degradation_journal': str(P / 'degraded/results.sqlite'),

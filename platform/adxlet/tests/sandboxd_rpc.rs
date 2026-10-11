@@ -355,6 +355,7 @@ async fn connect_with_env(server: Server, env: HashMap<String, String>) -> (Sand
         socket,
         Config {
             env,
+            operation_journal: Some(directory.path().join("operations.sqlite")),
             rpc_timeout: Duration::from_secs(2),
             runtime_logs: Some(adxlet::runtime_logs::RuntimeLogPolicy {
                 directory: directory.path().join("runtime-logs"),
@@ -842,6 +843,227 @@ async fn unknown_start_holds_capacity_until_late_backend_is_retired() {
         .unwrap()
         .iter()
         .all(|r| r.state != EnvironmentState::Running));
+}
+
+#[tokio::test]
+async fn restart_unknown_start_keeps_reservation_until_late_retirement() {
+    let server = Server {
+        transport_error: true,
+        ..Default::default()
+    };
+    let (adapter, harness) = connect(server.clone()).await;
+    let hooks = Arc::new(LifecycleHooks::default());
+    let node = lifecycle_node(adapter, &hooks);
+    let environment = node.environment(spec(), lifecycle_assignment()).unwrap();
+    assert!(environment.create().await.is_err());
+    let failed = environment.sync().await.unwrap().record;
+    assert!(failed.resources_held);
+    drop(environment);
+    drop(node);
+
+    let restored = Sandboxd::connect(
+        harness._directory.path().join("rpc.sock"),
+        Config {
+            operation_journal: Some(harness._directory.path().join("operations.sqlite")),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let restarted = lifecycle_node(restored, &hooks);
+    assert!(restarted.reconcile(vec![failed.clone()]).await.is_err());
+    assert_eq!(restarted.used(), spec().resources);
+    assert_eq!(server.starts.lock().unwrap().len(), 1);
+    assert!(server.conditional_deletes.lock().unwrap().is_empty());
+    assert!(hooks
+        .records
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|r| r.resources_held));
+
+    // The same operation can publish a physical execution after the first
+    // complete inventory. It is cleanup-only, never a second creation.
+    *server.running.lock().unwrap() = true;
+    restarted.reconcile(vec![failed]).await.unwrap();
+    assert_eq!(restarted.used(), Resources::default());
+    assert!(!*server.running.lock().unwrap());
+    assert_eq!(server.starts.lock().unwrap().len(), 1);
+    assert_eq!(server.conditional_deletes.lock().unwrap().len(), 1);
+    assert_eq!(
+        hooks.activations.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+}
+
+async fn reconnect_with_journal(harness: &Harness) -> Sandboxd {
+    Sandboxd::connect(
+        harness._directory.path().join("rpc.sock"),
+        Config {
+            operation_journal: Some(harness._directory.path().join("operations.sqlite")),
+            env: HashMap::new(),
+            runtime_logs: Some(adxlet::runtime_logs::RuntimeLogPolicy {
+                directory: harness._directory.path().join("runtime-logs"),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn journal_reopen_replays_start_without_dispatch_and_rejects_changed_request() {
+    let server = Server::default();
+    let (adapter, harness) = connect(server.clone()).await;
+    let original = adapter.start(&spec(), "i-1", 1, &[]).await.unwrap();
+    for _ in 0..5 {
+        assert_eq!(
+            adapter.start(&spec(), "i-1", 1, &[]).await.unwrap(),
+            original
+        );
+    }
+    drop(adapter);
+    let adapter = reconnect_with_journal(&harness).await;
+    assert_eq!(
+        adapter.start(&spec(), "i-1", 1, &[]).await.unwrap(),
+        original
+    );
+    let mut changed = spec();
+    changed.env.insert(
+        "PRIVATE_TEST_VALUE".into(),
+        "synthetic-secret-not-to-persist".into(),
+    );
+    assert!(matches!(
+        adapter.start(&changed, "i-1", 1, &[]).await,
+        Err(adx_core::Error::Conflict)
+    ));
+    assert_eq!(server.starts.lock().unwrap().len(), 1);
+    adapter.remove("i-1").await.unwrap();
+    drop(adapter);
+    let adapter = reconnect_with_journal(&harness).await;
+    adapter.remove("i-1").await.unwrap();
+    assert!(matches!(
+        adapter.start(&spec(), "i-1", 1, &[]).await,
+        Err(adx_core::Error::Conflict)
+    ));
+    assert_eq!(server.starts.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn journal_reopen_replays_lost_delete_receipt_with_original_physical_generation() {
+    let server = Server::default();
+    let (adapter, harness) = connect(server.clone()).await;
+    adapter.start(&spec(), "i-1", 1, &[]).await.unwrap();
+    server
+        .lose_delete_reply_once
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(adapter.remove("i-1").await.is_err());
+    assert!(!*server.running.lock().unwrap());
+    drop(adapter);
+    let adapter = reconnect_with_journal(&harness).await;
+    adapter.remove("i-1").await.unwrap();
+    let deletes = server.conditional_deletes.lock().unwrap();
+    assert_eq!(deletes.len(), 2);
+    assert_eq!(deletes[0], deletes[1]);
+    assert_eq!(deletes[1].expected_generation, "physical-generation-1");
+}
+
+#[tokio::test]
+async fn journal_reopen_keeps_unknown_checkpoint_and_never_reissues_it() {
+    let server = Server {
+        checkpoint_error: Some(tonic::Code::Unavailable),
+        ..Default::default()
+    };
+    let (adapter, harness) = connect(server.clone()).await;
+    adapter.start(&spec(), "i-1", 1, &[]).await.unwrap();
+    let checkpoint = harness._directory.path().join("checkpoint-unknown");
+    assert!(adapter
+        .checkpoint("i-1", &checkpoint, Duration::from_secs(1))
+        .await
+        .is_err());
+    drop(adapter);
+    let adapter = reconnect_with_journal(&harness).await;
+    assert!(adapter
+        .checkpoint("i-1", &checkpoint, Duration::from_secs(1))
+        .await
+        .is_err());
+    assert_eq!(server.conditional_checkpoints.lock().unwrap().len(), 1);
+    adapter.remove("i-1").await.unwrap();
+}
+
+#[tokio::test]
+async fn journal_intent_is_durable_before_start_and_contains_no_request_secrets() {
+    let server = Server {
+        release: Arc::new(Semaphore::new(0)),
+        ..Default::default()
+    };
+    let (adapter, harness) = connect(server.clone()).await;
+    let mut request = spec();
+    request.env.insert(
+        "PRIVATE_TEST_VALUE".into(),
+        "synthetic-secret-not-to-persist".into(),
+    );
+    let start = tokio::spawn(async move { adapter.start(&request, "i-1", 1, &[]).await });
+    server.entered.acquire().await.unwrap().forget();
+    let database =
+        rusqlite::Connection::open(harness._directory.path().join("operations.sqlite")).unwrap();
+    let payload: String = database
+        .query_row(
+            "SELECT payload FROM operations WHERE runtime_id='i-1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let record: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(record["state"], "StartUncertain");
+    assert!(record["start"]["deadline_unix_millis"].as_u64().unwrap() > 0);
+    assert_eq!(
+        record["start"]["id"].as_str().unwrap(),
+        server.labels.lock().unwrap()["akernel.scheduler/start-operation-id"]
+    );
+    assert!(!payload.contains("synthetic-secret-not-to-persist"));
+    assert!(!payload.contains("PRIVATE_TEST_VALUE"));
+    server.release.add_permits(1);
+    start.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn journal_failure_prevents_start_dispatch_and_missing_entry_cannot_prove_absence() {
+    let server = Server::default();
+    let (adapter, harness) = connect(server.clone()).await;
+    assert!(adapter.remove("i-1").await.is_err());
+    std::fs::remove_file(harness._directory.path().join("operations.sqlite")).unwrap();
+    assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
+    assert!(server.starts.lock().unwrap().is_empty());
+    assert!(server.conditional_deletes.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn journal_second_owner_and_corruption_are_rejected_without_reset() {
+    let (adapter, harness) = connect(Server::default()).await;
+    let config = Config {
+        operation_journal: Some(harness._directory.path().join("operations.sqlite")),
+        ..Default::default()
+    };
+    assert!(
+        Sandboxd::connect(harness._directory.path().join("rpc.sock"), config.clone())
+            .await
+            .is_err()
+    );
+    drop(adapter);
+    let bytes = b"this is not a sqlite database";
+    std::fs::write(harness._directory.path().join("operations.sqlite"), bytes).unwrap();
+    assert!(
+        Sandboxd::connect(harness._directory.path().join("rpc.sock"), config)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read(harness._directory.path().join("operations.sqlite")).unwrap(),
+        bytes
+    );
 }
 
 #[tokio::test]

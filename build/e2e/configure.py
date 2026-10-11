@@ -295,6 +295,7 @@ node_config = {
     'proxy_mode': relay_mode,
     'tls': tls('node' if node == 'node1' else 'node2', {'coordinator': 'coordinator', 'apiserver': 'apiserver'}),
     'sandboxd_socket': str(R / 'sandboxd.sock'),
+    'sandboxd_operation_journal': str(R / 'operations' / 'sandboxd.sqlite'),
     'proxy_socket': str(P / 'proxy/route.sock'),
     'capacity_file': str(P / 'capacity.json'),
     'report_interval_seconds': 2,

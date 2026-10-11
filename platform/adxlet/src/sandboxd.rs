@@ -15,6 +15,9 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Request};
 use tower::service_fn;
 
+mod operations;
+use operations::{OperationIntent, OperationJournal, OperationRecord};
+
 pub mod proto {
     tonic::include_proto!("runtime.v1");
 }
@@ -22,6 +25,9 @@ use proto::sandbox_service_client::SandboxServiceClient;
 
 #[derive(Clone)]
 pub struct Config {
+    /// Durable execution intent and physical identity journal. Required by the
+    /// node binary; None is intended for isolated in-memory adapter tests.
+    pub operation_journal: Option<PathBuf>,
     pub runtime_profile: Option<adx_core::runtime_profile::RuntimeProfile>,
     pub command: Vec<String>,
     pub env: HashMap<String, String>,
@@ -33,6 +39,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            operation_journal: None,
             runtime_profile: None,
             command: vec!["/usr/local/bin/adx-execd".into()],
             env: HashMap::from([("EXECD_HTTP_PORT".into(), "50090".into())]),
@@ -43,6 +50,7 @@ impl Default for Config {
     }
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 enum StartState {
     Idle,
     Started(IpAddr),
@@ -52,16 +60,18 @@ enum StartState {
     StartUncertain,
     // Checkpoint may still be executing after its transport failed.
     CheckpointUncertain,
+    DeleteUncertain,
 }
 type Cell = Arc<tokio::sync::Mutex<StartState>>;
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct BackendIdentity {
     id: String,
     resource_generation: String,
 }
 
 const RESOURCE_GENERATION_LABEL: &str = "akernel.scheduler/resource-generation";
+const START_OPERATION_LABEL: &str = "akernel.scheduler/start-operation-id";
 
 fn valid_resource_generation(value: &str) -> bool {
     !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_whitespace)
@@ -73,6 +83,8 @@ pub struct Sandboxd {
     config: Config,
     starts: Arc<Mutex<BTreeMap<String, Cell>>>,
     backend_ids: Arc<Mutex<BTreeMap<String, BackendIdentity>>>,
+    operations: Arc<Mutex<BTreeMap<String, OperationRecord>>>,
+    journal: Option<OperationJournal>,
 }
 
 fn unavailable(error: impl std::fmt::Display) -> Error {
@@ -178,11 +190,33 @@ impl Sandboxd {
             }))
             .await
             .map_err(unavailable)?;
+        let (journal, operations) = match &config.operation_journal {
+            Some(path) => {
+                let (journal, records) = OperationJournal::open(path.clone()).await?;
+                (Some(journal), records)
+            }
+            None => (None, BTreeMap::new()),
+        };
+        let starts = operations
+            .iter()
+            .map(|(id, record)| {
+                (
+                    id.clone(),
+                    Arc::new(tokio::sync::Mutex::new(record.state.clone())),
+                )
+            })
+            .collect();
+        let backend_ids = operations
+            .iter()
+            .filter_map(|(id, record)| record.backend.clone().map(|backend| (id.clone(), backend)))
+            .collect();
         Ok(Self {
             client: SandboxServiceClient::new(channel),
             config,
-            starts: Arc::default(),
-            backend_ids: Arc::default(),
+            starts: Arc::new(Mutex::new(starts)),
+            backend_ids: Arc::new(Mutex::new(backend_ids)),
+            operations: Arc::new(Mutex::new(operations)),
+            journal,
         })
     }
 
@@ -261,9 +295,21 @@ impl Sandboxd {
     async fn execute_start(
         &self,
         runtime_id: &str,
-        request: Request<proto::StartRequest>,
+        mut request: Request<proto::StartRequest>,
     ) -> Result<IpAddr> {
         let mut state = self.cell(runtime_id).lock_owned().await;
+        let fingerprint = operations::fingerprint(request.get_ref())?;
+        let previous = self
+            .operations
+            .lock()
+            .expect("operation state lock poisoned")
+            .get(runtime_id)
+            .and_then(|record| record.start.clone());
+        let intent = match previous {
+            Some(intent) if intent.fingerprint != fingerprint => return Err(Error::Conflict),
+            Some(intent) => intent,
+            None => OperationIntent::new("start", fingerprint, self.config.rpc_timeout)?,
+        };
         if let StartState::Started(ip) = *state {
             return Ok(ip);
         }
@@ -272,14 +318,30 @@ impl Sandboxd {
         }
         if matches!(
             *state,
-            StartState::StartUncertain | StartState::CheckpointUncertain
+            StartState::StartUncertain
+                | StartState::CheckpointUncertain
+                | StartState::DeleteUncertain
         ) {
             return Err(unavailable("start outcome requires reconciliation"));
         }
         *state = StartState::StartUncertain;
+        self.operations
+            .lock()
+            .expect("operation state lock poisoned")
+            .entry(runtime_id.into())
+            .or_default()
+            .start = Some(intent.clone());
+        request
+            .get_mut()
+            .labels
+            .insert(START_OPERATION_LABEL.into(), intent.id.clone());
+        // This write completes before dispatch. Cancellation or process loss can
+        // leave a conservative unknown intent, never an unrecorded creation.
+        self.persist(runtime_id, &state, Some(intent)).await?;
         let mut client = self.client.clone();
         let backend_ids = self.backend_ids.clone();
         let logical_id = runtime_id.to_string();
+        let adapter = self.clone();
         tokio::spawn(async move {
             let response = match client.start(request).await {
                 Ok(response) => response.into_inner(),
@@ -296,13 +358,14 @@ impl Sandboxd {
                     .lock()
                     .expect("shared state lock poisoned")
                     .insert(
-                        logical_id,
+                        logical_id.clone(),
                         BackendIdentity {
                             id: response.id.clone(),
                             resource_generation: response.resource_generation.clone(),
                         },
                     );
             }
+            adapter.persist(&logical_id, &state, None).await?;
             if response.code != 0 {
                 return Err(unavailable(response.message));
             }
@@ -315,6 +378,7 @@ impl Sandboxd {
             // A completed successful Start has a known incarnation even when
             // its IP is malformed. Cleanup still requires its retirement receipt.
             *state = StartState::Failed;
+            adapter.persist(&logical_id, &state, None).await?;
             let ip: IpAddr = response
                 .sandbox_ip
                 .parse()
@@ -323,6 +387,7 @@ impl Sandboxd {
                 return Err(unavailable("Start returned a non-routable sandbox IP"));
             }
             *state = StartState::Started(ip);
+            adapter.persist(&logical_id, &state, None).await?;
             Ok(ip)
         })
         .await
@@ -336,6 +401,39 @@ impl Sandboxd {
             .entry(id.into())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(StartState::Idle)))
             .clone()
+    }
+
+    async fn persist(
+        &self,
+        id: &str,
+        state: &StartState,
+        action: Option<OperationIntent>,
+    ) -> Result<()> {
+        let mut record = self
+            .operations
+            .lock()
+            .expect("operation state lock poisoned")
+            .get(id)
+            .cloned()
+            .unwrap_or_default();
+        record.state = state.clone();
+        if let Some(action) = action {
+            record.action = Some(action);
+        }
+        record.backend = self
+            .backend_ids
+            .lock()
+            .expect("shared state lock poisoned")
+            .get(id)
+            .cloned();
+        if let Some(journal) = &self.journal {
+            journal.save(id.to_owned(), record.clone()).await?;
+        }
+        self.operations
+            .lock()
+            .expect("operation state lock poisoned")
+            .insert(id.into(), record);
+        Ok(())
     }
 
     fn request<T>(&self, message: T) -> Request<T> {
@@ -398,6 +496,18 @@ impl Sandboxd {
                 .get("adx.runtime_id")
                 .filter(|id| adx_core::valid_runtime_id(environment, generation, id))
                 .ok_or_else(|| unavailable("managed runtime has invalid execution labels"))?;
+            if self
+                .operations
+                .lock()
+                .expect("operation state lock poisoned")
+                .get(logical)
+                .and_then(|record| record.start.as_ref())
+                .is_some_and(|intent| sandbox.labels.get(START_OPERATION_LABEL) != Some(&intent.id))
+            {
+                return Err(unavailable(
+                    "backend does not match its durable start operation",
+                ));
+            }
             let resource_generation = sandbox
                 .labels
                 .get(RESOURCE_GENERATION_LABEL)
@@ -1104,22 +1214,71 @@ impl RuntimeDriver for Sandboxd {
         let mut state = self.cell(runtime_id).lock_owned().await;
         let failed_start = matches!(*state, StartState::Failed | StartState::StartUncertain);
         if let Some(physical) = self.physical_identity(runtime_id).await? {
-            let response = self
+            let request = proto::DeleteIfGenerationRequest {
+                id: physical.id,
+                expected_generation: physical.resource_generation.clone(),
+            };
+            let fingerprint = operations::fingerprint(&request)?;
+            let previous = self
+                .operations
+                .lock()
+                .expect("operation state lock poisoned")
+                .get(runtime_id)
+                .and_then(|record| record.action.clone());
+            let action = match previous
+                .filter(|intent| intent.kind == "delete" && intent.fingerprint == fingerprint)
+            {
+                Some(intent) => intent,
+                None => OperationIntent::new("delete", fingerprint, self.config.rpc_timeout)?,
+            };
+            let previous_state = state.clone();
+            *state = StartState::DeleteUncertain;
+            self.persist(runtime_id, &state, Some(action)).await?;
+            let response = match self
                 .client
                 .clone()
-                .delete_if_generation(self.request(proto::DeleteIfGenerationRequest {
-                    id: physical.id,
-                    expected_generation: physical.resource_generation.clone(),
-                }))
+                .delete_if_generation(self.request(request))
                 .await
-                .map_err(unavailable)?
-                .into_inner();
+            {
+                Ok(response) => response.into_inner(),
+                Err(error) => {
+                    // These conditional-RPC rejections do not retire an
+                    // execution. Preserve its previous physical-operation state;
+                    // transport errors retain DeleteUncertain and its identity.
+                    if matches!(
+                        error.code(),
+                        Code::FailedPrecondition
+                            | Code::InvalidArgument
+                            | Code::Unimplemented
+                            | Code::PermissionDenied
+                            | Code::Unauthenticated
+                    ) {
+                        *state = previous_state;
+                        self.persist(runtime_id, &state, None).await?;
+                    }
+                    return Err(unavailable(error));
+                }
+            };
             if response.retired_generation != physical.resource_generation {
                 return Err(unavailable(
                     "Delete returned a mismatched retirement receipt",
                 ));
             }
-        } else if !matches!(*state, StartState::Idle | StartState::Failed) {
+            self.operations
+                .lock()
+                .expect("operation state lock poisoned")
+                .entry(runtime_id.into())
+                .or_default()
+                .retired_generation = Some(response.retired_generation);
+            self.persist(runtime_id, &state, None).await?;
+        } else if !matches!(*state, StartState::Idle | StartState::Failed)
+            || (self.journal.is_some()
+                && !self
+                    .operations
+                    .lock()
+                    .expect("operation state lock poisoned")
+                    .contains_key(runtime_id))
+        {
             return Err(unavailable(
                 "cannot confirm cleanup while the physical operation outcome is unknown",
             ));
@@ -1138,11 +1297,12 @@ impl RuntimeDriver for Sandboxd {
             .remove(runtime_id);
         // A failed create cannot become successful through a retry of the same
         // execution. Keep its identity terminal so a later backend is cleanup-only.
-        *state = if failed_start {
+        *state = if failed_start || self.journal.is_some() {
             StartState::Failed
         } else {
             StartState::Idle
         };
+        self.persist(runtime_id, &state, None).await?;
         Ok(())
     }
 }
@@ -1171,7 +1331,9 @@ impl Sandboxd {
         let mut state = self.cell(runtime_id).lock_owned().await;
         if matches!(
             *state,
-            StartState::StartUncertain | StartState::CheckpointUncertain
+            StartState::StartUncertain
+                | StartState::CheckpointUncertain
+                | StartState::DeleteUncertain
         ) {
             return Err(unavailable("execution outcome requires reconciliation"));
         }
@@ -1237,10 +1399,19 @@ impl Sandboxd {
         let mut client = self.client.clone();
         // Retain the operation guard on caller cancellation, as with Start.
         *state = StartState::CheckpointUncertain;
+        let action = OperationIntent::new(
+            "checkpoint",
+            operations::fingerprint(request.get_ref())?,
+            duration,
+        )?;
+        self.persist(runtime_id, &state, Some(action)).await?;
+        let adapter = self.clone();
+        let logical_id = runtime_id.to_owned();
         tokio::spawn(async move {
             match client.checkpoint_if_generation(request).await {
                 Ok(response) if response.get_ref().success => {
                     *state = StartState::Settled;
+                    adapter.persist(&logical_id, &state, None).await?;
                     Ok(())
                 }
                 Ok(_) => Err(unavailable("checkpoint completion was not confirmed")),
@@ -1253,6 +1424,7 @@ impl Sandboxd {
                             | Code::Unauthenticated
                     ) {
                         *state = StartState::Settled;
+                        adapter.persist(&logical_id, &state, None).await?;
                     }
                     Err(unavailable(error))
                 }

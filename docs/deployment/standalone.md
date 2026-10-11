@@ -68,6 +68,12 @@ with os.fdopen(fd, 'w') as output:
 
 ## 校验、启动和业务就绪
 
+节点配置必须指定持久的 `sandboxd_operation_journal` 路径，默认部署示例使用
+`/opt/adx/data/operations/sandboxd.sqlite`。它保存派发前操作事实和物理代际，
+与仅补交结果的 `degradation_journal` 分开。节点进程重启保留数据库及其锁文件，
+不能使用临时配置目录存放，也不能通过删库处理未知结果。多个节点不能共享同一个
+日志路径；共享宿主总容量仍需单独的预算准入。
+
 ```sh
 sudo adxctl validate
 sudo adxctl render --output /opt/adx/run/config-review

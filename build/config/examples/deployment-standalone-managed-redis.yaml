@@ -54,6 +54,7 @@ services:
           coordinator: /opt/adx/config/tls/coordinator.der
           apiserver: /opt/adx/config/tls/apiserver.der
       sandboxd_socket: /run/sandboxd/sandboxd.sock
+      sandboxd_operation_journal: /opt/adx/data/operations/sandboxd.sqlite
       runtime_logs:
         directory: /opt/adx/run/control/logs/runtime
       proxy_socket: /opt/adx/run/node/route.sock

@@ -36,6 +36,7 @@ struct Config {
     #[serde(default)]
     admin_socket: Option<PathBuf>,
     sandboxd_socket: PathBuf,
+    sandboxd_operation_journal: PathBuf,
     #[serde(default)]
     runtime_logs: RuntimeLogPolicy,
     proxy_socket: PathBuf,
@@ -266,6 +267,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .transpose()?;
     let runtime_config = RuntimeConfig {
+        operation_journal: Some(config.sandboxd_operation_journal),
         runtime_profile: config.runtime_profile,
         command: config.execd_command,
         env,
