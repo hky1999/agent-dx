@@ -35,6 +35,9 @@ def build(binary, output, busybox=Path('/usr/bin/busybox')):
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='adx-runtime-') as temporary:
         root = Path(temporary)
+        # TemporaryDirectory is private to the host build user. The image
+        # root must be traversable by guest processes with reduced capabilities.
+        root.chmod(0o755)
         for name in (
             'usr/bin',
             'usr/local/bin',
@@ -67,7 +70,7 @@ def build(binary, output, busybox=Path('/usr/bin/busybox')):
         if certs.is_file():
             (root / 'etc/ssl/certs').mkdir(parents=True)
             shutil.copyfile(certs, root / 'etc/ssl/certs/ca-certificates.crt')
-        subprocess.run([_executable('mkfs.erofs'), '-E', 'noinline_data', str(output), str(root)], check=True)
+        subprocess.run([_executable('mkfs.erofs'), '--all-root', '-E', 'noinline_data', str(output), str(root)], check=True)
         subprocess.run([_executable('fsck.erofs'), str(output)], check=True)
 
 

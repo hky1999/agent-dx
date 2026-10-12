@@ -79,7 +79,7 @@ Execd 在 Linux PID 1 场景内置进程回收：单线程启动阶段 fork 实�
 
 Kata 的 PTY 同样由 guest 内的 Execd 分配。adxlet 在 Kata 创建请求中为 `/dev/pts` 添加独立的 `devpts` 挂载，由执行后端在创建容器时准备；无需在 guest 中授予 `CAP_SYS_ADMIN` 或自行执行 mount。若请求已有 `/dev/pts` 挂载，保留该配置，由配置者保证终端设备可用。其他 runtime 的终端准备保持各自后端行为。旧节点侧 `sbox exec -t` 的运行时终端路径与 Execd 原生 PTY 不同；对照及回归证据见 [Kata 定位记录](../testing/2026-10-09-h2-close-and-acl.md#kata-旧镜像对照)。
 
-发布构建需要原生 musl Rust target、musl C 工具链、`busybox-static`、`erofs-utils` 和 `readelf`。`build/runtime/rootfs.py` 拒绝带动态解释器的 Execd/BusyBox，再生成并检查 EROFS。构建示例与进程部署见 [standalone](standalone.md)。
+发布构建需要原生 musl Rust target、musl C 工具链、`busybox-static`、`erofs-utils` 和 `readelf`。`build/runtime/rootfs.py` 拒绝带动态解释器的 Execd/BusyBox，将镜像根目录设为 0755，并通过 `mkfs.erofs --all-root` 使镜像文件属于沙箱内的 root，再生成并检查 EROFS。宿主构建用户和临时目录的 0700 权限不能成为沙箱的访问前提。使用 `python3 -m unittest discover -s build/runtime/tests -v` 检查真实 EROFS 根目录的归属和权限；该检查需要 `dump.erofs`，不替代目标环境的实际启动验收。构建示例与进程部署见 [standalone](standalone.md)。
 
 使用 EROFS 配置的节点必须支持从普通文件创建只读 loop 设备并实际挂载 EROFS。`/proc/filesystems` 中出现 `erofs` 只表示驱动已登记，不足以证明该内核构建和设备路径可用；对应 preflight 会对发布包内制品执行一次真实挂载和卸载。OCI 配置不要求 EROFS，仍要求 sandboxd 能访问并解析配置的 digest 引用。Buildkite K8s 验收使用 OCI 模式；本地与 standalone 验证继续覆盖 EROFS 模式。
 
