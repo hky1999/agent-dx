@@ -68,11 +68,7 @@ with os.fdopen(fd, 'w') as output:
 
 ## 校验、启动和业务就绪
 
-节点配置必须指定持久的 `sandboxd_operation_journal` 路径，默认部署示例使用
-`/opt/adx/data/operations/sandboxd.sqlite`。它保存派发前操作事实和物理代际，
-与仅补交结果的 `degradation_journal` 分开。节点进程重启保留数据库及其锁文件，
-不能使用临时配置目录存放，也不能通过删库处理未知结果。多个节点不能共享同一个
-日志路径；共享宿主总容量仍需单独的预算准入。
+节点配置必须指定持久的 `sandboxd_operation_journal` 路径，默认部署示例使用 `/opt/adx/data/operations/sandboxd.sqlite`。它保存派发前操作事实、查询绑定的原物理身份、清理意图和完成回执，与仅补交结果的 `degradation_journal` 分开。节点进程重启保留数据库及其锁文件，不能使用临时配置目录存放，也不能通过删库处理未知结果。新的持久创建查询处于处理中（PENDING）且原身份完整时，节点先持久保存原绑定，再按原代际清理；只有匹配回执和后续原库存核对通过才归还预算。字段缺失、旧协议查询、清理或日志写入失败继续保留占用。多个节点不能共享同一个日志路径；共享宿主总容量仍需单独的预算准入。具体契约见 [失败记录与资源清理](../testing/failed-environment-gc.md)。
 
 ```sh
 sudo adxctl validate
@@ -131,4 +127,4 @@ Kubernetes 同样在 Pod 内运行进程，但部署与验收应使用独立的 
 
 ## Failed 记录保留
 
-Coordinator 服务配置 `failed_retention_seconds` 默认600秒，必须大于零。终态 Failed 在保留期后自动清理；创建失败的资源预留立即释放。正在重启／恢复的记录不按普通终态回收，清理失败继续重试。具体契约见 [Failed Environment GC](../testing/failed-environment-gc.md)。
+Coordinator 服务配置 `failed_retention_seconds` 默认600秒，必须大于零。终态 Failed 在保留期后进入自动清理；资源预留按照对应原创建与退役证明结算，不能因标记失败或保留期到期而提前释放未知占用。正在重启／恢复的记录不按普通终态回收，清理失败继续重试。具体契约见 [Failed Environment GC](../testing/failed-environment-gc.md)。

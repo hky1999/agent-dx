@@ -622,13 +622,26 @@ impl Sandboxd {
             .await
             .map_err(unavailable)?
             .into_inner();
-        match start_operation_state(&intent, &response)? {
+        let outcome = start_operation_state(&intent, &response)?;
+        match outcome {
             proto::StartOperationState::NotCreated => {
                 *state = StartState::NotCreated;
                 self.persist(runtime_id, state, None).await?;
                 Ok(None)
             }
-            proto::StartOperationState::Started | proto::StartOperationState::Retired => {
+            proto::StartOperationState::Started
+            | proto::StartOperationState::Retired
+            | proto::StartOperationState::Pending => {
+                // Only the durable creation protocol binds a pending admission
+                // to its original physical identity. Legacy pending responses
+                // cannot authorize cleanup, much less release a reservation.
+                if outcome == proto::StartOperationState::Pending
+                    && intent.kind != "start_operation"
+                {
+                    return Err(unavailable(
+                        "legacy pending creation has no cleanup binding",
+                    ));
+                }
                 let result = response
                     .result
                     .filter(|result| {
@@ -645,13 +658,19 @@ impl Sandboxd {
                     .lock()
                     .map_err(unavailable)?
                     .insert(runtime_id.into(), identity.clone());
-                // A recovered failed creation is cleanup-only. A historical
-                // STARTED reply cannot turn it into a new successful execution.
-                *state = StartState::Failed;
+                // Persist the original binding before conditional cleanup can
+                // dispatch. PENDING stays uncertain until the existing delete
+                // path saves a matching completion receipt; it is not a proof
+                // of non-creation or retirement and never makes Start succeed.
+                *state = if outcome == proto::StartOperationState::Pending {
+                    StartState::StartUncertain
+                } else {
+                    StartState::Failed
+                };
                 self.persist(runtime_id, state, None).await?;
                 Ok(Some(identity))
             }
-            proto::StartOperationState::Unknown | proto::StartOperationState::Pending => {
+            proto::StartOperationState::Unknown => {
                 Err(unavailable("creation has no final settlement proof"))
             }
         }

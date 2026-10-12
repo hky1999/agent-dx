@@ -1088,6 +1088,335 @@ fn lifecycle_assignment() -> Assignment {
     }
 }
 
+fn bind_pending_creation(server: &Server) {
+    for outcome in server.start_outcomes.lock().unwrap().values_mut() {
+        outcome.state = StartOperationState::Pending as i32;
+        outcome.result = Some(StartResponse {
+            id: "generated-backend-id".into(),
+            resource_generation: server.resource_generation.lock().unwrap().clone(),
+            ..Default::default()
+        });
+    }
+}
+
+#[tokio::test]
+async fn pending_creation_binding_drives_conditional_cleanup_before_budget_return() {
+    let server = Server {
+        transport_error: true,
+        hide_inventory: true,
+        ..Default::default()
+    };
+    let (adapter, _harness) = connect(server.clone()).await;
+    let hooks = Arc::new(LifecycleHooks::default());
+    let node = lifecycle_node(adapter, &hooks);
+    let environment = node.environment(spec(), lifecycle_assignment()).unwrap();
+    assert!(environment.create().await.is_err());
+    assert_eq!(node.used(), spec().resources);
+    bind_pending_creation(&server);
+
+    node.monitor_environments().await.unwrap();
+
+    assert_eq!(node.used(), Resources::default());
+    let retired = environment.sync().await.unwrap().record;
+    assert_eq!(retired.state, EnvironmentState::Failed);
+    assert!(!retired.resources_held);
+    let deletes = server.conditional_deletes.lock().unwrap().clone();
+    assert_eq!(deletes.len(), 1);
+    assert_eq!(deletes[0].id, "generated-backend-id");
+    assert_eq!(deletes[0].expected_generation, "physical-generation-1");
+    assert_eq!(server.starts.lock().unwrap().len(), 1);
+    assert_eq!(
+        server
+            .legacy_deletes
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert!(hooks
+        .records
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|r| r.state != EnvironmentState::Running));
+    drop(deletes);
+    node.monitor_environments().await.unwrap();
+    assert_eq!(node.used(), Resources::default());
+    assert_eq!(server.conditional_deletes.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn pending_creation_invalid_binding_keeps_budget_and_never_deletes() {
+    for mode in [
+        "missing-result",
+        "missing-id",
+        "missing-generation",
+        "invalid-generation",
+        "failed-code",
+        "operation",
+        "fingerprint",
+        "deadline",
+        "unknown",
+    ] {
+        let server = Server {
+            transport_error: true,
+            hide_inventory: true,
+            ..Default::default()
+        };
+        let (adapter, _harness) = connect(server.clone()).await;
+        let hooks = Arc::new(LifecycleHooks::default());
+        let node = lifecycle_node(adapter, &hooks);
+        let environment = node.environment(spec(), lifecycle_assignment()).unwrap();
+        assert!(environment.create().await.is_err());
+        bind_pending_creation(&server);
+        for outcome in server.start_outcomes.lock().unwrap().values_mut() {
+            match mode {
+                "missing-result" => outcome.result = None,
+                "missing-id" => outcome.result.as_mut().unwrap().id.clear(),
+                "missing-generation" => {
+                    outcome.result.as_mut().unwrap().resource_generation.clear()
+                }
+                "invalid-generation" => {
+                    outcome.result.as_mut().unwrap().resource_generation =
+                        "invalid generation".into()
+                }
+                "failed-code" => outcome.result.as_mut().unwrap().code = -1,
+                "operation" => outcome.operation_id = uuid::Uuid::new_v4().to_string(),
+                "fingerprint" => outcome.request_fingerprint = "b".repeat(64),
+                "deadline" => outcome.deadline_unix_millis += 1,
+                "unknown" => outcome.state = StartOperationState::Unknown as i32,
+                _ => unreachable!(),
+            }
+        }
+        assert!(node.monitor_environments().await.is_err(), "{mode}");
+        assert_eq!(node.used(), spec().resources, "{mode}");
+        assert!(
+            environment.sync().await.unwrap().record.resources_held,
+            "{mode}"
+        );
+        assert!(
+            server.conditional_deletes.lock().unwrap().is_empty(),
+            "{mode}"
+        );
+        assert_eq!(
+            server
+                .legacy_deletes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+}
+
+#[tokio::test]
+async fn pending_creation_lost_cleanup_reply_reopens_original_intent_before_budget_return() {
+    let server = Server {
+        transport_error: true,
+        hide_inventory: true,
+        lose_delete_reply_once: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        ..Default::default()
+    };
+    let (adapter, harness) = connect(server.clone()).await;
+    let hooks = Arc::new(LifecycleHooks::default());
+    let node = lifecycle_node(adapter, &hooks);
+    let environment = node.environment(spec(), lifecycle_assignment()).unwrap();
+    assert!(environment.create().await.is_err());
+    bind_pending_creation(&server);
+    assert!(node.monitor_environments().await.is_err());
+    assert_eq!(node.used(), spec().resources);
+    let failed = environment.sync().await.unwrap().record;
+    assert!(failed.resources_held);
+    let original_delete = server.conditional_deletes.lock().unwrap()[0].clone();
+    drop(environment);
+    drop(node);
+
+    let restored = reconnect_with_journal(&harness).await;
+    let restarted = lifecycle_node(restored, &hooks);
+    restarted.reconcile(vec![failed]).await.unwrap();
+    assert_eq!(restarted.used(), Resources::default());
+    let deletes = server.conditional_deletes.lock().unwrap();
+    assert_eq!(deletes.len(), 2);
+    assert_eq!(deletes[1], original_delete);
+    assert_eq!(server.starts.lock().unwrap().len(), 1);
+    assert_eq!(
+        server.start_queries.lock().unwrap().len(),
+        2,
+        "reopen consumes the durable original binding without adopting another query"
+    );
+    assert!(hooks
+        .records
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|r| r.state != EnvironmentState::Running));
+}
+
+#[tokio::test]
+async fn pending_creation_cleanup_failure_remains_held_after_reopen() {
+    let server = Server {
+        transport_error: true,
+        hide_inventory: true,
+        delete_error: Some(tonic::Code::Unavailable),
+        ..Default::default()
+    };
+    let (adapter, harness) = connect(server.clone()).await;
+    let hooks = Arc::new(LifecycleHooks::default());
+    let node = lifecycle_node(adapter, &hooks);
+    let environment = node.environment(spec(), lifecycle_assignment()).unwrap();
+    assert!(environment.create().await.is_err());
+    bind_pending_creation(&server);
+    assert!(node.monitor_environments().await.is_err());
+    let failed = environment.sync().await.unwrap().record;
+    assert!(failed.resources_held);
+    drop(environment);
+    drop(node);
+    let restored = reconnect_with_journal(&harness).await;
+    let restarted = lifecycle_node(restored, &hooks);
+    assert!(restarted.reconcile(vec![failed]).await.is_err());
+    assert_eq!(restarted.used(), spec().resources);
+    let deletes = server.conditional_deletes.lock().unwrap();
+    assert_eq!(deletes.len(), 2);
+    assert_eq!(deletes[0], deletes[1]);
+    assert!(hooks
+        .records
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|r| r.resources_held));
+}
+
+#[tokio::test]
+async fn pending_creation_wrong_retirement_receipt_cannot_return_budget() {
+    let server = Server {
+        transport_error: true,
+        hide_inventory: true,
+        retired_generation: Some("neighbor-generation".into()),
+        ..Default::default()
+    };
+    let (adapter, _harness) = connect(server.clone()).await;
+    let hooks = Arc::new(LifecycleHooks::default());
+    let node = lifecycle_node(adapter, &hooks);
+    let environment = node.environment(spec(), lifecycle_assignment()).unwrap();
+    assert!(environment.create().await.is_err());
+    bind_pending_creation(&server);
+    assert!(node.monitor_environments().await.is_err());
+    assert_eq!(node.used(), spec().resources);
+    assert!(environment.sync().await.unwrap().record.resources_held);
+    assert_eq!(
+        server.conditional_deletes.lock().unwrap()[0].expected_generation,
+        "physical-generation-1"
+    );
+    assert!(hooks
+        .records
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|r| r.resources_held));
+}
+
+#[tokio::test]
+async fn pending_creation_saved_binding_cannot_adopt_replacement_generation() {
+    let server = Server {
+        transport_error: true,
+        hide_inventory: true,
+        lose_delete_reply_once: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        ..Default::default()
+    };
+    let (adapter, harness) = connect(server.clone()).await;
+    let hooks = Arc::new(LifecycleHooks::default());
+    let node = lifecycle_node(adapter, &hooks);
+    let environment = node.environment(spec(), lifecycle_assignment()).unwrap();
+    assert!(environment.create().await.is_err());
+    bind_pending_creation(&server);
+    assert!(node.monitor_environments().await.is_err());
+    let failed = environment.sync().await.unwrap().record;
+    *server.resource_generation.lock().unwrap() = "replacement-generation".into();
+    *server.running.lock().unwrap() = true;
+    bind_pending_creation(&server);
+    drop(environment);
+    drop(node);
+    let restored = reconnect_with_journal(&harness).await;
+    let restarted = lifecycle_node(restored, &hooks);
+    assert!(restarted.reconcile(vec![failed]).await.is_err());
+    assert_eq!(restarted.used(), spec().resources);
+    assert!(
+        *server.running.lock().unwrap(),
+        "the replacement must survive old cleanup"
+    );
+    let deletes = server.conditional_deletes.lock().unwrap();
+    assert_eq!(deletes.len(), 2);
+    assert!(deletes
+        .iter()
+        .all(|r| r.expected_generation == "physical-generation-1"));
+    assert_eq!(server.start_queries.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn pending_creation_journal_failure_prevents_cleanup_dispatch() {
+    let server = Server {
+        transport_error: true,
+        hide_inventory: true,
+        ..Default::default()
+    };
+    let (adapter, harness) = connect(server.clone()).await;
+    let hooks = Arc::new(LifecycleHooks::default());
+    let node = lifecycle_node(adapter, &hooks);
+    let environment = node.environment(spec(), lifecycle_assignment()).unwrap();
+    assert!(environment.create().await.is_err());
+    bind_pending_creation(&server);
+    let path = harness._directory.path().join("operations.sqlite");
+    let saved = path.with_extension("sqlite.original");
+    std::fs::rename(&path, &saved).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert!(node.monitor_environments().await.is_err());
+    assert_eq!(node.used(), spec().resources);
+    assert!(server.conditional_deletes.lock().unwrap().is_empty());
+    std::fs::remove_dir(&path).unwrap();
+    std::fs::rename(saved, path).unwrap();
+    node.monitor_environments().await.unwrap();
+    assert_eq!(node.used(), Resources::default());
+    assert_eq!(server.conditional_deletes.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn pending_creation_legacy_operation_cannot_authorize_cleanup() {
+    let server = Server {
+        transport_error: true,
+        hide_inventory: true,
+        ..Default::default()
+    };
+    let (adapter, harness) = connect(server.clone()).await;
+    assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
+    bind_pending_creation(&server);
+    drop(adapter);
+    let db =
+        rusqlite::Connection::open(harness._directory.path().join("operations.sqlite")).unwrap();
+    let payload: String = db
+        .query_row(
+            "SELECT payload FROM operations WHERE runtime_id='i-1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut record: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    record["start"]["kind"] = "start".into();
+    db.execute(
+        "UPDATE operations SET payload=?1 WHERE runtime_id='i-1'",
+        [record.to_string()],
+    )
+    .unwrap();
+    drop(db);
+    let restored = reconnect_with_journal(&harness).await;
+    assert!(restored.remove("i-1").await.is_err());
+    assert!(server.conditional_deletes.lock().unwrap().is_empty());
+    assert!(
+        !server
+            .start_queries
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .seal_missing
+    );
+}
+
 #[tokio::test]
 async fn unknown_start_holds_capacity_until_late_backend_is_retired() {
     let server = Server {
