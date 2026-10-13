@@ -94,10 +94,19 @@ pub struct EnvironmentSpec {
 }
 
 impl EnvironmentSpec {
-    /// Resources enforced at execution, with zero limits inheriting requests.
-    /// Admission and restart accounting reserve this full tuple until a
-    /// separate, durable resource grant authorizes a smaller execution bound.
+    /// Initial execution allowance. Explicit elastic memory starts at the request;
+    /// fixed resources use their full ceiling. Recovery must reserve the ceiling
+    /// until the saved physical limit has been completely verified.
     pub fn execution_resources(&self) -> Resources {
+        let mut resources = self.execution_ceiling();
+        if self.sandbox.elastic_memory.is_some() {
+            resources.memory_bytes = self.resources.memory_bytes;
+        }
+        resources
+    }
+
+    /// Immutable permitted bounds, with zero limits inheriting requests.
+    pub fn execution_ceiling(&self) -> Resources {
         Resources {
             cpu_millis: self
                 .resources
@@ -129,6 +138,18 @@ impl EnvironmentSpec {
         } else if self.image.trim().is_empty() && self.sandbox.rootfs.is_none() {
             return Err(Error::Invalid(
                 "image or runtime environment is required".into(),
+            ));
+        }
+        if self.sandbox.elastic_memory.is_some()
+            && (self.runtime_class != "runsc" || self.snapshot_id.is_some())
+        {
+            return Err(Error::Invalid(
+                "elastic memory requires runsc and does not yet support snapshot cloning".into(),
+            ));
+        }
+        if self.sandbox.elastic_memory.is_some() && self.execution_ceiling().cpu_millis < 10 {
+            return Err(Error::Invalid(
+                "elastic memory requires an enforceable CPU limit of at least 10 millicores".into(),
             ));
         }
         self.lifecycle.validate()?;

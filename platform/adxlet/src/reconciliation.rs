@@ -90,7 +90,7 @@ impl Adxlet {
                 return Err(Error::Conflict);
             }
             if r.resources_held {
-                scalar.restore(&r.runtime.id, r.spec.execution_resources())?;
+                scalar.restore(&r.runtime.id, r.spec.execution_ceiling())?;
                 cards.restore(&r.runtime.id, &r.assignment.devices)?;
             }
             catalog.insert(r.spec.id.clone(), r);
@@ -209,7 +209,7 @@ impl Adxlet {
                         // Catalog has already been validated for scalar/card conflicts.
                         admission
                             .ledger
-                            .restore(&r.runtime.id, r.spec.execution_resources())?;
+                            .restore(&r.runtime.id, r.spec.execution_ceiling())?;
                         admission
                             .devices
                             .restore(&r.runtime.id, &r.assignment.devices)?;

@@ -5,6 +5,12 @@ use std::collections::BTreeMap;
 const MIB: u64 = 1024 * 1024;
 
 async fn fixture() -> (common::Redis, Session, EnvironmentRecord, MemoryObservation) {
+    fixture_with_elastic(false).await
+}
+
+async fn fixture_with_elastic(
+    elastic: bool,
+) -> (common::Redis, Session, EnvironmentRecord, MemoryObservation) {
     let rig = common::Redis::new().await;
     let session = rig.store().await.begin(1).await.unwrap();
     let mut n = node("first");
@@ -40,6 +46,12 @@ async fn fixture() -> (common::Redis, Session, EnvironmentRecord, MemoryObservat
     s.resources.cpu_millis = 500;
     s.resources.memory_bytes = 128 * MIB;
     s.sandbox.limits.memory_bytes = 256 * MIB;
+    if elastic {
+        s.runtime_class = "runsc".into();
+        let mut value = serde_json::to_value(s).unwrap();
+        value["sandbox"]["elastic_memory"] = serde_json::json!({"high_per_mille":750});
+        s = serde_json::from_value(value).unwrap();
+    }
     let assignment = Assignment {
         environment_id: s.id.clone(),
         node_id: "first".into(),
@@ -386,4 +398,138 @@ async fn memory_invalid_authorization_cannot_mutate_holds_or_reuse_completed_ope
             .authorization,
         growth
     );
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn memory_scheduler_restore_uses_settled_and_pending_holds() {
+    let (_rig, s, _, observation) = fixture().await;
+    s.initialize_memory(observation.clone(), "boot-first")
+        .await
+        .unwrap();
+    let shrink = s
+        .authorize_memory(request(&observation, "shrink-a", 128), "boot-first", 1000)
+        .await
+        .unwrap();
+    s.complete_memory(shrink.clone(), completed(&shrink), "boot-first")
+        .await
+        .unwrap();
+    let scheduler = Coordinator::restore(&s.snapshot().await.unwrap(), Placement::Spread).unwrap();
+    let (capacity, available) = scheduler.node_resources("first").unwrap();
+    assert_eq!(
+        capacity.memory_bytes - available.memory_bytes,
+        128 * MIB,
+        "scheduler must rebuild the settled allocation, not the immutable ceiling"
+    );
+    s.authorize_memory(
+        request(&completed(&shrink), "grow-a", 256),
+        "boot-first",
+        3000,
+    )
+    .await
+    .unwrap();
+    let scheduler = Coordinator::restore(&s.snapshot().await.unwrap(), Placement::Spread).unwrap();
+    let (capacity, available) = scheduler.node_resources("first").unwrap();
+    assert_eq!(
+        capacity.memory_bytes - available.memory_bytes,
+        256 * MIB,
+        "unknown growth remains held during scheduler restore"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn memory_elastic_birth_and_recovery_reserve_different_bounds() {
+    let (_rig, s, mut record, mut observation) = fixture_with_elastic(true).await;
+    assert_eq!(
+        held(&s).await,
+        128 * MIB,
+        "new elastic creation holds initial memory"
+    );
+    observation.memory_limit_bytes = 128 * MIB;
+    observation.memory_high_bytes = 96 * MIB;
+    s.initialize_memory(observation.clone(), "boot-first")
+        .await
+        .unwrap();
+    let grow = s
+        .authorize_memory(request(&observation, "grow-a", 192), "boot-first", 1000)
+        .await
+        .unwrap();
+    s.complete_memory(grow.clone(), completed(&grow), "boot-first")
+        .await
+        .unwrap();
+    assert_eq!(held(&s).await, 192 * MIB);
+    record.state = EnvironmentState::Paused;
+    record.revision += 1;
+    record.resources_held = false;
+    record.runtime.ip = None;
+    record.checkpoint = Some(adx_core::RestorePoint {
+        id: "checkpoint".into(),
+        origin: None,
+        expires_at_unix_seconds: u64::MAX,
+        source_runtime_id: record.runtime.id.clone(),
+        artifact: adx_core::CheckpointArtifact {
+            storage: "shared".into(),
+            location: "artifact".into(),
+            size_bytes: 8,
+        },
+    });
+    s.commit(record.clone()).await.unwrap();
+    assert_eq!(held(&s).await, 0);
+    let request = adx_core::execution::ExecutionRequest {
+        expected_revision: record.revision,
+        source: record,
+        kind: adx_core::execution::ExecutionKind::Resume,
+        operation_id: "resume-a".into(),
+        timeout_millis: 1000,
+    };
+    let grant = s
+        .authorize_execution(request, "boot-first", 3000)
+        .await
+        .unwrap();
+    assert_eq!(
+        held(&s).await,
+        256 * MIB,
+        "restore must reserve its possible saved limit before dispatch"
+    );
+    let scheduler = Coordinator::restore(&s.snapshot().await.unwrap(), Placement::Spread).unwrap();
+    let (capacity, available) = scheduler.node_resources("first").unwrap();
+    assert_eq!(capacity.memory_bytes - available.memory_bytes, 256 * MIB);
+    let mut restored = grant.target.clone();
+    restored.state = EnvironmentState::Running;
+    restored.revision += 1;
+    restored.runtime.ip = Some("10.0.0.3".parse().unwrap());
+    restored.last_operation = Some(adx_core::CompletedOperation {
+        id: grant.request.operation_id,
+        kind: adx_core::LifecycleKind::Resume,
+        expected_revision: grant.request.expected_revision,
+    });
+    s.commit(restored.clone()).await.unwrap();
+    assert_eq!(
+        held(&s).await,
+        256 * MIB,
+        "Running without exact memory readback does not release recovery allowance"
+    );
+    assert!(
+        s.initialize_memory(observation.clone(), "boot-first")
+            .await
+            .is_err(),
+        "old Runtime cannot settle the new recovery"
+    );
+    observation.identity.runtime_id = restored.runtime.id;
+    observation.identity.sandbox_id = "sbox-restored".into();
+    observation.identity.resource_generation = "generation-restored".into();
+    observation.memory_limit_bytes = 192 * MIB;
+    observation.memory_high_bytes = 144 * MIB;
+    s.initialize_memory(observation.clone(), "boot-first")
+        .await
+        .unwrap();
+    assert_eq!(
+        held(&s).await,
+        192 * MIB,
+        "complete birth proof settles only unused recovery allowance"
+    );
+    let scheduler = Coordinator::restore(&s.snapshot().await.unwrap(), Placement::Spread).unwrap();
+    let (capacity, available) = scheduler.node_resources("first").unwrap();
+    assert_eq!(capacity.memory_bytes - available.memory_bytes, 192 * MIB);
 }

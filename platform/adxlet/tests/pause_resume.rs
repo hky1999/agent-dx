@@ -1806,3 +1806,51 @@ async fn pending_execution_catalog_replaces_retired_source_controller() {
         "old source controller must be fenced"
     );
 }
+
+#[tokio::test]
+async fn elastic_memory_resume_reserves_ceiling_before_physical_dispatch() {
+    const MIB: u64 = 1024 * 1024;
+    let (_temp, backend, node, mut spec, assignment) = fixture();
+    spec.runtime_class = "runsc".into();
+    spec.resources.cpu_millis = 500;
+    spec.resources.memory_bytes = 128 * MIB;
+    spec.sandbox.limits.memory_bytes = 256 * MIB;
+    spec.sandbox.elastic_memory = Some(adx_core::memory::ElasticMemoryPolicy {
+        high_per_mille: 750,
+    });
+    let mut capacity = spec.resources;
+    capacity.memory_bytes = 512 * MIB;
+    node.update_capacity(capacity, Duration::from_secs(300))
+        .unwrap();
+    let handle = node.environment(spec, assignment).unwrap();
+    let running = handle.create().await.unwrap();
+    assert_eq!(node.used().memory_bytes, 128 * MIB);
+    let paused = handle.pause(pause(running.record.revision)).await.unwrap();
+    assert_eq!(node.used().memory_bytes, 0);
+    capacity.memory_bytes = 192 * MIB;
+    node.update_capacity(capacity, Duration::from_secs(300))
+        .unwrap();
+    backend.events.lock().unwrap().clear();
+    assert_eq!(
+        handle.resume(resume(paused.record.revision)).await,
+        Err(Error::NoCapacity)
+    );
+    assert!(!backend
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|e| e == "restore" || e == "start"));
+    assert_eq!(node.used().memory_bytes, 0);
+    capacity.memory_bytes = 512 * MIB;
+    node.update_capacity(capacity, Duration::from_secs(300))
+        .unwrap();
+    handle.resume(resume(paused.record.revision)).await.unwrap();
+    assert_eq!(
+        node.used().memory_bytes,
+        256 * MIB,
+        "unknown checkpoint limit keeps the conservative reservation"
+    );
+    handle.delete().await.unwrap();
+    assert_eq!(node.used(), Resources::default());
+}

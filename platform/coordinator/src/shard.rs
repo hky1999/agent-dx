@@ -142,7 +142,12 @@ impl ShardScheduler {
             )
         })
     }
-    pub fn restore(&mut self, spec: &EnvironmentSpec, assignment: &Assignment) -> Result<()> {
+    pub fn restore(
+        &mut self,
+        spec: &EnvironmentSpec,
+        assignment: &Assignment,
+        held: adx_core::Resources,
+    ) -> Result<()> {
         if self.assigned.contains_key(&spec.id) {
             return Err(Error::Conflict);
         }
@@ -152,7 +157,7 @@ impl ShardScheduler {
             .ok_or(Error::NotFound)?;
         let mut scalar = state.scalar.clone();
         let mut devices = state.devices.clone();
-        scalar.restore(&spec.id, spec.execution_resources())?;
+        scalar.restore(&spec.id, held)?;
         devices.restore(&spec.id, &assignment.devices)?;
         state.scalar = scalar;
         state.devices = devices;

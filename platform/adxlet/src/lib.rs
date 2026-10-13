@@ -257,6 +257,15 @@ pub(crate) struct Admission {
 
 impl Admission {
     fn reserve(&mut self, id: &str, spec: &EnvironmentSpec, assignment: &Assignment) -> Result<()> {
+        self.reserve_resources(id, spec, assignment, spec.execution_resources())
+    }
+    fn reserve_resources(
+        &mut self,
+        id: &str,
+        spec: &EnvironmentSpec,
+        assignment: &Assignment,
+        resources: Resources,
+    ) -> Result<()> {
         if self.maintenance
             || self.pressure
             || self
@@ -273,7 +282,7 @@ impl Admission {
         }
         let mut scalar = self.ledger.clone();
         let mut devices = self.devices.clone();
-        scalar.reserve(id, spec.execution_resources())?;
+        scalar.reserve(id, resources)?;
         devices.reserve(id, &spec.scheduling.devices, &assignment.devices)?;
         self.ledger = scalar;
         self.devices = devices;

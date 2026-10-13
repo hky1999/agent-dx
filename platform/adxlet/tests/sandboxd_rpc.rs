@@ -1,5 +1,6 @@
 //! Local gRPC/UDS contract tests against the pinned protocol, not sandboxd E2E.
 mod execution_authority;
+mod memory_elasticity;
 use adx_core::{Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Resources};
 use adxlet::sandboxd::proto::sandbox_service_server::SandboxService;
 use adxlet::{

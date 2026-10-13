@@ -59,6 +59,9 @@ fn sandbox_options_roundtrip_preserves_backend_contract() {
             memory_bytes: 2 << 30,
             disk_bytes: 4 << 30,
         },
+        elastic_memory: Some(adx_core::memory::ElasticMemoryPolicy {
+            high_per_mille: 750,
+        }),
         extra_config: r#"{"networkStack":"netstack"}"#.into(),
     };
     let wire: control::SandboxOptions = options.clone().into();
@@ -154,4 +157,15 @@ fn transport_metadata_cannot_impersonate_a_component() {
             .code(),
         tonic::Code::Unauthenticated
     );
+}
+
+#[test]
+fn elastic_memory_wire_ratio_does_not_truncate() {
+    let wire = control::SandboxOptions {
+        elastic_memory: Some(control::ElasticMemoryPolicy {
+            high_per_mille: 65536,
+        }),
+        ..Default::default()
+    };
+    assert!(adx_core::sandbox::SandboxOptions::try_from(wire).is_err());
 }

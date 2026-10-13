@@ -619,6 +619,7 @@ pub fn create_spec_with_environment(
             memory_bytes: memory_limit,
             disk_bytes: disk_limit,
         },
+        elastic_memory: None,
         extra_config,
     };
     sandbox

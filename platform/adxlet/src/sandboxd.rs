@@ -970,6 +970,20 @@ pub fn start_request(
         })
         .transpose()?
         .unwrap_or_default();
+    let mut labels = HashMap::from([
+        ("adx.environment_id".into(), spec.id.clone()),
+        ("adx.tenant_id".into(), spec.tenant_id.clone()),
+        ("adx.runtime_id".into(), runtime_id.into()),
+        ("adx.generation".into(), ownership_generation.to_string()),
+    ]);
+    if options.elastic_memory.is_some() {
+        let ceiling = spec.execution_ceiling();
+        labels.insert("akernel.scheduler/elastic-resources".into(), serde_json::json!({
+            "version": 1,
+            "CPU": { "initial": execution.cpu_millis, "ceiling": execution.cpu_millis },
+            "Memory": { "initial": execution.memory_bytes / 1_048_576, "ceiling": ceiling.memory_bytes / 1_048_576 },
+        }).to_string());
+    }
     Ok(proto::StartRequest {
         xpu_allocations: xpu
             .into_iter()
@@ -1023,12 +1037,7 @@ pub fn start_request(
             ("CPU".into(), execution.cpu_millis as f64),
             ("Memory".into(), execution.memory_bytes as f64 / 1_048_576.0),
         ]),
-        labels: HashMap::from([
-            ("adx.environment_id".into(), spec.id.clone()),
-            ("adx.tenant_id".into(), spec.tenant_id.clone()),
-            ("adx.runtime_id".into(), runtime_id.into()),
-            ("adx.generation".into(), ownership_generation.to_string()),
-        ]),
+        labels,
         metric_labels: HashMap::from([
             ("environment_id".into(), spec.id.clone()),
             ("runtime_id".into(), runtime_id.into()),

@@ -30,7 +30,7 @@ fn check_observation(
 ) -> Result<()> {
     observation.validate()?;
     let result = environment.result.as_ref().ok_or(Error::Conflict)?;
-    let ceiling = environment.spec.execution_resources();
+    let ceiling = environment.spec.execution_ceiling();
     if observation.identity.assignment != environment.assignment
         || observation.identity.runtime_id != result.runtime.id
         || !result.resources_held
@@ -100,10 +100,14 @@ impl StoredMemory {
 }
 
 impl StoredEnvironment {
-    /// Full static execution allowance until a complete physical memory account
-    /// exists. Pending growth holds its target; pending shrink holds its source.
-    pub(super) fn held_resources(&self) -> Resources {
-        let mut resources = self.spec.execution_resources();
+    /// Birth allowance for new creation; recovery keeps the permitted ceiling
+    /// until complete physical readback. Unknown growth holds its full target.
+    pub(crate) fn held_resources(&self) -> Resources {
+        let mut resources = if self.execution.is_some() || self.recovery.is_some() {
+            self.spec.execution_ceiling()
+        } else {
+            self.spec.execution_resources()
+        };
         if let Some(memory) = &self.memory {
             resources.memory_bytes = memory.held_bytes();
         }
@@ -151,9 +155,10 @@ fn check_live(environment: &StoredEnvironment) -> Result<()> {
 }
 
 impl Session {
-    /// Install the initial verified physical state without releasing any static
-    /// reservation. Requires configured host capacity and a current live session.
-    /// Partial, smaller, conflicting or retired observations return Conflict.
+    /// Install a complete birth observation under a current live session.
+    /// First creation must match its initial allowance. A completed elastic
+    /// recovery may settle its unused ceiling reservation from exact readback.
+    /// Partial, conflicting or retired observations return Conflict.
     pub async fn initialize_memory(
         &self,
         observation: MemoryObservation,
@@ -191,7 +196,12 @@ impl Session {
                     Err(Error::Conflict)
                 };
             }
-            if observation.memory_limit_bytes != environment.spec.execution_resources().memory_bytes
+            let recovered_elastic = environment.spec.sandbox.elastic_memory.is_some()
+                && (environment.execution.is_some() || environment.recovery.is_some());
+            if (!recovered_elastic
+                && observation.memory_limit_bytes
+                    != environment.spec.execution_resources().memory_bytes)
+                || observation.memory_limit_bytes > environment.held_resources().memory_bytes
                 || observation.resource_revision != 1
                 || !observation.operation_id.is_empty()
             {

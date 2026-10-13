@@ -419,3 +419,31 @@ async fn restart_after_interrupted_reconciliation_retries_physical_cleanup() {
         .iter()
         .any(|event| event.starts_with("bind:")));
 }
+
+#[tokio::test]
+async fn elastic_memory_restart_keeps_ceiling_without_authoritative_memory_account() {
+    const MIB: u64 = 1024 * 1024;
+    let b = Arc::new(Backend::default());
+    *b.actual.lock().unwrap() = vec![observed("elastic")];
+    let node = manager(&b);
+    let mut running = record("elastic", EnvironmentState::Running);
+    running.spec.runtime_class = "runsc".into();
+    running.spec.resources.cpu_millis = 500;
+    running.spec.resources.memory_bytes = 128 * MIB;
+    running.spec.sandbox.limits.memory_bytes = 512 * MIB;
+    running.spec.sandbox.elastic_memory = Some(adx_core::memory::ElasticMemoryPolicy {
+        high_per_mille: 750,
+    });
+    node.reconcile(vec![running]).await.unwrap();
+    assert_eq!(
+        node.used().memory_bytes,
+        512 * MIB,
+        "a lifecycle record alone does not prove the current dynamic limit"
+    );
+    assert!(!b
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|e| e.starts_with("remove:")));
+}

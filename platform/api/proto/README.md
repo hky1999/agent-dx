@@ -116,3 +116,7 @@ conflicting cursor or regressed execution version causes a fresh subscription.
 Coordinator publishes only committed, Running Environments on routable nodes. API key
 verification is shared by trusted API Server and Ingress callers. Route publication
 and credentials do not transfer Environment lifecycle ownership to Coordinator.
+
+## 显式弹性内存
+
+`SandboxOptions.elastic_memory` 使用 `ElasticMemoryPolicy.high_per_mille` 保存期望的软节流比例。仅支持 runsc 的普通创建，请求内存是出生额度和下限，`limits.memory_bytes` 是允许上限，两者须为整数 MiB。固定配置省略该字段；CPU 和磁盘规则不变。快照克隆暂不支持，公开 HTTP 和 Python SDK 尚未暴露此选项。此协议字段与 sandboxd 出生标签已接通，资源调整 RPC、节点额度同步和自动策略仍待实现，详见[节点资源契约](../../../docs/testing/node-lifecycle.md)。

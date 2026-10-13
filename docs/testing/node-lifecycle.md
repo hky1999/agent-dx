@@ -14,9 +14,13 @@ adxlet 拥有实例串行状态机。Coordinator 提供归属校验、Redis 持�
 
 ## 资源与指标
 
-`EnvironmentSpec.resources` 保存请求值，`sandbox.limits` 保存执行上限；上限为零时采用对应请求值。Coordinator 的过滤、评分和预留、节点直接准入、临时预留转交与重启对账均采用 `EnvironmentSpec.execution_resources()` 得到的执行额度。CPU、内存与显式磁盘额度必须完整预留，不能仅预留较小请求值后给运行时发放更大上限。Start 使用同一额度，并拒绝超过 sandboxd 数值精度的 CPU／内存上限。
+`EnvironmentSpec.resources` 保存请求值，`sandbox.limits` 保存不可变允许上限；上限为零时采用对应请求值。默认固定资源配置使用 `EnvironmentSpec.execution_ceiling()` 的完整额度进行创建和预留。
 
-此规则保持当前固定资源配置的保守准入。请求和磁盘上限均为零时仍不设置可写层配额，不能声称所有磁盘使用已经受预算约束。替换执行的中心持久预留已经接通；同宿主多个节点共享容量的存储接口已经实现，生产配置尚未启用。独立动态资源授权和扩缩容仍待完成，不能用请求与执行上限的差额宣称已支持安全超卖。具体状态及配置边界见 [宿主准入与执行授权](coordinator-storage.md)。
+内部 Environment 协议可显式配置 `sandbox.elastic_memory={"high_per_mille":750}`。此时 `execution_resources()` 的内存为请求值，作为出生额度和缩容下限；CPU 和磁盘仍使用完整上限。仅支持 runsc，请求和允许上限必须为整数 MiB，比例必须大于 0 且小于 1000，出生软限制至少为 4096 字节，CPU 上限至少为 10 毫核；数值超过 sandboxd 精度时拒绝。快照克隆暂不接受该选项。Start 写入 sandboxd 第一版弹性策略标签，CPU 的初值和上限相同，内存分别记录初值和允许上限；不通过修改原始规格记录后续额度。
+
+恢复可能携带已经增长的内存上限，因此中心和节点在恢复前预留完整允许上限，Running 状态本身不能归还差额。Coordinator 从持久内存账户重建确认额度及待执行扩容额度；节点重启只有生命周期记录时保守保留允许上限。完整物理回读、节点内存账户同步和资源操作 RPC 尚未接通，节点保守预留尚不能自动收敛到实际额度。此选项当前没有公开 HTTP／Python SDK 入口，也不启用自动调整；期望的 memory.high 比例需要后续执行链路验证 sandboxd 配置。具体边界见 [宿主准入与执行授权](coordinator-storage.md)。
+
+请求和磁盘上限均为零时仍不设置可写层配额，不能声称所有磁盘使用已经受预算约束。宿主共享预算已经有生产配置入口；独立内存授权的存储实现不等于物理动态资源或安全超卖已经验收。
 
 `resource_source` 选择以下之一，也可保留既有 `capacity_file`。两者不能同时配置。
 

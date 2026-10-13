@@ -272,6 +272,8 @@ pub struct SandboxOptions {
     pub inherit_entrypoint: bool,
     #[serde(default)]
     pub limits: ResourceLimits,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elastic_memory: Option<crate::memory::ElasticMemoryPolicy>,
     #[serde(default)]
     pub extra_config: String,
 }
@@ -298,6 +300,12 @@ impl SandboxOptions {
             return Err(Error::Invalid(
                 "execution limits cannot be lower than resource requests".into(),
             ));
+        }
+        if let Some(policy) = &self.elastic_memory {
+            policy.validate(
+                requests.memory_bytes,
+                requests.memory_bytes.max(limits.memory_bytes),
+            )?;
         }
         if self.inherit_entrypoint
             && !matches!(

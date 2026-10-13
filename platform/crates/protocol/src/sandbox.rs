@@ -315,6 +315,9 @@ impl From<core::SandboxOptions> for pb::SandboxOptions {
                 memory_bytes: value.limits.memory_bytes,
                 disk_bytes: value.limits.disk_bytes,
             }),
+            elastic_memory: value.elastic_memory.map(|policy| pb::ElasticMemoryPolicy {
+                high_per_mille: u32::from(policy.high_per_mille),
+            }),
             extra_config: value.extra_config,
         }
     }
@@ -348,6 +351,15 @@ impl TryFrom<pb::SandboxOptions> for core::SandboxOptions {
                 memory_bytes: limits.memory_bytes,
                 disk_bytes: limits.disk_bytes,
             },
+            elastic_memory: value
+                .elastic_memory
+                .map(|policy| {
+                    Ok::<_, Error>(adx_core::memory::ElasticMemoryPolicy {
+                        high_per_mille: u16::try_from(policy.high_per_mille)
+                            .map_err(|_| invalid("elastic memory soft-limit ratio"))?,
+                    })
+                })
+                .transpose()?,
             extra_config: value.extra_config,
         })
     }

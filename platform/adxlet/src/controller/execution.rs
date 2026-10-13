@@ -41,10 +41,11 @@ impl Controller {
             .admission
             .lock()
             .expect("shared state lock poisoned")
-            .reserve(
+            .reserve_resources(
                 &target.runtime.id,
                 &self.record.spec,
                 &self.record.assignment,
+                self.record.spec.execution_ceiling(),
             )?;
         let granted = timeout(self.services.operation_timeout, async {
             self.services.runtime.prepare_execution(&target).await?;

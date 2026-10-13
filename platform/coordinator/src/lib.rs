@@ -108,7 +108,11 @@ impl Coordinator {
         for (id, environment) in &saved.environments {
             if environment.resources_held() {
                 let shard = environment.assignment.shard_id;
-                coordinator.shards[shard].restore(&environment.spec, &environment.assignment)?;
+                coordinator.shards[shard].restore(
+                    &environment.spec,
+                    &environment.assignment,
+                    environment.held_resources(),
+                )?;
                 coordinator
                     .requests
                     .insert(id.clone(), (shard, environment.spec.clone()));
@@ -273,7 +277,7 @@ impl Coordinator {
             shard.forget_queued(&spec.id);
         }
         self.requests.remove(&spec.id);
-        self.restore_assignment(spec, assignment)?;
+        self.restore_assignment_with_resources(spec, assignment, spec.execution_resources())?;
         self.generation = self.generation.max(assignment.generation);
         Ok(())
     }
@@ -466,11 +470,20 @@ impl Coordinator {
         self.wake_pending(None);
         Ok(())
     }
-    /// Apply a committed same-node resume to the incremental scheduling view.
+    /// Restore ownership when only the immutable specification is available.
+    /// Reserve its full ceiling; rebuilding from storage uses exact durable holds.
     pub fn restore_assignment(
         &mut self,
         spec: &EnvironmentSpec,
         assignment: &Assignment,
+    ) -> Result<()> {
+        self.restore_assignment_with_resources(spec, assignment, spec.execution_ceiling())
+    }
+    fn restore_assignment_with_resources(
+        &mut self,
+        spec: &EnvironmentSpec,
+        assignment: &Assignment,
+        held: adx_core::Resources,
     ) -> Result<()> {
         if self.requests.contains_key(&spec.id)
             || self.node_shards.get(&assignment.node_id) != Some(&assignment.shard_id)
@@ -480,7 +493,7 @@ impl Coordinator {
         self.shards
             .get_mut(assignment.shard_id)
             .ok_or(Error::NotFound)?
-            .restore(spec, assignment)?;
+            .restore(spec, assignment, held)?;
         self.requests
             .insert(spec.id.clone(), (assignment.shard_id, spec.clone()));
         Arc::make_mut(&mut self.snapshot).place(PlacedEnvironment {

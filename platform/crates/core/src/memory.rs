@@ -49,6 +49,32 @@ pub struct MemoryAuthorization {
     pub deadline_unix_millis: u64,
 }
 
+/// Explicit opt-in for elastic memory. The request is the initial allocation and
+/// floor; SandboxOptions::limits remains the immutable allowed ceiling. The node
+/// must verify the configured sandboxd soft-limit ratio before authorizing changes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ElasticMemoryPolicy {
+    pub high_per_mille: u16,
+}
+
+impl ElasticMemoryPolicy {
+    pub fn validate(&self, initial_bytes: u64, ceiling_bytes: u64) -> Result<()> {
+        const MIB: u64 = 1_048_576;
+        if !(1..1000).contains(&self.high_per_mille)
+            || initial_bytes == 0
+            || !initial_bytes.is_multiple_of(MIB)
+            || !ceiling_bytes.is_multiple_of(MIB)
+            || ceiling_bytes < initial_bytes
+            || ceiling_bytes > 1 << 53
+            || (u128::from(initial_bytes) * u128::from(self.high_per_mille)).div_ceil(1000) < 4096
+        {
+            return Err(Error::Invalid("elastic memory requires whole MiB bounds and a soft-limit ratio between 0 and 1000 exclusive that yields at least one 4096-byte page".into()));
+        }
+        Ok(())
+    }
+}
+
 fn valid_id(id: &str) -> bool {
     !id.is_empty() && id.trim() == id && id.len() <= 256 && !id.chars().any(char::is_control)
 }
