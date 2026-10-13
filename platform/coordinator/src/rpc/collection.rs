@@ -84,7 +84,7 @@ impl CoordinatorRpc {
                 state.environments.remove(id);
                 state.failed_environments.remove(id);
                 state.specs.remove(id);
-                state.scheduling_deadlines.remove(id);
+                state.scheduling_attempts.remove(id);
                 state.needs_recovery = false;
                 self.0.changed.notify_waiters();
                 return Ok(true);

@@ -3,6 +3,8 @@ mod common;
 mod host_budget;
 #[path = "rpc/host_budget_configuration.rs"]
 mod host_budget_configuration;
+#[path = "rpc/host_budget_rejection.rs"]
+mod host_budget_rejection;
 #[path = "rpc/host_budget_view.rs"]
 mod host_budget_view;
 use adx_coordinator::{routes::RoutePublisher, rpc::CoordinatorRpc, storage::Session, Placement};

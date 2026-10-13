@@ -217,3 +217,5 @@ operations, which may still produce a conflict.
 ## 宿主预算查询
 
 `GET /api/sandbox/v1/resources` 保留节点 `items`，并返回 `host_budget_configured` 与 `host_budgets`。每个宿主独立提供持久 `capacity`、`held`、`available` 和在线可调度上界 `allocatable`，标量单位明确为毫核与字节。节点条目中的 `host_id` 说明共享归属，多个同宿主分片不能重复计入总容量。节点离线时持久占用仍保留，存储未知或视图过期返回不可用。兼容查询和具体字段见 [API Server 资源视图](../README.md)。
+
+中央创建在持久宿主预算准入处返回 `RESOURCE_EXHAUSTED`／`not_started` 后，这次排队尝试已终结。之后的容量释放不会自动启动它；客户端可以退避后使用相同环境 ID 发起新尝试。同一轮中的其他请求独立接收自己的结果。恢复的容量拒绝仍保留已暂停的环境和检查点。

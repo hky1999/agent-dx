@@ -17,7 +17,7 @@ use adx_protocol::{
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 use tokio::sync::{mpsc, oneshot, Mutex, Notify};
@@ -31,6 +31,26 @@ struct LiveNode {
     inspected: bool,
     report: pb::RegisterNodeRequest,
 }
+/// Shared by callers of the same queued attempt, including callers awakened
+/// after a newer explicit retry has already submitted the same Environment ID.
+struct SchedulingAttempt {
+    deadline: tokio::time::Instant,
+    rejection: OnceLock<Error>,
+}
+impl SchedulingAttempt {
+    fn new(timeout: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            deadline: tokio::time::Instant::now() + timeout,
+            rejection: OnceLock::new(),
+        })
+    }
+    fn check(&self) -> Result<()> {
+        self.rejection
+            .get()
+            .map_or(Ok(()), |error| Err(error.clone()))
+    }
+}
+
 struct State {
     session: Session,
     scheduler: Coordinator,
@@ -45,7 +65,7 @@ struct State {
     live: BTreeMap<String, LiveNode>,
     recovering: BTreeMap<String, tokio::time::Instant>,
     retired_sessions: BTreeSet<(String, String)>,
-    scheduling_deadlines: BTreeMap<String, tokio::time::Instant>,
+    scheduling_attempts: BTreeMap<String, Arc<SchedulingAttempt>>,
 }
 
 fn requires_node_reconciliation(environment: &StoredEnvironment) -> bool {
@@ -173,9 +193,36 @@ impl State {
                         .insert(assignment.environment_id.clone(), fresh);
                 }
                 Err(Error::NoCapacity) => {
-                    self.needs_recovery = true;
-                    self.recover_authoritative_state().await?;
-                    return Err(Error::NoCapacity);
+                    // Admission rejected this exact assignment before any durable
+                    // write. Undo only its speculative reservation and continue
+                    // the round: another caller may already have a durable owner.
+                    if let Err(error) = self.scheduler.release(&assignment) {
+                        self.needs_recovery = true;
+                        return Err(error);
+                    }
+                    if !self.environments.contains_key(&assignment.environment_id) {
+                        if let Some(attempt) =
+                            self.scheduling_attempts.remove(&assignment.environment_id)
+                        {
+                            let _ = attempt.rejection.set(Error::NoCapacity);
+                        }
+                        // Remove before an asynchronous snapshot-pin release, so
+                        // recovery cannot resurrect a definitively rejected create.
+                        if let Some(spec) = self.specs.remove(&assignment.environment_id) {
+                            if let Some(snapshot_id) = spec.snapshot_id {
+                                self.session
+                                    .release_snapshot(
+                                        &snapshot_id,
+                                        adx_core::snapshots::Reference::Restore {
+                                            environment_id: spec.id,
+                                        },
+                                    )
+                                    .await?;
+                            }
+                        }
+                    }
+                    // An invalidated, durable source stays eligible for the next
+                    // recovery scan; a new create requires a new explicit attempt.
                 }
                 Err(Error::Conflict) => {
                     // Rebuild the whole precomputed round after a competing owner
@@ -377,7 +424,7 @@ impl CoordinatorRpc {
                 live: BTreeMap::new(),
                 recovering,
                 retired_sessions: BTreeSet::new(),
-                scheduling_deadlines: BTreeMap::new(),
+                scheduling_attempts: BTreeMap::new(),
             }),
             claim_sender,
             changed: Notify::new(),
@@ -447,16 +494,20 @@ impl CoordinatorRpc {
         spec: EnvironmentSpec,
         schedule_timeout: Duration,
     ) -> std::result::Result<pb::EnvironmentResult, Status> {
-        let mut schedule_deadline = None;
+        let mut attempt: Option<Arc<SchedulingAttempt>> = None;
         loop {
             let changed = self.0.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
             let mut state = self.0.state.lock().await;
+            if let Some(attempt) = &attempt {
+                attempt.check().map_err(status)?;
+            }
             state.recover_authoritative_state().await.map_err(status)?;
             state.healthy().map_err(status)?;
-            if schedule_deadline.is_some_and(|deadline| {
-                tokio::time::Instant::now() >= deadline && !state.specs.contains_key(&spec.id)
+            if attempt.as_ref().is_some_and(|attempt| {
+                tokio::time::Instant::now() >= attempt.deadline
+                    && !state.specs.contains_key(&spec.id)
             }) {
                 return Err(Status::deadline_exceeded(
                     "central scheduling queue deadline exceeded; retry the same Environment ID",
@@ -468,11 +519,12 @@ impl CoordinatorRpc {
                         "environment ID has a different specification",
                     ));
                 }
-                schedule_deadline.get_or_insert_with(|| {
-                    *state
-                        .scheduling_deadlines
+                attempt.get_or_insert_with(|| {
+                    state
+                        .scheduling_attempts
                         .entry(spec.id.clone())
-                        .or_insert_with(|| tokio::time::Instant::now() + schedule_timeout)
+                        .or_insert_with(|| SchedulingAttempt::new(schedule_timeout))
+                        .clone()
                 });
             } else {
                 if let Some(id) = &spec.snapshot_id {
@@ -504,17 +556,23 @@ impl CoordinatorRpc {
                     return Err(status(error));
                 }
                 state.specs.insert(spec.id.clone(), spec.clone());
-                let deadline = tokio::time::Instant::now() + schedule_timeout;
-                state.scheduling_deadlines.insert(spec.id.clone(), deadline);
-                schedule_deadline.get_or_insert(deadline);
+                let submitted = SchedulingAttempt::new(schedule_timeout);
+                state
+                    .scheduling_attempts
+                    .insert(spec.id.clone(), submitted.clone());
+                attempt.get_or_insert(submitted);
             }
             let drive = state.drive().await;
             if drive.as_ref().is_err() || drive.as_ref().is_ok_and(|progress| *progress) {
                 self.0.changed.notify_waiters();
             }
+            let current = attempt
+                .as_ref()
+                .expect("submitted request has a scheduling attempt");
+            current.check().map_err(status)?;
             let progress = drive.map_err(status)?;
             if state.environments.contains_key(&spec.id) {
-                state.scheduling_deadlines.remove(&spec.id);
+                state.scheduling_attempts.remove(&spec.id);
                 // Recheck storage session before using a cached assignment.
                 let stored = state.session.get(&spec.id).await.map_err(status)?;
                 if stored.invalidated || stored.recovery.as_ref().is_some_and(|r| r.pending) {
@@ -632,14 +690,14 @@ impl CoordinatorRpc {
                 return Ok(result);
             }
             drop(state);
-            let deadline = schedule_deadline.expect("submitted request has a queue deadline");
+            let deadline = current.deadline;
             if progress {
                 tokio::task::yield_now().await;
             } else {
                 if tokio::time::timeout_at(deadline, changed).await.is_ok() {
                     continue;
                 }
-                if self.expire_pending(&spec, deadline).await? {
+                if self.expire_pending(&spec, current).await? {
                     return Err(Status::deadline_exceeded(
                         "central scheduling queue deadline exceeded; retry the same Environment ID",
                     ));
@@ -651,17 +709,20 @@ impl CoordinatorRpc {
     async fn expire_pending(
         &self,
         spec: &EnvironmentSpec,
-        deadline: tokio::time::Instant,
+        attempt: &Arc<SchedulingAttempt>,
     ) -> std::result::Result<bool, Status> {
         let mut state = self.0.state.lock().await;
         if state.environments.contains_key(&spec.id)
-            || state.scheduling_deadlines.get(&spec.id) != Some(&deadline)
+            || state
+                .scheduling_attempts
+                .get(&spec.id)
+                .is_none_or(|pending| !Arc::ptr_eq(pending, attempt))
             || !state.scheduler.cancel_pending(&spec.id)
         {
             return Ok(false);
         }
         state.specs.remove(&spec.id);
-        state.scheduling_deadlines.remove(&spec.id);
+        state.scheduling_attempts.remove(&spec.id);
         if let Some(snapshot_id) = &spec.snapshot_id {
             state
                 .session
@@ -787,7 +848,7 @@ impl CoordinatorRpc {
             state.environments.remove(&accepted.spec.id);
             state.failed_environments.remove(&accepted.spec.id);
             state.specs.remove(&accepted.spec.id);
-            state.scheduling_deadlines.remove(&accepted.spec.id);
+            state.scheduling_attempts.remove(&accepted.spec.id);
         }
         self.0.changed.notify_waiters();
         Ok(accepted)

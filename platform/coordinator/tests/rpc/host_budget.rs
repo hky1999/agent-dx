@@ -3,9 +3,9 @@ use adx_coordinator::storage::HostBudget;
 use adxlet::StateSink;
 use std::collections::BTreeMap;
 
-struct ReplyLossSink {
-    upstream: CoordinatorStateSink,
-    lose_next: std::sync::atomic::AtomicBool,
+pub(super) struct ReplyLossSink {
+    pub(super) upstream: CoordinatorStateSink,
+    pub(super) lose_next: std::sync::atomic::AtomicBool,
 }
 #[async_trait::async_trait]
 impl StateSink for ReplyLossSink {
