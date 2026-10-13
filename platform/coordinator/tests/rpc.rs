@@ -1,4 +1,6 @@
 mod common;
+#[path = "rpc/host_budget.rs"]
+mod host_budget;
 use adx_coordinator::{routes::RoutePublisher, rpc::CoordinatorRpc, storage::Session, Placement};
 use adx_core::{
     scheduling::DeviceAllocation, EnvironmentRecord, EnvironmentSpec, Resources, Result,

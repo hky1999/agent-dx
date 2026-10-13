@@ -31,14 +31,17 @@ impl Session {
         }
         let field = format!("environment:{}", previous.environment_id);
         for _ in 0..ATTEMPTS {
-            let [header_value, environment_value, node_value] = self
+            let raw = self
                 .store
-                .fields([
+                .allocation_view(&[
                     HEADER.into(),
                     field.clone(),
                     format!("node:{}", replacement.node_id),
                 ])
                 .await?;
+            let header_value = raw.get(HEADER).cloned();
+            let environment_value = raw.get(&field).cloned();
+            let node_value = raw.get(&format!("node:{}", replacement.node_id)).cloned();
             let mut header = self.header(&header_value)?;
             let mut stored_environment: StoredEnvironment =
                 decode(environment_value.as_deref().ok_or(Error::NotFound)?)?;
@@ -97,6 +100,7 @@ impl Session {
                 pending: true,
             });
             stored_environment.validate()?;
+            budget::check_admission(&raw, &header, &stored_environment)?;
             header.generation = replacement.generation;
             header.advance()?;
             if self

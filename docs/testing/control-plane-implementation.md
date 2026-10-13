@@ -37,6 +37,8 @@ adxlet 调用 sandboxd Start 时，RPC 失败、超时、应答丢失或成功�
 
 节点心跳超时后，Coordinator 持久化失效、撤销路由并保留原占用。只有原执行确认未开始或已经退役，才允许结算并协调有效共享 checkpoint 的恢复；已预留但未确认的恢复操作同样保留预算。local-only、缺失或过期 checkpoint 直接失败。原节点返回先清理失效执行，再开放准入。心跳失效是控制面判定，不是物理进程已停止的证据；当前没有跨宿主网络分区的强隔离验收，见 [失效契约](node-failure-takeover.md)。
 
+宿主容量与创建准入的新存储契约见 [宿主持久准入](coordinator-storage.md#宿主持久准入的库接线阶段)。该库接线尚未由部署配置启用；公开恢复预授权、动态资源授权和按宿主汇总的公开视图仍在开发。
+
 ## 公开能力与 Agent 边界
 
 新平台已接通创建、查询、删除、同节点暂停/恢复、reload、可复用快照目录和克隆、空闲删除、重启策略、`failover=true`、HTTP/SDK 放置约束、S3 rootfs／mount、镜像入口继承、创建及运行期网络策略、独立执行 limit、extra_config、每实例数据面安全策略、鉴权端口转发、`upstream` reverse tunnel 及命令/文件数据链路。公开请求中的本机 rootfs 和 host mount 会被拒绝；节点本地 Execd 运行环境仍由部署配置拥有。旧 `/invoke` 兼容传输不属于新数据链路。

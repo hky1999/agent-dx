@@ -3,6 +3,8 @@ mod budget_expiry;
 #[path = "storage/claims.rs"]
 mod claims;
 mod common;
+#[path = "storage/host_budget.rs"]
+mod host_budget;
 use adx_coordinator::{storage::StoredNode, Coordinator, Node, Placement};
 use adx_core::{
     Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Error, Resources,

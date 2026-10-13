@@ -1,5 +1,7 @@
 //! Single-Coordinator Redis persistence. Lua only compares opaque bytes and performs
 //! atomic hash writes; JSON and u64 counters are validated in Rust, never Lua doubles.
+mod budget;
+pub use budget::{HostBudget, HostBudgetStatus};
 mod claims;
 pub use claims::{ClaimOutcome, LocalClaim};
 mod collection;
@@ -62,6 +64,8 @@ struct Header {
     generation: u64,
     revision: u64,
     next_node_shard: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host_budgets: Option<BTreeMap<String, HostBudget>>,
 }
 impl Header {
     fn advance(&mut self) -> Result<()> {
@@ -69,14 +73,19 @@ impl Header {
         Ok(())
     }
     fn validate(&self) -> Result<()> {
-        if self.schema != 1
-            || self.shards == 0
+        if !matches!(
+            (self.schema, self.host_budgets.is_some()),
+            (1, false) | (2, true)
+        ) || self.shards == 0
             || self.next_node_shard >= self.shards
             || self.epoch == 0
         {
             return Err(Error::Unavailable(
                 "unsupported or corrupt control metadata".into(),
             ));
+        }
+        if let Some(budgets) = &self.host_budgets {
+            budget::validate_budgets(budgets)?;
         }
         Ok(())
     }
@@ -492,17 +501,33 @@ impl RedisStore {
             Error::Unavailable("Redis returned an unexpected control field count".into())
         })
     }
-    async fn fields_vec(&self, fields: &[String]) -> Result<Vec<Option<String>>> {
-        let mut cmd = redis::cmd("HMGET");
-        cmd.arg(&self.key).arg(fields);
-        let values: Vec<Option<String>> = self.query(cmd).await?;
+    /// Keep the unconfigured storage hot path bounded. A configured host budget
+    /// requires one complete view of holds; its own header is the CAS operand.
+    /// If configuration is installed after a narrow read, that read's header CAS
+    /// fails, and the next attempt necessarily reads the complete budget view.
+    async fn allocation_view(&self, fields: &[String]) -> Result<BTreeMap<String, String>> {
+        let mut command = redis::cmd("HMGET");
+        command.arg(&self.key).arg(fields);
+        let values: Vec<Option<String>> = self.query(command).await?;
         if values.len() != fields.len() {
             return Err(Error::Unavailable(
                 "Redis returned an unexpected control field count".into(),
             ));
         }
-        Ok(values)
+        let raw: BTreeMap<_, _> = fields
+            .iter()
+            .cloned()
+            .zip(values)
+            .filter_map(|(field, value)| value.map(|value| (field, value)))
+            .collect();
+        let header: Header = decode(raw.get(HEADER).ok_or(Error::Conflict)?)?;
+        if header.host_budgets.is_some() {
+            self.raw().await
+        } else {
+            Ok(raw)
+        }
     }
+
     async fn raw(&self) -> Result<BTreeMap<String, String>> {
         let mut cmd = redis::cmd("HGETALL");
         cmd.arg(&self.key);
@@ -605,6 +630,7 @@ impl RedisStore {
                     generation: 0,
                     revision: 0,
                     next_node_shard: 0,
+                    host_budgets: None,
                 }
             } else {
                 let mut h: Header = decode(old)?;
@@ -748,6 +774,7 @@ fn snapshot(raw: &BTreeMap<String, String>) -> Result<StoredSnapshot> {
         }
     }
     out.validate()?;
+    budget::check_holds(raw, &h, None)?;
     Ok(out)
 }
 #[derive(Clone)]
@@ -1041,14 +1068,19 @@ impl Session {
         record.validate()?;
         let field = format!("environment:{}", record.spec.id);
         for _ in 0..ATTEMPTS {
-            let [header_value, environment_value, node_value] = self
+            let raw = self
                 .store
-                .fields([
+                .allocation_view(&[
                     HEADER.into(),
                     field.clone(),
                     format!("node:{}", record.assignment.node_id),
                 ])
                 .await?;
+            let header_value = raw.get(HEADER).cloned();
+            let environment_value = raw.get(&field).cloned();
+            let node_value = raw
+                .get(&format!("node:{}", record.assignment.node_id))
+                .cloned();
             let mut header = self.header(&header_value)?;
             if let Some(environment_value) = &environment_value {
                 let existing: StoredEnvironment = decode(environment_value)?;
@@ -1064,6 +1096,7 @@ impl Session {
             {
                 return Err(Error::Conflict);
             }
+            budget::check_admission(&raw, &header, &record)?;
             header.generation = record.assignment.generation;
             header.advance()?;
             if self
@@ -1098,14 +1131,17 @@ impl Session {
         }
         let field = format!("environment:{}", previous.environment_id);
         for _ in 0..ATTEMPTS {
-            let [header_value, environment_value, node_value] = self
+            let raw = self
                 .store
-                .fields([
+                .allocation_view(&[
                     HEADER.into(),
                     field.clone(),
                     format!("node:{}", replacement.node_id),
                 ])
                 .await?;
+            let header_value = raw.get(HEADER).cloned();
+            let environment_value = raw.get(&field).cloned();
+            let node_value = raw.get(&format!("node:{}", replacement.node_id)).cloned();
             let mut header = self.header(&header_value)?;
             let mut stored_environment: StoredEnvironment =
                 decode(environment_value.as_deref().ok_or(Error::NotFound)?)?;
@@ -1130,6 +1166,7 @@ impl Session {
             stored_environment.assignment = replacement.clone();
             stored_environment.result = None;
             stored_environment.validate()?;
+            budget::check_admission(&raw, &header, &stored_environment)?;
             header.generation = replacement.generation;
             header.advance()?;
             if self
@@ -1172,8 +1209,12 @@ impl Session {
         }
         let field = format!("environment:{}", result.spec.id);
         for _ in 0..ATTEMPTS {
-            let [header_value, environment_value] =
-                self.store.fields([HEADER.into(), field.clone()]).await?;
+            let raw = self
+                .store
+                .allocation_view(&[HEADER.into(), field.clone()])
+                .await?;
+            let header_value = raw.get(HEADER).cloned();
+            let environment_value = raw.get(&field).cloned();
             let mut header = self.header(&header_value)?;
             let Some(environment_value) = environment_value.as_deref() else {
                 if result.state == EnvironmentState::Deleted {
@@ -1203,6 +1244,7 @@ impl Session {
             stored_environment.result = Some(result.clone());
             stored_environment.track_failure(collection::now()?);
             stored_environment.validate()?;
+            budget::check_holds(&raw, &header, Some(&stored_environment))?;
             header.advance()?;
             let expected_header = header_value
                 .as_deref()

@@ -172,6 +172,11 @@ impl State {
                     self.environments
                         .insert(assignment.environment_id.clone(), fresh);
                 }
+                Err(Error::NoCapacity) => {
+                    self.needs_recovery = true;
+                    self.recover_authoritative_state().await?;
+                    return Err(Error::NoCapacity);
+                }
                 Err(Error::Conflict) => {
                     // Rebuild the whole precomputed round after a competing owner
                     // or generation wins. Only uncommitted work is requeued.

@@ -95,14 +95,17 @@ impl Session {
         validate_device_assignment(&spec.scheduling.devices, &candidate.devices)?;
         let field = format!("environment:{}", spec.id);
         for _ in 0..ATTEMPTS {
-            let [header_value, environment_value, node_value] = self
+            let raw = self
                 .store
-                .fields([
+                .allocation_view(&[
                     HEADER.into(),
                     field.clone(),
                     format!("node:{}", candidate.node_id),
                 ])
                 .await?;
+            let header_value = raw.get(HEADER).cloned();
+            let environment_value = raw.get(&field).cloned();
+            let node_value = raw.get(&format!("node:{}", candidate.node_id)).cloned();
             let mut header = self.header(&header_value)?;
             let node: StoredNode = decode(node_value.as_deref().ok_or(Error::NotFound)?)?;
             if node.node.id != candidate.node_id
@@ -167,6 +170,7 @@ impl Session {
                 },
             };
             record.validate()?;
+            budget::check_admission(&raw, &header, &record)?;
             header.generation = generation;
             header.advance()?;
             let mut command = redis::cmd("EVAL");
@@ -223,8 +227,14 @@ impl Session {
                 .chain(environment_fields.iter().cloned())
                 .chain(node_fields.iter().cloned())
                 .collect();
-            let values = self.store.fields_vec(&fields).await?;
-            let mut by_field: BTreeMap<_, _> = fields.into_iter().zip(values).collect();
+            let mut raw = self.store.allocation_view(&fields).await?;
+            let mut by_field: BTreeMap<_, _> = fields
+                .into_iter()
+                .map(|field| {
+                    let value = raw.get(&field).cloned();
+                    (field, value)
+                })
+                .collect();
             let header_value = by_field.remove(HEADER).flatten().ok_or(Error::Conflict)?;
             let mut header = self.header(&Some(header_value.clone()))?;
             let mut environments = BTreeMap::new();
@@ -296,8 +306,6 @@ impl Session {
                         }
                     }
                     let generation = header.generation.checked_add(1).ok_or(Error::Conflict)?;
-                    header.generation = generation;
-                    header.advance()?;
                     let record = StoredEnvironment {
                         failed_since_unix_seconds: None,
                         recovery: None,
@@ -313,6 +321,10 @@ impl Session {
                         },
                     };
                     record.validate()?;
+                    budget::check_admission(&raw, &header, &record)?;
+                    header.generation = generation;
+                    header.advance()?;
+                    raw.insert(format!("environment:{}", spec.id), encode(&record)?);
                     environments.insert(spec.id.clone(), record.clone());
                     writes.push((
                         format!("environment:{}", spec.id),
