@@ -71,7 +71,7 @@ fn statuses(
             .values_mut()
             .find(|status| status.nodes.contains(&record.assignment.node_id))
             .ok_or_else(|| Error::Invalid("held execution has no trusted host budget".into()))?;
-        let amount = record.spec.execution_resources();
+        let amount = record.held_resources();
         let sum = |a: u64, b: u64| a.checked_add(b).ok_or(Error::NoCapacity);
         status.held = Resources {
             cpu_millis: sum(status.held.cpu_millis, amount.cpu_millis)?,

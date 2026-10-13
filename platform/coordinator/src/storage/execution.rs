@@ -135,7 +135,7 @@ impl Session {
             stored.validate()?;
             budget::check_admission(&raw, &header, &stored)?;
             // Older writers must not ignore the unknown pending-execution field.
-            header.schema = 3;
+            header.schema = header.schema.max(3);
             header.advance()?;
             if self
                 .store

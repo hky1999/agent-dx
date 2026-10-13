@@ -5,6 +5,8 @@ mod claims;
 mod common;
 #[path = "storage/host_budget.rs"]
 mod host_budget;
+#[path = "storage/memory.rs"]
+mod memory;
 use adx_coordinator::{storage::StoredNode, Coordinator, Node, Placement};
 use adx_core::{
     Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Error, Resources,

@@ -79,6 +79,7 @@ fn saved() -> StoredSnapshot {
         environments: [(
             "i".into(),
             StoredEnvironment {
+                memory: None,
                 execution: None,
                 failed_since_unix_seconds: None,
                 recovery: None,

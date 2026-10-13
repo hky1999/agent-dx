@@ -9,6 +9,8 @@ mod credentials;
 mod execution;
 mod failure;
 pub use execution::StoredExecution;
+mod memory;
+pub use memory::{StoredMemory, StoredMemoryOperation};
 mod recovery;
 mod snapshots;
 use crate::Node;
@@ -77,7 +79,7 @@ impl Header {
     fn validate(&self) -> Result<()> {
         if !matches!(
             (self.schema, self.host_budgets.is_some()),
-            (1, false) | (2, true) | (3, _)
+            (1, false) | (2, true) | (3, _) | (4, true)
         ) || self.shards == 0
             || self.next_node_shard >= self.shards
             || self.epoch == 0
@@ -117,6 +119,8 @@ pub struct Recovery {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredEnvironment {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<StoredMemory>,
     /// Pending physical attempts retain budget independently of the last result.
     #[serde(default)]
     pub execution: Option<StoredExecution>,
@@ -176,7 +180,8 @@ impl StoredEnvironment {
         }
     }
     pub fn resources_held(&self) -> bool {
-        self.execution.as_ref().is_some_and(|e| e.pending)
+        self.memory.is_some()
+            || self.execution.as_ref().is_some_and(|e| e.pending)
             || (!self.invalidated && self.recovery.as_ref().is_some_and(|r| r.pending))
             || self.result.as_ref().is_none_or(|r| r.resources_held)
     }
@@ -210,6 +215,9 @@ impl StoredEnvironment {
         validate_device_assignment(&self.spec.scheduling.devices, &self.assignment.devices)?;
         if let Some(execution) = &self.execution {
             execution.validate(self)?;
+        }
+        if let Some(memory) = &self.memory {
+            memory.validate(self)?;
         }
         if let Some(r) = &self.result {
             validate_result(r)?;
@@ -1073,6 +1081,7 @@ impl Session {
             }
         }
         let record = StoredEnvironment {
+            memory: None,
             execution: None,
             failed_since_unix_seconds: None,
             recovery: None,
@@ -1184,6 +1193,7 @@ impl Session {
                 return Err(Error::Conflict);
             }
             stored_environment.execution = None;
+            stored_environment.memory = None;
             stored_environment.assignment = replacement.clone();
             stored_environment.result = None;
             stored_environment.validate()?;
@@ -1248,10 +1258,11 @@ impl Session {
                 return Err(Error::NotFound);
             };
             let mut stored_environment: StoredEnvironment = decode(environment_value)?;
+            stored_environment.validate()?;
             execution::check_result(
                 &stored_environment,
                 &result,
-                header.host_budgets.is_some() || header.schema == 3,
+                header.host_budgets.is_some() || header.schema >= 3,
             )?;
             let mut previous = stored_environment.clone();
             if !stored_environment.invalidated
@@ -1281,6 +1292,7 @@ impl Session {
             // commits compare against the version already enforced by the
             // runtime, while every placement and resource field remains
             // fenced by `next_result` above.
+            memory::retire(&mut stored_environment, &result)?;
             stored_environment.spec = result.spec.clone();
             stored_environment.result = Some(result.clone());
             stored_environment.track_failure(collection::now()?);

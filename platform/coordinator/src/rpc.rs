@@ -1507,6 +1507,7 @@ mod reconciliation_tests {
             devices: vec![],
         };
         let mut environment = StoredEnvironment {
+            memory: None,
             execution: None,
             failed_since_unix_seconds: None,
             recovery: None,
