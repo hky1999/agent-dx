@@ -1,7 +1,7 @@
 use adx_coordinator::{
     auth::{AuthRpc, Credential},
     rpc::CoordinatorRpc,
-    storage::RedisStore,
+    storage::{HostBudget, RedisStore},
     Placement,
 };
 use adx_core::Error;
@@ -9,7 +9,7 @@ use adx_process::{read_config, shutdown};
 use adx_protocol::control as pb;
 use adx_transport::tls::TlsFiles;
 use serde::Deserialize;
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf, time::Duration};
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Bootstrap {
@@ -34,6 +34,8 @@ struct Config {
     redis_url: String,
     namespace: String,
     scheduler_shards: usize,
+    #[serde(default)]
+    host_budgets: Option<BTreeMap<String, HostBudget>>,
     placement: String,
     rpc_timeout_seconds: u64,
     tls: TlsFiles,
@@ -89,6 +91,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(error) => return Err(error.into()),
         }
     };
+    if let Some(budgets) = config.host_budgets {
+        session.configure_host_budgets(budgets).await?;
+    }
     let mut administrators = Vec::new();
     let mut tenants = Vec::new();
     for credential in config.bootstrap_credentials {

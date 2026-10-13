@@ -5,19 +5,20 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 #[derive(Default)]
 pub(crate) struct Directory {
-    nodes: Vec<pb::NodeEndpoint>,
+    frame: pb::NodeDirectory,
     valid_until: Option<Instant>,
     next: usize,
 }
 impl Directory {
     pub fn clear(&mut self) {
-        self.nodes.clear();
+        self.frame = pb::NodeDirectory::default();
         self.valid_until = None;
     }
     pub fn update(&mut self, frame: pb::NodeDirectory) -> Result<(), tonic::Status> {
         let mut ids = std::collections::BTreeSet::new();
         if frame.epoch == 0
             || frame.valid_for_millis == 0
+            || !valid_host_budgets(&frame)
             || frame.nodes.iter().any(|n| {
                 n.node_id.is_empty()
                     || n.address.is_empty()
@@ -29,9 +30,9 @@ impl Directory {
             self.clear();
             return Err(tonic::Status::data_loss("invalid node directory"));
         }
-        self.nodes = frame.nodes;
         self.valid_until =
             Some(Instant::now() + Duration::from_millis(frame.valid_for_millis.min(5000)));
+        self.frame = frame;
         Ok(())
     }
     pub fn select(&mut self) -> Option<pb::NodeEndpoint> {
@@ -39,6 +40,7 @@ impl Directory {
             return None;
         }
         let available = self
+            .frame
             .nodes
             .iter()
             .filter(|node| node.accepting_allocations)
@@ -48,6 +50,7 @@ impl Directory {
         }
         self.next %= available;
         let node = self
+            .frame
             .nodes
             .iter()
             .filter(|node| node.accepting_allocations)
@@ -78,6 +81,7 @@ impl Directory {
             return None;
         }
         let matches = self
+            .frame
             .nodes
             .iter()
             .filter(|node| node.accepting_allocations)
@@ -111,12 +115,70 @@ impl Directory {
         self.next += 1;
         node
     }
-    pub fn snapshot(&self) -> Option<Vec<pb::NodeEndpoint>> {
+    pub fn snapshot(&self) -> Option<pb::NodeDirectory> {
         if self.valid_until.is_none_or(|t| Instant::now() >= t) {
             return None;
         }
-        Some(self.nodes.clone())
+        Some(self.frame.clone())
     }
+}
+// 完整校验在缓存边界完成；无效消息撤销上一份视图。
+fn valid_host_budgets(frame: &pb::NodeDirectory) -> bool {
+    use std::collections::BTreeSet;
+    if frame.host_budget_configured == frame.host_budgets.is_empty() {
+        return false;
+    }
+    let valid_id = |id: &str| !id.is_empty() && id.trim() == id;
+    let mut hosts = BTreeSet::new();
+    let mut members = BTreeSet::new();
+    let mut totals = [0u64; 3];
+    for host in &frame.host_budgets {
+        if !valid_id(&host.host_id)
+            || !hosts.insert(&host.host_id)
+            || host.nodes.is_empty()
+            || host
+                .nodes
+                .iter()
+                .any(|id| !valid_id(id) || !members.insert(id))
+        {
+            return false;
+        }
+        let (Some(capacity), Some(held), Some(available)) =
+            (&host.capacity, &host.held, &host.available)
+        else {
+            return false;
+        };
+        if capacity.cpu_millis == 0 || capacity.memory_bytes == 0 {
+            return false;
+        }
+        for (index, (cap, used, free)) in [
+            (capacity.cpu_millis, held.cpu_millis, available.cpu_millis),
+            (
+                capacity.memory_bytes,
+                held.memory_bytes,
+                available.memory_bytes,
+            ),
+            (capacity.disk_bytes, held.disk_bytes, available.disk_bytes),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if used.checked_add(free) != Some(cap) {
+                return false;
+            }
+            let Some(total) = totals[index].checked_add(cap) else {
+                return false;
+            };
+            totals[index] = total;
+        }
+    }
+    !frame.host_budget_configured
+        || frame.nodes.iter().all(|node| {
+            !node.accepting_allocations
+                || (members.contains(&node.node_id)
+                    && node.capacity.is_some()
+                    && node.allocatable.is_some())
+        })
 }
 #[cfg(test)]
 mod tests {
@@ -137,11 +199,13 @@ mod tests {
             epoch: 1,
             nodes: vec![node("a"), node("b")],
             valid_for_millis: 1000,
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(
             d.snapshot()
                 .unwrap()
+                .nodes
                 .into_iter()
                 .map(|node| node.node_id)
                 .collect::<Vec<_>>(),
@@ -165,6 +229,7 @@ mod tests {
                 ..node("a")
             }],
             valid_for_millis: 1000,
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(d.select().unwrap().session_id, "new");
@@ -178,9 +243,10 @@ mod tests {
                 node("ready"),
             ],
             valid_for_millis: 1000,
+            ..Default::default()
         })
         .unwrap();
-        assert_eq!(d.snapshot().unwrap().len(), 2);
+        assert_eq!(d.snapshot().unwrap().nodes.len(), 2);
         assert_eq!(d.select().unwrap().node_id, "ready");
         d.clear();
         assert!(d.select().is_none());
@@ -192,6 +258,7 @@ mod tests {
                 epoch: 4,
                 nodes: vec![incomplete],
                 valid_for_millis: 1000,
+                ..Default::default()
             })
             .unwrap_err()
             .code(),
@@ -214,6 +281,7 @@ mod tests {
             epoch: 1,
             nodes: vec![node("a"), node("b")],
             valid_for_millis: 1000,
+            ..Default::default()
         })
         .unwrap();
         let spec = pb::EnvironmentSpec {
@@ -258,6 +326,7 @@ mod tests {
             epoch: 1,
             nodes: vec![node("a"), node("b")],
             valid_for_millis: 1000,
+            ..Default::default()
         })
         .unwrap();
         let spec = pb::EnvironmentSpec::default();
@@ -266,3 +335,7 @@ mod tests {
         assert_eq!(d.select_for(&spec).unwrap().node_id, "b");
     }
 }
+
+#[cfg(test)]
+#[path = "directory/host_budgets.rs"]
+mod host_budget_tests;

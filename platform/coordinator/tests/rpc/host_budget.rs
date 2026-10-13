@@ -322,6 +322,24 @@ async fn host_budget_rpc_rejects_before_execution_and_recovers_after_release() {
         .clone();
     assert!(unknown.execution.as_ref().unwrap().pending);
     assert!(unknown.resources_held());
+    let replay = owner
+        .claim_environment(pb::ClaimEnvironmentRequest {
+            spec: Some(unknown.spec.clone().into()),
+            caller: caller(),
+            node_session_id: report.session_id.clone(),
+            devices: vec![],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let Some(pb::claim_environment_response::Outcome::Existing(replay)) = replay.outcome else {
+        panic!("pending replacement must return its existing owner");
+    };
+    let visible: EnvironmentRecord = replay.record.unwrap().try_into().unwrap();
+    assert_eq!(
+        visible, target,
+        "claim replay must show the reserved target, not the retired source"
+    );
     assert_eq!(
         session.host_budgets().await.unwrap()["physical"].available,
         Resources::default()

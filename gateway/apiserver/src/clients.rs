@@ -170,7 +170,7 @@ impl Clients {
         )
         .await
     }
-    pub async fn nodes(&self) -> Result<Vec<pb::NodeEndpoint>, Status> {
+    pub async fn nodes(&self) -> Result<pb::NodeDirectory, Status> {
         self.directory
             .lock()
             .await

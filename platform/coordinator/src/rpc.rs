@@ -808,57 +808,77 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         let service = self.clone();
         tokio::spawn(async move {
             loop {
-                let frame = {
+                let frame = async {
                     let state = service.0.state.lock().await;
-                    state.healthy().map_err(status).map(|()| pb::NodeDirectory {
+                    state.healthy().map_err(status)?;
+                    // 持久预算必须每次成功读取；离线和存储错误都不是零占用证明。
+                    let budgets = state.session.host_budgets().await.map_err(status)?;
+                    let nodes = state
+                        .nodes
+                        .values()
+                        .filter(|n| {
+                            n.session.as_ref().is_some_and(|session| {
+                                state
+                                    .live_claimant(
+                                        &n.node.id,
+                                        &session.id,
+                                        service.0.heartbeat_timeout,
+                                    )
+                                    .is_ok()
+                            })
+                        })
+                        .filter_map(|n| {
+                            let (capacity, allocatable) =
+                                state.scheduler.node_resources(&n.node.id)?;
+                            let (capacity_devices, allocatable_devices) =
+                                state.scheduler.node_devices(&n.node.id)?;
+                            Some(pb::NodeEndpoint {
+                                node_id: n.node.id.clone(),
+                                address: n.address.clone(),
+                                relay_address: n.proxy_address.clone(),
+                                session_id: n
+                                    .session
+                                    .as_ref()
+                                    .expect("node directory filters entries without a session")
+                                    .id
+                                    .clone(),
+                                capacity: Some(capacity.into()),
+                                allocatable: Some(allocatable.into()),
+                                labels: n.node.labels.clone().into_iter().collect(),
+                                accepting_allocations: n.node.available
+                                    && (budgets.is_empty()
+                                        || budgets
+                                            .values()
+                                            .any(|host| host.nodes.contains(&n.node.id))),
+                                capacity_devices: capacity_devices
+                                    .into_iter()
+                                    .map(Into::into)
+                                    .collect(),
+                                allocatable_devices: allocatable_devices
+                                    .into_iter()
+                                    .map(Into::into)
+                                    .collect(),
+                            })
+                        })
+                        .collect();
+                    Ok(pb::NodeDirectory {
                         epoch: state.session.epoch(),
                         valid_for_millis: 2500,
-                        nodes: state
-                            .nodes
-                            .values()
-                            .filter(|n| {
-                                n.session.as_ref().is_some_and(|session| {
-                                    state
-                                        .live_claimant(
-                                            &n.node.id,
-                                            &session.id,
-                                            service.0.heartbeat_timeout,
-                                        )
-                                        .is_ok()
-                                })
-                            })
-                            .filter_map(|n| {
-                                let (capacity, allocatable) =
-                                    state.scheduler.node_resources(&n.node.id)?;
-                                let (capacity_devices, allocatable_devices) =
-                                    state.scheduler.node_devices(&n.node.id)?;
-                                Some(pb::NodeEndpoint {
-                                    node_id: n.node.id.clone(),
-                                    address: n.address.clone(),
-                                    relay_address: n.proxy_address.clone(),
-                                    session_id: n
-                                        .session
-                                        .as_ref()
-                                        .expect("node directory filters entries without a session")
-                                        .id
-                                        .clone(),
-                                    capacity: Some(capacity.into()),
-                                    allocatable: Some(allocatable.into()),
-                                    labels: n.node.labels.clone().into_iter().collect(),
-                                    accepting_allocations: n.node.available,
-                                    capacity_devices: capacity_devices
-                                        .into_iter()
-                                        .map(Into::into)
-                                        .collect(),
-                                    allocatable_devices: allocatable_devices
-                                        .into_iter()
-                                        .map(Into::into)
-                                        .collect(),
-                                })
+                        nodes,
+                        host_budget_configured: !budgets.is_empty(),
+                        host_budgets: budgets
+                            .into_iter()
+                            .map(|(host_id, budget)| pb::HostBudgetStatus {
+                                host_id,
+                                capacity: Some(budget.capacity.into()),
+                                held: Some(budget.held.into()),
+                                available: Some(budget.available.into()),
+                                nodes: budget.nodes.into_iter().collect(),
                             })
                             .collect(),
                     })
-                };
+                }
+                .await;
                 let failed = frame.is_err();
                 if tx.send(frame).await.is_err() || failed {
                     break;

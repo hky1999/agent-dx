@@ -185,7 +185,10 @@ impl Api {
         }
         if method == "GET" && path == "/api/sandbox/v1/resources" {
             return match self.clients.nodes().await {
-                Ok(nodes) => plain(StatusCode::OK.as_u16(), resource_view(nodes)),
+                Ok(nodes) => plain(
+                    StatusCode::OK.as_u16(),
+                    resource_view(nodes.nodes, &nodes.host_budgets),
+                ),
                 Err(error) => error_response(error, &request_id, None, None, false),
             };
         }
@@ -193,7 +196,7 @@ impl Api {
             return match self.clients.nodes().await {
                 Ok(nodes) => plain(
                     StatusCode::OK.as_u16(),
-                    legacy_resource_view(nodes, &request_id),
+                    legacy_resource_view(nodes.nodes, &nodes.host_budgets, &request_id),
                 ),
                 Err(error) => error_response(error, &request_id, None, None, false),
             };
@@ -1026,7 +1029,60 @@ fn route_name(path: &str) -> &'static str {
     }
 }
 
-fn scheduling_resource_node(mut node: pb::NodeEndpoint) -> pb::NodeEndpoint {
+fn resource_min(left: &pb::Resources, right: &pb::Resources) -> pb::Resources {
+    pb::Resources {
+        cpu_millis: left.cpu_millis.min(right.cpu_millis),
+        memory_bytes: left.memory_bytes.min(right.memory_bytes),
+        disk_bytes: left.disk_bytes.min(right.disk_bytes),
+    }
+}
+
+fn host_allocatable(nodes: &[pb::NodeEndpoint], host: &pb::HostBudgetStatus) -> pb::Resources {
+    let mut online = pb::Resources::default();
+    for resources in nodes
+        .iter()
+        .filter(|node| node.accepting_allocations && host.nodes.contains(&node.node_id))
+        .filter_map(|node| node.allocatable.as_ref())
+    {
+        online.cpu_millis = online.cpu_millis.saturating_add(resources.cpu_millis);
+        online.memory_bytes = online.memory_bytes.saturating_add(resources.memory_bytes);
+        online.disk_bytes = online.disk_bytes.saturating_add(resources.disk_bytes);
+    }
+    // 这里只是可调度上界；真正的每次分配仍须通过持久原子准入。
+    resource_min(&online, &host.available.unwrap_or_default())
+}
+
+fn host_budget_views(nodes: &[pb::NodeEndpoint], hosts: &[pb::HostBudgetStatus]) -> Vec<Value> {
+    fn resources(value: Option<pb::Resources>) -> Value {
+        value.map_or(Value::Null, |value| json!({
+            "cpu_millis": value.cpu_millis, "memory_bytes": value.memory_bytes, "disk_bytes": value.disk_bytes,
+        }))
+    }
+    hosts.iter().map(|host| json!({
+        "id": host.host_id, "nodes": host.nodes,
+        "capacity": resources(host.capacity), "held": resources(host.held),
+        "available": resources(host.available), "allocatable": resources(Some(host_allocatable(nodes, host))),
+    })).collect()
+}
+
+fn scheduling_resource_node(
+    mut node: pb::NodeEndpoint,
+    hosts: &[pb::HostBudgetStatus],
+) -> pb::NodeEndpoint {
+    if !hosts.is_empty() {
+        match hosts
+            .iter()
+            .find(|host| host.nodes.contains(&node.node_id))
+            .and_then(|host| host.available.as_ref())
+        {
+            Some(available) => {
+                node.allocatable = node
+                    .allocatable
+                    .map(|value| resource_min(&value, available))
+            }
+            None => node.accepting_allocations = false,
+        }
+    }
     if !node.accepting_allocations {
         node.capacity = Some(pb::Resources::default());
         node.allocatable = Some(pb::Resources::default());
@@ -1036,7 +1092,7 @@ fn scheduling_resource_node(mut node: pb::NodeEndpoint) -> pb::NodeEndpoint {
     node
 }
 
-fn resource_view(nodes: Vec<pb::NodeEndpoint>) -> Value {
+fn resource_view(nodes: Vec<pb::NodeEndpoint>, hosts: &[pb::HostBudgetStatus]) -> Value {
     fn resources(resources: Option<pb::Resources>, devices: &[pb::Device]) -> Value {
         let resources = resources.unwrap_or_default();
         let mut values = serde_json::Map::from_iter([
@@ -1049,9 +1105,13 @@ fn resource_view(nodes: Vec<pb::NodeEndpoint>) -> Value {
         }
         Value::Object(values)
     }
+    let host_views = host_budget_views(&nodes, hosts);
     json!({
-        "items": nodes.into_iter().map(scheduling_resource_node).map(|node| json!({
+        "host_budget_configured": !hosts.is_empty(),
+        "host_budgets": host_views,
+        "items": nodes.into_iter().map(|node| scheduling_resource_node(node, hosts)).map(|node| json!({
             "id": node.node_id,
+            "host_id": hosts.iter().find(|host| host.nodes.contains(&node.node_id)).map(|host| &host.host_id),
             "status": if node.accepting_allocations { 0 } else { 1 },
             "capacity": resources(node.capacity, &node.capacity_devices),
             "allocatable": resources(node.allocatable, &node.allocatable_devices),
@@ -1060,7 +1120,11 @@ fn resource_view(nodes: Vec<pb::NodeEndpoint>) -> Value {
     })
 }
 
-fn legacy_resource_view(nodes: Vec<pb::NodeEndpoint>, request_id: &str) -> Value {
+fn legacy_resource_view(
+    nodes: Vec<pb::NodeEndpoint>,
+    hosts: &[pb::HostBudgetStatus],
+    request_id: &str,
+) -> Value {
     fn resources(resources: Option<pb::Resources>, devices: &[pb::Device]) -> Value {
         let resources = resources.unwrap_or_default();
         let mut values = serde_json::Map::from_iter([
@@ -1094,16 +1158,27 @@ fn legacy_resource_view(nodes: Vec<pb::NodeEndpoint>, request_id: &str) -> Value
             total.disk_bytes = total.disk_bytes.saturating_add(value.disk_bytes);
         }
     }
+    let host_views = host_budget_views(&nodes, hosts);
     let mut capacity = pb::Resources::default();
     let mut allocatable = pb::Resources::default();
+    let mut held = pb::Resources::default();
+    let mut available = pb::Resources::default();
+    for host in hosts {
+        add(&mut capacity, &host.capacity);
+        add(&mut held, &host.held);
+        add(&mut available, &host.available);
+        add(&mut allocatable, &Some(host_allocatable(&nodes, host)));
+    }
     let mut capacity_devices = Vec::new();
     let mut allocatable_devices = Vec::new();
     let fragments = nodes
         .into_iter()
-        .map(scheduling_resource_node)
+        .map(|node| scheduling_resource_node(node, hosts))
         .map(|node| {
-            add(&mut capacity, &node.capacity);
-            add(&mut allocatable, &node.allocatable);
+            if hosts.is_empty() {
+                add(&mut capacity, &node.capacity);
+                add(&mut allocatable, &node.allocatable);
+            }
             capacity_devices.extend(node.capacity_devices.clone());
             allocatable_devices.extend(node.allocatable_devices.clone());
             let labels = node
@@ -1117,6 +1192,7 @@ fn legacy_resource_view(nodes: Vec<pb::NodeEndpoint>, request_id: &str) -> Value
             let id = node.node_id;
             let unit = json!({
                 "id": id.clone(),
+                "host_id": hosts.iter().find(|host| host.nodes.contains(&id)).map(|host| &host.host_id),
                 "capacity": resources(node.capacity, &node.capacity_devices),
                 "allocatable": resources(node.allocatable, &node.allocatable_devices),
                 "nodeLabels": labels,
@@ -1129,6 +1205,10 @@ fn legacy_resource_view(nodes: Vec<pb::NodeEndpoint>, request_id: &str) -> Value
         "requestID": request_id,
         "resource": {
             "id": "adx-cluster",
+            "host_budget_configured": !hosts.is_empty(),
+            "host_budgets": host_views,
+            "held": if hosts.is_empty() { Value::Null } else { resources(Some(held), &[]) },
+            "available": if hosts.is_empty() { Value::Null } else { resources(Some(available), &[]) },
             "capacity": resources(Some(capacity), &capacity_devices),
             "allocatable": resources(Some(allocatable), &allocatable_devices),
             "fragment": fragments,
@@ -1282,36 +1362,39 @@ mod error_contract_tests {
 
     #[test]
     fn resource_view_uses_public_units_and_plain_labels() {
-        let value = resource_view(vec![pb::NodeEndpoint {
-            node_id: "node-a".into(),
-            address: "node-a:17001".into(),
-            relay_address: "node-a:17002".into(),
-            session_id: "session-a".into(),
-            capacity: Some(pb::Resources {
-                cpu_millis: 4000,
-                memory_bytes: 8 * 1_048_576,
-                disk_bytes: 20 * 1_048_576,
-            }),
-            allocatable: Some(pb::Resources {
-                cpu_millis: 3000,
-                memory_bytes: 6 * 1_048_576,
-                disk_bytes: 10 * 1_048_576,
-            }),
-            labels: [("arch".into(), "arm64".into())].into_iter().collect(),
-            accepting_allocations: true,
-            capacity_devices: vec![pb::Device {
-                id: 0,
-                kind: pb::DeviceKind::Gpu.into(),
-                model: "A100".into(),
-                healthy: true,
+        let value = resource_view(
+            vec![pb::NodeEndpoint {
+                node_id: "node-a".into(),
+                address: "node-a:17001".into(),
+                relay_address: "node-a:17002".into(),
+                session_id: "session-a".into(),
+                capacity: Some(pb::Resources {
+                    cpu_millis: 4000,
+                    memory_bytes: 8 * 1_048_576,
+                    disk_bytes: 20 * 1_048_576,
+                }),
+                allocatable: Some(pb::Resources {
+                    cpu_millis: 3000,
+                    memory_bytes: 6 * 1_048_576,
+                    disk_bytes: 10 * 1_048_576,
+                }),
+                labels: [("arch".into(), "arm64".into())].into_iter().collect(),
+                accepting_allocations: true,
+                capacity_devices: vec![pb::Device {
+                    id: 0,
+                    kind: pb::DeviceKind::Gpu.into(),
+                    model: "A100".into(),
+                    healthy: true,
+                }],
+                allocatable_devices: vec![pb::Device {
+                    id: 0,
+                    kind: pb::DeviceKind::Gpu.into(),
+                    model: "A100".into(),
+                    healthy: true,
+                }],
             }],
-            allocatable_devices: vec![pb::Device {
-                id: 0,
-                kind: pb::DeviceKind::Gpu.into(),
-                model: "A100".into(),
-                healthy: true,
-            }],
-        }]);
+            &[],
+        );
         assert_eq!(value["items"][0]["id"], "node-a");
         assert_eq!(value["items"][0]["capacity"]["CPU"], 4000);
         assert_eq!(value["items"][0]["allocatable"]["Memory"], 6);
@@ -1350,7 +1433,7 @@ mod error_contract_tests {
             }],
             ..Default::default()
         };
-        let value = resource_view(vec![node]);
+        let value = resource_view(vec![node], &[]);
         let item = &value["items"][0];
         assert_eq!(item["id"], "blocked");
         assert_eq!(item["status"], 1);
@@ -1392,7 +1475,7 @@ mod error_contract_tests {
             }],
             ..Default::default()
         };
-        let value = legacy_resource_view(vec![node("1", true), node("2", false)], "req");
+        let value = legacy_resource_view(vec![node("1", true), node("2", false)], &[], "req");
         assert_eq!(value["requestID"], "req");
         assert_eq!(
             value["resource"]["capacity"]["resources"]["CPU"]["scalar"]["value"],
@@ -1439,7 +1522,7 @@ mod error_contract_tests {
             value["resource"]["fragment"]["1"]["nodeLabels"]["HOST_IP"]["items"]["10.0.0.1"],
             1
         );
-        let blocked = legacy_resource_view(vec![node("1", false), node("2", false)], "req");
+        let blocked = legacy_resource_view(vec![node("1", false), node("2", false)], &[], "req");
         for field in ["capacity", "allocatable"] {
             assert_eq!(
                 blocked["resource"][field],
@@ -1450,7 +1533,7 @@ mod error_contract_tests {
                 }})
             );
         }
-        let resumed = legacy_resource_view(vec![node("1", true), node("2", true)], "req");
+        let resumed = legacy_resource_view(vec![node("1", true), node("2", true)], &[], "req");
         assert_eq!(
             resumed["resource"]["capacity"]["resources"]["CPU"]["scalar"]["value"],
             4000
@@ -1644,3 +1727,7 @@ mod error_contract_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "http/host_budgets.rs"]
+mod host_budget_tests;

@@ -97,21 +97,7 @@ impl State {
             .nodes
             .get(&stored.assignment.node_id)
             .ok_or(Error::NotFound)?;
-        let record = stored.result.clone().unwrap_or_else(|| EnvironmentRecord {
-            spec: stored.spec.clone(),
-            assignment: stored.assignment.clone(),
-            runtime: adx_core::Runtime {
-                id: format!("{}-{}", stored.spec.id, stored.assignment.generation),
-                ip: None,
-            },
-            state: EnvironmentState::Pending,
-            revision: 0,
-            resources_held: true,
-            checkpoint: None,
-            last_operation: None,
-            restart_attempts: 0,
-            restart_pending: false,
-        });
+        let record = stored.effective_record();
         Ok(pb::GetEnvironmentResponse {
             record: Some(record.try_into()?),
             node_address: node.address.clone(),

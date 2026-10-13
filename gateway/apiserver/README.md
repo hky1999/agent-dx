@@ -19,14 +19,13 @@ resumed node closed.
 API Server performs the administrator check before either internal RPC. Coordinator
 does not repeat user or component authorization so trusted internal controllers
 can use the same operations directly.
-Both resource shapes include CPU millicores, Memory/Disk MiB and whole-card
-`GPU/<model>` or `NPU/<model>` capacity and allocatable counts.
-Both paths expose scheduling resources. Online nodes with admission disabled
-retain their ID, labels and status 1, but report zero CPU/Memory/Disk capacity
-and allocatable values and omit GPU/NPU resource entries. The legacy cluster
-totals include only nodes accepting new allocations. The watched directory and
-Coordinator ledger retain the underlying capacity and existing allocations;
-resuming admission makes the current resources visible again.
+两个资源接口保留节点分片的 CPU 毫核、Memory／Disk MiB 和整卡 GPU／NPU 字段。关闭准入的在线节点保留身份、标签及状态 1，调度资源显示为零。
+
+配置可信宿主预算时，两个接口另外发布 `host_budget_configured` 和 `host_budgets`。标准接口位于顶层，兼容接口位于 `resource` 内。每个宿主包含 `id`、完整成员 `nodes` 及 `capacity`、`held`、`available`、`allocatable`；其标量字段使用精确的 `cpu_millis`、`memory_bytes`、`disk_bytes`。`held` 包括未知创建和待恢复预留；节点离线不会将其归零。`available` 是持久剩余额度，`allocatable` 是它与在线成员可调度资源之和的逐项最小值，只代表上界，实际申请仍需原子准入。
+
+兼容接口的集群 CPU、内存和磁盘 `capacity` 按宿主各计一次，包括暂时离线的宿主；新增 `held`、`available` 保留兼容资源格式。兼容格式的 MiB 值向下取整，精确守恒核对使用宿主字节字段。节点分片标记 `host_id`，同宿主分片不能相加当作独立容量。未配置宿主预算时保留原节点汇总，并将集群 `held`、`available` 标为 null。GPU／NPU 仍是节点整卡视图，不属于本轮宿主标量预算。
+
+Coordinator 每次从持久账本读取完整预算。存储失败、非法视图或缓存过期使资源查询返回不可用，不显示为预算归还。两端协议及程序须匹配部署；本模块测试不能替代实际节点和资源回读验收。
 
 ## Modules
 

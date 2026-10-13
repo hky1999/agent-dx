@@ -37,6 +37,8 @@ adxctl stop
 
 ## 进程和停止契约
 
+生产宿主预算放在 Coordinator 服务的 `config.host_budgets`，按可信宿主 ID 记录容量和实际节点 ID 集合。服务启动先安装或核对持久配置，再开放服务。配置省略不会删除已安装预算；修改或清空已安装预算会阻止启动。统一部署配置仍以服务配置传递该字段，最终校验由 Coordinator 执行。字段、示例和拒绝规则见 [宿主持久预算](coordinator-storage.md#宿主持久预算与生产配置)。节点资源观测的有效期仍独立控制准入，不能用于改变持久宿主容量。
+
 默认启动顺序为 Redis → Coordinator → adxlet（含内嵌 Proxy）→ API Server（含内嵌 Ingress）。显式分进程时，独立 Relay 在 adxlet 前启动，独立 Ingress 在 API Server 后启动。该顺序只安排进程拉起；组件通过已有发现和对账握手达到就绪。进程退出或 spawn 失败后按 `restart_delay_ms` 持续重试，其他角色保持运行。状态中的 `restarts` 只记录重试次数，`failed` 表示当前退出或启动失败状态，成功启动后清除；进程存活仍不代表业务就绪。
 
 显式 `stop` 和 supervisor 收到 SIGTERM／SIGINT 都执行：

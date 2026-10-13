@@ -28,5 +28,17 @@
   "heartbeat_timeout_seconds": 30,
   "failed_retention_seconds": 600,
   "discovery_ttl_seconds": 15,
-  "metrics_listen": "127.0.0.1:19090"
+  "metrics_listen": "127.0.0.1:19090",
+  "host_budgets": {
+    "physical-host-1": {
+      "capacity": {
+        "cpu_millis": 8000,
+        "memory_bytes": 17179869184,
+        "disk_bytes": 68719476736
+      },
+      "nodes": [
+        "node-1"
+      ]
+    }
+  }
 }

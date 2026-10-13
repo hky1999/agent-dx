@@ -211,3 +211,7 @@ execution from the cached record. Existing assignment, generation and operation
 ID checks still apply; other lifecycle operations continue to use the local
 directory. This read does not lock the revision against subsequent concurrent
 operations, which may still produce a conflict.
+
+## 宿主预算查询
+
+`GET /api/sandbox/v1/resources` 保留节点 `items`，并返回 `host_budget_configured` 与 `host_budgets`。每个宿主独立提供持久 `capacity`、`held`、`available` 和在线可调度上界 `allocatable`，标量单位明确为毫核与字节。节点条目中的 `host_id` 说明共享归属，多个同宿主分片不能重复计入总容量。节点离线时持久占用仍保留，存储未知或视图过期返回不可用。兼容查询和具体字段见 [API Server 资源视图](../README.md)。

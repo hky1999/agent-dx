@@ -139,7 +139,21 @@ message NodeEndpoint {
   // seed ownership after a successful node-local create without a Coordinator readback.
   string relay_address = 10;
 }
-message NodeDirectory { uint64 epoch = 1; repeated NodeEndpoint nodes = 2; uint64 valid_for_millis = 3; }
+// 宿主预算来自一次持久读取；节点离线不改变容量或占用。
+message HostBudgetStatus {
+  string host_id = 1;
+  Resources capacity = 2;
+  Resources held = 3;
+  Resources available = 4;
+  repeated string nodes = 5;
+}
+message NodeDirectory {
+  uint64 epoch = 1;
+  repeated NodeEndpoint nodes = 2;
+  uint64 valid_for_millis = 3;
+  repeated HostBudgetStatus host_budgets = 4;
+  bool host_budget_configured = 5;
+}
 message GetSchedulingQueueRequest {}
 message PendingEnvironment { EnvironmentSpec spec = 1; uint64 enqueue_time_millis = 2; }
 message GetSchedulingQueueResponse { repeated PendingEnvironment environments = 1; }
