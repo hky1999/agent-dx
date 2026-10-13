@@ -31,11 +31,11 @@
 
 暂停：节点完成 checkpoint、确认旧执行删除、保存制品，再经 Coordinator 提交 Paused 和恢复点。对象存储成功要求上传完成。恢复：公开 resume 直达所属节点重新准入和恢复，完成 Execd/绑定后提交 Running；共享 checkpoint 的故障跨节点恢复由 Coordinator 协调新归属。删除先退役本机绑定、确认后端删除，再释放资源和提交结果。
 
-adxlet 调用 sandboxd Start 时，RPC 失败、超时、应答丢失或成功载荷无效均判定创建 Failed，不以同一执行身份重复 Start。创建进入 Failed 即释放本机标量资源和 GPU/NPU 预留，并在清理之前提交 `resources_held=false`。资源释放不依赖后端查询、删除成功或清理超时。清理与本机尚在等待的 Start 客户端任务串行，失败则继续重试；提交不可用时按既有降级／重试契约补写集群账本。Failed 实例即使已释放资源仍会在生命周期巡检中检查并删除迟到的后端，不能转成 Running；节点重启时通过权威目录对账清理。这里的 Failed 是创建结果，不是物理后端从未启动的证明。公开 API 应答丢失仍按同一 Environment 身份查询或重试，不能另建实例；checkpoint 结果未知的保护独立保留。
+adxlet 调用 sandboxd Start 时，RPC 失败、超时、应答丢失或成功载荷无效会使逻辑创建失败，但未知的物理执行继续占用资源。节点先持久保存操作身份，通过原创建结果和资源代际确认未开始或已完成退役后才归还预留。迟到的后端不能恢复为 Running；清理或结果持久化失败时保留占用并继续对账。公开 API 应答丢失按同一 Environment 身份查询或重试，不能另建实例。
 
 `StateSink` 返回 Published 表示 Coordinator 已提交 Redis；Journaled 表示结果只进入 SQLite 降级日志。后者不发布集群路由，API Server 不返回集群生命周期成功。Coordinator 恢复后去重补写；adxlet 重启而 Coordinator 不可用时只观察，等待权威对账。详见 [节点生命周期](node-lifecycle.md)、[暂停恢复](environment-checkpoint.md) 和 [存储](snapshot-storage.md)。
 
-节点心跳超时后，Coordinator 持久化失效、撤销路由并协调有效共享 checkpoint 的恢复。local-only、缺失或过期 checkpoint 直接失败。原节点返回先清理失效执行，再开放准入。心跳失效是控制面判定，不是物理进程已停止的证据；当前没有跨宿主网络分区的强隔离验收，见 [失效契约](node-failure-takeover.md)。
+节点心跳超时后，Coordinator 持久化失效、撤销路由并保留原占用。只有原执行确认未开始或已经退役，才允许结算并协调有效共享 checkpoint 的恢复；已预留但未确认的恢复操作同样保留预算。local-only、缺失或过期 checkpoint 直接失败。原节点返回先清理失效执行，再开放准入。心跳失效是控制面判定，不是物理进程已停止的证据；当前没有跨宿主网络分区的强隔离验收，见 [失效契约](node-failure-takeover.md)。
 
 ## 公开能力与 Agent 边界
 

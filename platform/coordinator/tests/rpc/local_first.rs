@@ -271,11 +271,9 @@ async fn failed_gc_cleans_invalidated_owner_and_fences_delayed_running() {
         .unwrap();
     tokio::time::sleep(Duration::from_secs(11)).await;
     assert_eq!(rig.rpc.expire_nodes().await.unwrap(), 2);
-    assert_eq!(rig.rpc.collect_failed(Duration::ZERO).await.unwrap(), 1);
-    assert_eq!(
-        rig.session.get("dead-gc").await.unwrap_err(),
-        adx_core::Error::NotFound
-    );
+    assert_eq!(rig.rpc.collect_failed(Duration::ZERO).await.unwrap(), 0);
+    assert!(rig.session.get("dead-gc").await.unwrap().resources_held());
+    assert!(!rig.backends[0].running.lock().unwrap().is_empty());
     assert!(rig.claimants[0]
         .commit_environment(pb::CommitEnvironmentRequest {
             record: Some(created),
@@ -283,8 +281,48 @@ async fn failed_gc_cleans_invalidated_owner_and_fences_delayed_running() {
         })
         .await
         .is_err());
-    rig.managers[0].reconcile(vec![]).await.unwrap();
+    let node = rig.session.snapshot().await.unwrap().nodes["a"].clone();
+    rig.claimants[0]
+        .register_node(pb::RegisterNodeRequest {
+            runtime_classes: node.node.runtime_classes,
+            node_id: "a".into(),
+            node_address: node.address,
+            proxy_address: node.proxy_address,
+            session_id: "boot-a".into(),
+            heartbeat_sequence: 3,
+            reconciling: true,
+            capacity: Some(node.node.capacity.into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let catalog = rig.claimants[0]
+        .inspect_node(pb::InspectNodeRequest {
+            node_id: "a".into(),
+            session_id: "boot-a".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    rig.managers[0]
+        .reconcile(
+            catalog
+                .records
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<Vec<_>>>()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert!(rig.backends[0].running.lock().unwrap().is_empty());
+    assert!(!rig.session.get("dead-gc").await.unwrap().resources_held());
+    assert_eq!(rig.rpc.collect_failed(Duration::ZERO).await.unwrap(), 1);
+    assert_eq!(
+        rig.session.get("dead-gc").await.unwrap_err(),
+        adx_core::Error::NotFound
+    );
+    rig.managers[0].reconcile(vec![]).await.unwrap();
 }
 
 #[tokio::test]

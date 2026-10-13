@@ -360,8 +360,7 @@ fn next_result(old: &StoredEnvironment, r: &EnvironmentRecord) -> Result<bool> {
         && (!matches!(
             r.state,
             EnvironmentState::Failed | EnvironmentState::Deleted
-        ) || r.resources_held
-            || r.restart_pending
+        ) || r.restart_pending
             || r.runtime.ip.is_some()
             || (r.state != EnvironmentState::Deleted
                 && old

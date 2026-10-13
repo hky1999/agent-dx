@@ -143,9 +143,10 @@ impl Adxlet {
                     || (matches!(
                         r.state,
                         EnvironmentState::Failed | EnvironmentState::Deleted
-                    ) && !r.resources_held
-                        && !r.restart_pending)
+                    ) && !r.restart_pending)
             }) {
+                // A terminal authoritative record supersedes the live controller even
+                // while it retains resources. Cleanup must succeed before replacing it.
                 // Drain accepted operations, then clean locally without inventing a
                 // cluster record for an identity the authority does not own.
                 handle.discard().await?;

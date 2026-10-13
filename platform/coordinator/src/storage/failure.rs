@@ -1,4 +1,4 @@
-//! Persist node expiry and all retired execution results in one Redis script.
+//! Persist node expiry without treating loss of contact as physical retirement.
 use super::*;
 
 impl Session {
@@ -24,6 +24,8 @@ impl Session {
                 {
                     continue;
                 }
+                // A pending recovery also owns a reservation before its result arrives.
+                let resources_held = environment.resources_held();
                 let mut result = environment
                     .result
                     .clone()
@@ -44,7 +46,7 @@ impl Session {
                     });
                 result.state = EnvironmentState::Failed;
                 result.revision = result.revision.checked_add(1).ok_or(Error::Conflict)?;
-                result.resources_held = false;
+                result.resources_held = resources_held;
                 result.runtime.ip = None;
                 result.restart_pending = false;
                 result.last_operation = None;

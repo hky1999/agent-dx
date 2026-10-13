@@ -1,12 +1,14 @@
 # 节点失效与恢复对账契约
 
-2026-09-16，用户明确：Coordinator 根据既有心跳超时判定节点失效，该节点的旧实例执行随之失效。adxlet 恢复连接或进程重启后，以 Coordinator 权威目录对账并清理失效执行。阶段4已实现心跳超时失效、原节点恢复对账清理与旧结果拒收；共享checkpoint的新代次分配、恢复调用、路由切换与重复请求处理已接通，Lima双独立网络/后端的真实FC跨节点验收已通过；目标adxlet执行中重启与未提交执行清理也已通过；独立主机/K8s门禁另行验收。
+当前源码将节点失效与物理退役分开。Coordinator 在心跳超时后撤销路由和准入，持久保留原执行或待恢复操作的资源占用。adxlet 返回后按原 Environment、Runtime 和 Assignment 对账并确认物理清理，再发布不占用资源的结果。共享检查点恢复必须等待源执行完成这一结算；检查点存在和心跳超时都不能替代源执行退役证明。
+
+本次变更的组件回归与 BareMetal1 物理验收分别记录；既有跨节点报告只说明其原提交和原契约，不继承为新预算契约的验收。
 
 ## Coordinator 的职责
 
 1. 心跳超时后关闭该节点的调度资格，持久化节点会话及旧执行的失效状态，撤销旧路由。仅设置节点 unavailable 不足以完成此流程。
 2. 失效后的旧会话、旧归属代次及旧执行不能通过迟到心跳、结果提交或 SQLite 补写重新变为有效。
-3. 需要恢复的 Environment 使用新的执行代次重新调度，保持 Environment ID；恢复所需 checkpoint 必须已登记、未过期、可跨节点读取且兼容目标后端。
+3. 需要恢复的 Environment 在原执行确认不再占用资源后，使用新的执行代次重新调度，保持 Environment ID；恢复所需 checkpoint 必须已登记、未过期、可跨节点读取且兼容目标后端。原节点失联而清理结果未知时保留原预留，不派发替代执行。
 4. checkpoint 缺失或 local-only 时明确恢复失败，不从原始镜像重新创建。节点不可调度期间不把它的容量重新投入分配。
 5. Coordinator 重启后，已有节点先关闭路由和准入，并从恢复完成时开始等待一个心跳超时周期。期限内重新报到可正常对账；期限届满仍未报到则失效旧执行。迟到注册和结果提交同样先检查这段期限，不能绕过定时器。
 
@@ -24,7 +26,7 @@
 4. SQLite 日志不能覆盖 Coordinator 的失效或转移决定；丢弃退役归属的补写记录。有效归属的日志继续遵守已有降级契约。
 5. 清理失败时保持对账未完成和准入关闭，重试清理。受有效快照引用保护的制品不随旧执行无条件删除。
 
-失效判定与物理清理是两个步骤：前者由 Coordinator 在心跳超时后完成，后者由恢复后的 adxlet 执行。跨节点恢复不以收到旧节点的停止确认作为前置条件；控制面不应将超时事件记录为已经观察到远端进程退出。
+失效判定与物理清理是两个步骤：前者由 Coordinator 在心跳超时后完成，后者由恢复后的 adxlet 执行。跨节点恢复以原执行已经完成物理退役或明确未开始的结果为前置条件。超时不能归还原预留，也不能授权另一执行使用它；pending 恢复派发在节点失联时同样保留占用。Failed 保留期到期不能绕过该限制。
 
 Coordinator 暂时不可用时的 SQLite 降级行为，与 Coordinator 已经作出的节点失效决定分别处理；一旦获取到权威失效记录，对账清理优先，不能以本地日志保留旧执行资格。
 
@@ -32,8 +34,8 @@ Coordinator 暂时不可用时的 SQLite 降级行为，与 Coordinator 已经�
 
 - 节点超时：旧执行失效与路由撤销持久化；迟到心跳和提交不能复活旧执行。
 - adxlet 恢复连接/进程重启：发现原执行仍在，先清理再开放准入；清理失败保持关闭。
-- 有效共享 checkpoint：新节点恢复同 Environment ID、新执行代次，发布新路由。
+- 有效共享 checkpoint：源清理未知时不恢复；原节点清理并持久结算后，新节点恢复同 Environment ID、新执行代次并发布新路由。
 - 无 checkpoint、local-only、过期或不兼容 checkpoint：明确恢复失败。
 - 恢复过程被 Coordinator 重启或请求重试打断：不重复创建，不接受旧代结果；原节点之后恢复仍清理旧执行。
 
-当前 `CoordinatorRpc::expire_nodes` 调用 `Session::invalidate_node`，原子更新节点和旧执行结果，并保存 invalidated 标记；迟到注册/提交路径也会先检查超时。adxlet 对账会废弃与权威终态冲突的已有控制器，SQLite 不补写到权威终态之上。`Session::reserve_recovery` 与 `CoordinatorRpc::recover_instances` 已接通共享 checkpoint 的新代次分配/恢复；持久化计划、重复请求和源节点制品保护有组件测试。真实FC双节点六项及计划落盘后Coordinator重启已通过，r5目标adxlet执行中重启及未提交backend清理也已通过，见 [跨节点恢复](2026-09-16-cross-node-recovery.md)。
+当前 `CoordinatorRpc::expire_nodes` 调用 `Session::invalidate_node`，原子更新节点和旧执行结果，并保存 invalidated 标记；迟到注册/提交路径也会先检查超时。adxlet 对账会废弃与权威终态冲突的已有控制器，SQLite 不补写到权威终态之上。`Session::reserve_recovery` 与 `CoordinatorRpc::recover_environments` 已接通共享 checkpoint 的新代次分配/恢复；持久化计划、重复请求和源节点制品保护有组件测试。此前真实 FC 跨节点报告属于旧失效契约，见 [历史跨节点恢复](2026-09-16-cross-node-recovery.md)；本次占用保留与清理后恢复必须重新验收。

@@ -1018,7 +1018,7 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
     let snapshot = session.snapshot().await.unwrap();
     assert!(!snapshot.nodes["node"].node.available);
     assert!(snapshot.routes().unwrap().is_empty());
-    assert!(!snapshot.environments["held"].resources_held());
+    assert!(snapshot.environments["held"].resources_held());
     let metrics = rpc.metrics().await.unwrap();
     assert!(metrics.contains(
         "adx_coordinator_environments{shard_id=\"0\",node_id=\"node\",state=\"Invalidated\"} 1\n"
@@ -1054,7 +1054,7 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
         snapshot.records[0].state,
         pb::EnvironmentState::Failed as i32
     );
-    assert!(!snapshot.records[0].resources_held);
+    assert!(snapshot.records[0].resources_held);
     assert!(!snapshot.records[0].restart_pending);
     let backend = Arc::new(Backend {
         session: session.clone(),
@@ -1491,7 +1491,7 @@ async fn coordinator_restart_bounds_re_registration_grace() {
             let returned: EnvironmentRecord = catalog.records[0].clone().try_into().unwrap();
             assert_eq!(&returned, result);
             assert_eq!(result.state, EnvironmentState::Failed, "{mode}");
-            assert!(!result.resources_held);
+            assert!(result.resources_held);
             assert!(result.runtime.ip.is_none());
             assert!(
                 node.commit_environment(pb::CommitEnvironmentRequest {
@@ -1504,6 +1504,7 @@ async fn coordinator_restart_bounds_re_registration_grace() {
             );
             let mut deleted = returned;
             deleted.state = EnvironmentState::Deleted;
+            deleted.resources_held = false;
             deleted.revision += 1;
             node.commit_environment(pb::CommitEnvironmentRequest {
                 record: Some(deleted.try_into().unwrap()),
@@ -2559,7 +2560,7 @@ impl RuntimeDriver for RecoveryBackend {
 }
 #[tokio::test]
 #[ignore = "requires isolated Redis and mTLS certificates"]
-async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deleting_artifact() {
+async fn shared_checkpoint_recovers_only_after_source_cleanup_and_keeps_artifact() {
     use adx_core::{Assignment, EnvironmentState, RestorePoint};
     use adxlet::checkpoint::{CheckpointStore, ObjectCheckpointStore, RemoteGcConfig};
     let redis = common::Redis::new().await;
@@ -2757,6 +2758,76 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
     target_report.accepting_allocations = true;
     target.register_node(target_report.clone()).await.unwrap();
     assert_eq!(rpc.expire_nodes().await.unwrap(), 1);
+    assert_eq!(rpc.recover_environments().await.unwrap(), 0);
+    assert!(session.get("held").await.unwrap().resources_held());
+    assert_eq!(backend.0.started.load(Ordering::SeqCst), 0);
+    source_report.heartbeat_sequence += 1;
+    source_report.reconciling = true;
+    source_report.accepting_allocations = false;
+    source.register_node(source_report.clone()).await.unwrap();
+    let pending_cleanup = source
+        .inspect_node(pb::InspectNodeRequest {
+            node_id: "source".into(),
+            session_id: "source-boot".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(pending_cleanup.records.len(), 1);
+    assert!(pending_cleanup.records[0].resources_held);
+    let returned_dir = tempfile::tempdir().unwrap();
+    let returned_store = Arc::new(
+        ObjectCheckpointStore::new(
+            "shared".into(),
+            remote.clone(),
+            "test".into(),
+            returned_dir.path().into(),
+            1024,
+        )
+        .unwrap()
+        .with_owner(
+            "source".into(),
+            "new-upload-session".into(),
+            RemoteGcConfig {
+                min_age_seconds: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    );
+    let old_backend = Arc::new(Backend {
+        session: session.clone(),
+        started: AtomicUsize::new(0),
+        removed: AtomicUsize::new(0),
+        running: Mutex::new(BTreeSet::from(["held-1".into()])),
+    });
+    let returned = Adxlet::new(
+        "source".into(),
+        old_backend.clone(),
+        Arc::new(LocalChecks),
+        Arc::new(LocalChecks),
+        Arc::new(
+            CoordinatorStateSink::new(channel(ma, "node").await, Duration::from_secs(3))
+                .unwrap()
+                .with_session("source-boot".into()),
+        ),
+    )
+    .with_checkpointing(returned_store.clone(), Arc::new(LocalChecks))
+    .unwrap();
+    returned
+        .reconcile(
+            pending_cleanup
+                .records
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<Vec<_>>>()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(old_backend.running.lock().unwrap().is_empty());
+    assert_eq!(old_backend.removed.load(Ordering::SeqCst), 1);
+    assert!(!session.get("held").await.unwrap().resources_held());
     assert_eq!(rpc.recover_environments().await.unwrap(), 1);
     let restored = session.get("held").await.unwrap();
     let result = restored.result.clone().unwrap();
@@ -2810,45 +2881,6 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
         .into_inner();
     assert!(catalog.records.is_empty());
     assert_eq!(catalog.retained_checkpoints.len(), 1);
-    let returned_dir = tempfile::tempdir().unwrap();
-    let returned_store = Arc::new(
-        ObjectCheckpointStore::new(
-            "shared".into(),
-            remote.clone(),
-            "test".into(),
-            returned_dir.path().into(),
-            1024,
-        )
-        .unwrap()
-        .with_owner(
-            "source".into(),
-            "new-upload-session".into(),
-            RemoteGcConfig {
-                min_age_seconds: 0,
-                ..Default::default()
-            },
-        )
-        .unwrap(),
-    );
-    let old_backend = Arc::new(Backend {
-        session: session.clone(),
-        started: AtomicUsize::new(0),
-        removed: AtomicUsize::new(0),
-        running: Mutex::new(BTreeSet::from(["held-1".into()])),
-    });
-    let returned = Adxlet::new(
-        "source".into(),
-        old_backend.clone(),
-        Arc::new(LocalChecks),
-        Arc::new(LocalChecks),
-        Arc::new(
-            CoordinatorStateSink::new(channel(ma, "node").await, Duration::from_secs(3))
-                .unwrap()
-                .with_session("source-boot".into()),
-        ),
-    )
-    .with_checkpointing(returned_store.clone(), Arc::new(LocalChecks))
-    .unwrap();
     let retained = catalog
         .retained_checkpoints
         .into_iter()

@@ -52,7 +52,7 @@ fn requires_node_reconciliation(environment: &StoredEnvironment) -> bool {
     environment.result.as_ref().is_none_or(|record| {
         // Failed records need a local controller for cleanup and explicit deletion,
         // including expired ownership. Storage fences invalidated results so a
-        // returning node cannot republish Running or reserve their resources.
+        // returning node cannot republish Running. Original holds survive until cleanup.
         record.state != EnvironmentState::Deleted || record.resources_held || record.restart_pending
     })
 }
@@ -107,11 +107,12 @@ impl State {
         self.scheduler.generation = self.scheduler.generation.max(saved.generation);
         for (environment_id, stored) in saved.environments {
             if stored.assignment.node_id == id && stored.invalidated {
-                if self
-                    .scheduler
-                    .snapshot()
-                    .environments()
-                    .contains_key(&environment_id)
+                if !stored.resources_held()
+                    && self
+                        .scheduler
+                        .snapshot()
+                        .environments()
+                        .contains_key(&environment_id)
                 {
                     if let Err(error) = self.scheduler.release(&stored.assignment) {
                         self.needs_recovery = true;

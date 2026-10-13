@@ -55,7 +55,7 @@ impl State {
         Ok(())
     }
     pub(super) fn accept_stored_claim(&mut self, record: StoredEnvironment) -> Result<()> {
-        let synchronized = if record.resources_held() && !record.invalidated {
+        let synchronized = if record.resources_held() {
             self.scheduler
                 .accept_claim(&record.spec, &record.assignment)
         } else {

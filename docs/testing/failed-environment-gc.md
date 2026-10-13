@@ -27,7 +27,7 @@ services:
 
 - 所属节点健康时，Coordinator 调用 adxlet 删除接口，携带归属 generation、节点会话和期望 Failed revision。adxlet 在该 Environment 的串行控制任务中复核状态；已恢复为 Running、待重启、修订号或会话不匹配时拒绝 GC。
 - 节点先清理后端和恢复点，再发布 Deleted。清理或持久化失败保留记录并在后续巡检重试；不会因为保留期到达就忽略仍在线节点的清理失败。
-- 节点归属已失效且资源已释放时，Coordinator 可以原子退役 Failed。此时不声称旧节点的物理执行已经停止；旧节点返回后按权威目录清理旧执行，旧 generation 不能再发布 Running。
+- 节点归属已失效且原清理结果已经确认不再占用资源时，Coordinator 可以原子退役 Failed。失联本身、保留期到达和共享检查点存在均不能释放资源或删除仍占用的记录。原节点返回后按权威目录清理并提交原身份结果；旧 generation 不能再发布 Running。
 - 成功后移除 Redis 主目录、Coordinator 调度目录以及在线 adxlet 控制任务。仅保留现有 600 秒最小删除回执，不保留完整 Failed／Deleted 记录。同名创建获得新 generation；迟到提交不能恢复旧归属。
 
 GC 在 mTLS 模式下仅允许 Coordinator 服务身份调用受控删除；普通 API Server DELETE 的用户权限检查保持不变。network 模式遵循既有内部网络信任边界。

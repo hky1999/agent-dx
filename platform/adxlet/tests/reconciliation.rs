@@ -317,34 +317,38 @@ async fn authority_removal_cleans_live_controller_and_fences_delayed_calls() {
 
 #[tokio::test]
 async fn reconnect_discards_live_controller_when_authority_invalidates_execution() {
-    let backend = Arc::new(Backend::default());
-    *backend.actual.lock().unwrap() = vec![observed("lost")];
-    let node = manager(&backend);
-    let running = record("lost", EnvironmentState::Running);
-    node.reconcile(vec![running.clone()]).await.unwrap();
-    backend.events.lock().unwrap().clear();
-    let mut failed = running;
-    failed.state = EnvironmentState::Failed;
-    failed.resources_held = false;
-    failed.runtime.ip = None;
-    failed.revision += 1;
-    backend
-        .fail_remove
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    assert!(node.reconcile(vec![failed.clone()]).await.is_err());
-    assert!(!node.accepting_allocations());
-    backend
-        .fail_remove
-        .store(false, std::sync::atomic::Ordering::SeqCst);
-    node.reconcile(vec![failed]).await.unwrap();
-    assert!(backend.actual.lock().unwrap().is_empty());
-    assert_eq!(node.used(), Resources::default());
-    assert!(!backend
-        .events
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|e| e.starts_with("bind:")));
+    for held in [false, true] {
+        let backend = Arc::new(Backend::default());
+        *backend.actual.lock().unwrap() = vec![observed("lost")];
+        let node = manager(&backend);
+        let running = record("lost", EnvironmentState::Running);
+        node.reconcile(vec![running.clone()]).await.unwrap();
+        backend.events.lock().unwrap().clear();
+        let mut failed = running;
+        failed.state = EnvironmentState::Failed;
+        failed.resources_held = held;
+        failed.runtime.ip = None;
+        failed.revision += 1;
+        backend
+            .fail_remove
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(node.reconcile(vec![failed.clone()]).await.is_err());
+        assert!(!node.accepting_allocations());
+        assert_eq!(node.used(), failed.spec.execution_resources());
+        assert_eq!(backend.actual.lock().unwrap().len(), 1);
+        backend
+            .fail_remove
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        node.reconcile(vec![failed]).await.unwrap();
+        assert!(backend.actual.lock().unwrap().is_empty());
+        assert_eq!(node.used(), Resources::default());
+        assert!(!backend
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e.starts_with("bind:")));
+    }
 }
 
 #[tokio::test]

@@ -1,3 +1,5 @@
+#[path = "storage/budget_expiry.rs"]
+mod budget_expiry;
 #[path = "storage/claims.rs"]
 mod claims;
 mod common;
@@ -157,6 +159,16 @@ async fn invalidated_failed_collection_is_atomic_and_fences_replacement() {
         Error::Conflict
     );
     session.invalidate_node("node", "s1").await.unwrap();
+    let held = session.get("invalid-gc").await.unwrap();
+    assert!(held.resources_held());
+    assert_eq!(
+        session.retire_invalidated_failed(&held, u64::MAX).await,
+        Err(Error::Conflict)
+    );
+    let mut retired = held.result.unwrap();
+    retired.resources_held = false;
+    retired.revision += 1;
+    session.commit(retired).await.unwrap();
     let failed = session.get("invalid-gc").await.unwrap();
     let deleted = session
         .retire_invalidated_failed(&failed, u64::MAX)
@@ -1143,7 +1155,7 @@ async fn expired_executions_remain_invalid_after_redis_and_coordinator_restart()
         assert!(environment.invalidated);
         let result = environment.result.as_ref().unwrap();
         assert_eq!(result.state, EnvironmentState::Failed);
-        assert!(!result.resources_held && !result.restart_pending);
+        assert!(result.resources_held && !result.restart_pending);
         assert!(result.runtime.ip.is_none());
     }
     assert!(!failed.environments["kept"].invalidated);
@@ -1226,6 +1238,16 @@ async fn recovery_assignment_is_durable_and_old_generation_cannot_publish() {
         .await
         .is_err());
     session.invalidate_node("source", "boot").await.unwrap();
+    assert_eq!(
+        session
+            .reserve_recovery(&previous, replacement.clone(), 1)
+            .await,
+        Err(Error::Conflict)
+    );
+    let mut retired = session.get("held").await.unwrap().result.unwrap();
+    retired.resources_held = false;
+    retired.revision += 1;
+    session.commit(retired).await.unwrap();
     let saved = session
         .reserve_recovery(&previous, replacement.clone(), 1)
         .await
@@ -1319,6 +1341,10 @@ async fn recovery_never_uses_missing_local_or_expired_checkpoint() {
         }
         session.commit(r).await.unwrap();
         session.invalidate_node("source", "boot").await.unwrap();
+        let mut retired = session.get("held").await.unwrap().result.unwrap();
+        retired.resources_held = false;
+        retired.revision += 1;
+        session.commit(retired).await.unwrap();
         let before = session.get("held").await.unwrap();
         assert!(before.recovery_point(2).is_none(), "{kind}");
         assert!(
