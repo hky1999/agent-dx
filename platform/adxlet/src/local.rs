@@ -112,7 +112,7 @@ impl Adxlet {
         let adopted = hold.devices == assignment.devices;
         if adopted {
             let runtime_id = format!("{}-{}", spec.id, assignment.generation);
-            scalar.restore(&runtime_id, spec.resources)?;
+            scalar.restore(&runtime_id, spec.execution_resources())?;
             devices.restore(&runtime_id, &assignment.devices)?;
         }
         admission.ledger = scalar;

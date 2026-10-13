@@ -132,6 +132,29 @@ fn corrupt_ownership_or_double_card_assignment_fails_recovery() {
     saved.environments.get_mut("i").unwrap().assignment.shard_id = 1;
     assert!(Coordinator::restore(&saved, Placement::Pack).is_err());
 }
+
+#[test]
+fn execution_limits_remain_reserved_after_coordinator_recovery() {
+    let mut saved = saved();
+    let stored = saved.environments.get_mut("i").unwrap();
+    stored.spec.scheduling.devices.clear();
+    stored.assignment.devices.clear();
+    stored.spec.sandbox.limits.cpu_millis = 200;
+    let mut coordinator = Coordinator::restore(&saved, Placement::Pack).unwrap();
+    let mut node = saved.nodes["n"].node.clone();
+    node.capacity.cpu_millis = 200;
+    node.capacity.memory_bytes = 200;
+    coordinator.register(node).unwrap();
+    let mut waiting = saved.environments["i"].spec.clone();
+    waiting.id = "waiting".into();
+    waiting.sandbox.limits = Default::default();
+    coordinator.submit(waiting).unwrap();
+    assert!(coordinator.schedule(0).unwrap().is_none());
+    coordinator
+        .release(&saved.environments["i"].assignment)
+        .unwrap();
+    assert!(coordinator.schedule(0).unwrap().is_some());
+}
 #[test]
 fn exhausted_generation_never_wraps_to_an_old_identity() {
     let mut saved = saved();

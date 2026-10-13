@@ -225,7 +225,7 @@ impl Admission {
         }
         let mut scalar = self.ledger.clone();
         let mut devices = self.devices.clone();
-        scalar.reserve(id, spec.resources)?;
+        scalar.reserve(id, spec.execution_resources())?;
         devices.reserve(id, &spec.scheduling.devices, &assignment.devices)?;
         self.ledger = scalar;
         self.devices = devices;

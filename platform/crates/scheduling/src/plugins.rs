@@ -17,7 +17,7 @@ impl Filter for ResourceFit {
         "resource-fit"
     }
     fn filter(&self, request: &EnvironmentSpec, candidate: &Candidate<'_>) -> Result<bool> {
-        Ok(request.resources.fits(&candidate.available))
+        Ok(request.execution_resources().fits(&candidate.available))
     }
 }
 pub struct ResourceBalance(pub Placement);
@@ -26,7 +26,9 @@ impl Score for ResourceBalance {
         "resource-balance"
     }
     fn score(&self, request: &EnvironmentSpec, candidate: &Candidate<'_>) -> Result<u32> {
-        let available = candidate.available.saturating_sub(request.resources);
+        let available = candidate
+            .available
+            .saturating_sub(request.execution_resources());
         let capacity = candidate.node.capacity;
         let fraction = |free: u64, total: u64| -> u32 {
             if total == 0 {

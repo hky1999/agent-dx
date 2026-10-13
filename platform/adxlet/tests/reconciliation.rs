@@ -164,6 +164,26 @@ fn manager(b: &Arc<Backend>) -> Adxlet {
     .unwrap();
     n
 }
+
+#[tokio::test]
+async fn execution_limits_are_rebuilt_from_the_authoritative_record() {
+    let b = Arc::new(Backend::default());
+    *b.actual.lock().unwrap() = vec![observed("bounded")];
+    let node = manager(&b);
+    let mut running = record("bounded", EnvironmentState::Running);
+    running.spec.sandbox.limits.cpu_millis = 8;
+    running.spec.sandbox.limits.memory_bytes = 16;
+    running.spec.sandbox.limits.disk_bytes = 32;
+    node.reconcile(vec![running]).await.unwrap();
+    assert_eq!(
+        node.used(),
+        Resources {
+            cpu_millis: 8,
+            memory_bytes: 16,
+            disk_bytes: 32
+        }
+    );
+}
 #[tokio::test]
 async fn restores_running_usage_without_start_and_cleans_uncommitted_orphans() {
     let b = Arc::new(Backend::default());

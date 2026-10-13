@@ -58,7 +58,7 @@ fn term() -> PeerTerm {
 }
 #[test]
 fn unsafe_policies_and_custom_profiles_never_enter_semantic_cache() {
-    for variant in 0..4 {
+    for variant in 0..5 {
         let mut m = Coordinator::new(1, Placement::Spread).unwrap();
         m.register(node("a")).unwrap();
         m.register(node("b")).unwrap();
@@ -75,6 +75,7 @@ fn unsafe_policies_and_custom_profiles_never_enter_semantic_cache() {
                     model: None,
                     count: 1,
                 }),
+                4 => r.sandbox.limits.disk_bytes = 1,
                 _ => unreachable!(),
             }
             m.submit(r).unwrap();
@@ -126,6 +127,24 @@ fn cached_scalar_request_respects_new_cross_shard_reverse_anti_affinity() {
     assert!(m.schedule(0).unwrap().is_none());
     m.release(&owned).unwrap();
     assert!(m.schedule(0).unwrap().is_some());
+}
+
+#[test]
+fn execution_limits_change_the_cached_scalar_demand() {
+    let mut coordinator = Coordinator::new(1, Placement::Pack).unwrap();
+    coordinator.register(node("a")).unwrap();
+    coordinator.submit(spec("warm")).unwrap();
+    let warm = coordinator.schedule(0).unwrap().unwrap();
+    coordinator.release(&warm).unwrap();
+    let mut large = spec("large");
+    large.sandbox.limits.memory_bytes = 101;
+    coordinator.submit(large).unwrap();
+    assert!(coordinator.schedule(0).unwrap().is_none());
+    coordinator.submit(spec("small")).unwrap();
+    assert_eq!(
+        coordinator.schedule(0).unwrap().unwrap().environment_id,
+        "small"
+    );
 }
 #[test]
 fn bounded_round_applies_peer_reservations_between_requests() {

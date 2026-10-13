@@ -90,7 +90,7 @@ impl Adxlet {
                 return Err(Error::Conflict);
             }
             if r.resources_held {
-                scalar.restore(&r.runtime.id, r.spec.resources)?;
+                scalar.restore(&r.runtime.id, r.spec.execution_resources())?;
                 cards.restore(&r.runtime.id, &r.assignment.devices)?;
             }
             catalog.insert(r.spec.id.clone(), r);
@@ -192,7 +192,9 @@ impl Adxlet {
                             .lock()
                             .expect("shared state lock poisoned");
                         // Catalog has already been validated for scalar/card conflicts.
-                        admission.ledger.restore(&r.runtime.id, r.spec.resources)?;
+                        admission
+                            .ledger
+                            .restore(&r.runtime.id, r.spec.execution_resources())?;
                         admission
                             .devices
                             .restore(&r.runtime.id, &r.assignment.devices)?;

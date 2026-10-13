@@ -195,6 +195,61 @@ async fn create_publishes_only_after_runtime_readiness_and_route_binding() {
 }
 
 #[tokio::test]
+async fn execution_limits_cover_local_holds_adoption_and_release() {
+    let deps = Dependencies::new(false);
+    let node = node(&deps);
+    let capacity = Resources {
+        cpu_millis: 2,
+        memory_bytes: 4096,
+        disk_bytes: 4096,
+    };
+    node.update_capacity(capacity, Duration::from_secs(30))
+        .unwrap();
+    let mut first = spec("bounded");
+    first.sandbox.limits.cpu_millis = 2;
+    first.sandbox.limits.memory_bytes = 4096;
+    first.sandbox.limits.disk_bytes = 4096;
+    let hold = node.reserve_local(&first).unwrap();
+    assert_eq!(node.used(), capacity);
+    assert!(matches!(
+        node.reserve_local(&spec("other")),
+        Err(Error::NoCapacity)
+    ));
+    let environment = node
+        .environment(first.clone(), assignment(&first.id))
+        .unwrap();
+    environment.create().await.unwrap();
+    assert_eq!(node.used(), capacity);
+    node.release_local(&first.id, &hold).unwrap();
+    assert_eq!(
+        node.used(),
+        capacity,
+        "an adopted token cannot release execution ownership"
+    );
+    environment.delete().await.unwrap();
+    assert_eq!(node.used(), Resources::default());
+}
+
+#[tokio::test]
+async fn execution_limit_above_capacity_rejects_direct_create_before_start() {
+    let deps = Dependencies::new(false);
+    let node = node(&deps);
+    let mut request = spec("too-large");
+    request.sandbox.limits.memory_bytes = 2048;
+    let environment = node
+        .environment(request.clone(), assignment(&request.id))
+        .unwrap();
+    assert_eq!(environment.create().await.unwrap_err(), Error::NoCapacity);
+    assert_eq!(node.used(), Resources::default());
+    assert!(!deps
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| event == "start"));
+}
+
+#[tokio::test]
 async fn failed_collection_is_fenced_and_keeps_metadata_until_cleanup_succeeds() {
     let deps = Dependencies::new(false);
     let node = node(&deps);

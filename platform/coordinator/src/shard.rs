@@ -30,11 +30,12 @@ struct Signature {
 }
 impl From<&EnvironmentSpec> for Signature {
     fn from(r: &EnvironmentSpec) -> Self {
+        let execution = r.execution_resources();
         Self {
             image: r.image.clone(),
             runtime: r.runtime_class.clone(),
-            cpu: r.resources.cpu_millis,
-            memory: r.resources.memory_bytes,
+            cpu: execution.cpu_millis,
+            memory: execution.memory_bytes,
         }
     }
 }
@@ -151,7 +152,7 @@ impl ShardScheduler {
             .ok_or(Error::NotFound)?;
         let mut scalar = state.scalar.clone();
         let mut devices = state.devices.clone();
-        scalar.restore(&spec.id, spec.resources)?;
+        scalar.restore(&spec.id, spec.execution_resources())?;
         devices.restore(&spec.id, &assignment.devices)?;
         state.scalar = scalar;
         state.devices = devices;
@@ -387,7 +388,7 @@ impl ShardScheduler {
         let r = &entry.spec;
         let reserved = (|| {
             let allocations = select_devices(&r.scheduling.devices, &state.free_devices)?;
-            state.scalar.reserve(&r.id, r.resources)?;
+            state.scalar.reserve(&r.id, r.execution_resources())?;
             if let Err(e) = state
                 .devices
                 .reserve(&r.id, &r.scheduling.devices, &allocations)

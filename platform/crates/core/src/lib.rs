@@ -92,6 +92,26 @@ pub struct EnvironmentSpec {
 }
 
 impl EnvironmentSpec {
+    /// Resources enforced at execution, with zero limits inheriting requests.
+    /// Admission and restart accounting reserve this full tuple until a
+    /// separate, durable resource grant authorizes a smaller execution bound.
+    pub fn execution_resources(&self) -> Resources {
+        Resources {
+            cpu_millis: self
+                .resources
+                .cpu_millis
+                .max(self.sandbox.limits.cpu_millis),
+            memory_bytes: self
+                .resources
+                .memory_bytes
+                .max(self.sandbox.limits.memory_bytes),
+            disk_bytes: self
+                .resources
+                .disk_bytes
+                .max(self.sandbox.limits.disk_bytes),
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         for (name, value) in [
             ("id", &self.id),

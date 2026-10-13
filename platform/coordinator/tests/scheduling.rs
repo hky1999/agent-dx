@@ -79,6 +79,39 @@ fn reservations_prevent_overcommit_and_release_wakes_waiting_work() {
 }
 
 #[test]
+fn execution_limits_are_reserved_before_a_second_assignment() {
+    let mut coordinator = Coordinator::new(1, Placement::Pack).unwrap();
+    coordinator.register(node("n1", 2)).unwrap();
+    let mut first = spec("bounded-a", "tenant", 0);
+    first.sandbox.limits.cpu_millis = 2;
+    coordinator.submit(first).unwrap();
+    let assignment = coordinator.schedule(0).unwrap().unwrap();
+    coordinator.submit(spec("bounded-b", "tenant", 0)).unwrap();
+    assert!(
+        coordinator.schedule(0).unwrap().is_none(),
+        "the first execution can consume the node's entire CPU limit"
+    );
+    coordinator.release(&assignment).unwrap();
+    assert_eq!(
+        coordinator.schedule(0).unwrap().unwrap().environment_id,
+        "bounded-b"
+    );
+}
+
+#[test]
+fn execution_memory_limit_must_fit_before_assignment() {
+    let mut coordinator = Coordinator::new(1, Placement::Pack).unwrap();
+    coordinator.register(node("n1", 2)).unwrap();
+    let mut request = spec("large-limit", "tenant", 0);
+    request.sandbox.limits.memory_bytes = 20_000;
+    coordinator.submit(request).unwrap();
+    assert!(
+        coordinator.schedule(0).unwrap().is_none(),
+        "the memory limit is larger than this node's entire budget"
+    );
+}
+
+#[test]
 fn maintenance_preserves_existing_reservations_and_blocks_new_ones() {
     let mut coordinator = Coordinator::new(1, Placement::Pack).unwrap();
     coordinator.register(node("n1", 2)).unwrap();

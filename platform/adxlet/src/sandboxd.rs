@@ -752,7 +752,8 @@ pub fn start_request(
         ));
     }
     // sandboxd's resource map is f64: reject lossy integer conversions.
-    if spec.resources.cpu_millis > 1 << 53 || spec.resources.memory_bytes > 1 << 53 {
+    let execution = spec.execution_resources();
+    if execution.cpu_millis > 1 << 53 || execution.memory_bytes > 1 << 53 {
         return Err(Error::Invalid(
             "resource value exceeds sandboxd numeric precision".into(),
         ));
@@ -865,9 +866,6 @@ pub fn start_request(
             image_process_config.into(),
         );
     }
-    let cpu_limit = options.limits.cpu_millis.max(spec.resources.cpu_millis);
-    let memory_limit = options.limits.memory_bytes.max(spec.resources.memory_bytes);
-    let disk_limit = options.limits.disk_bytes.max(spec.resources.disk_bytes);
     let (stdout, stderr) = config
         .runtime_logs
         .as_ref()
@@ -928,8 +926,8 @@ pub fn start_request(
         stdout,
         stderr,
         resources: HashMap::from([
-            ("CPU".into(), cpu_limit as f64),
-            ("Memory".into(), memory_limit as f64 / 1_048_576.0),
+            ("CPU".into(), execution.cpu_millis as f64),
+            ("Memory".into(), execution.memory_bytes as f64 / 1_048_576.0),
         ]),
         labels: HashMap::from([
             ("adx.environment_id".into(), spec.id.clone()),
@@ -942,7 +940,7 @@ pub fn start_request(
             ("runtime_id".into(), runtime_id.into()),
             ("tenantid".into(), spec.tenant_id.clone()),
         ]),
-        writable_layer_limit_bytes: disk_limit,
+        writable_layer_limit_bytes: execution.disk_bytes,
         extra_config: options.extra_config.clone(),
         network_policy: options
             .network
@@ -1634,6 +1632,26 @@ mod tests {
         assert_eq!(request.resources["CPU"], 1500.0);
         assert_eq!(request.resources["Memory"], 2048.0);
         assert_eq!(request.writable_layer_limit_bytes, 5 * 1024 * 1024 * 1024);
+        let mut bounded = spec.clone();
+        bounded.sandbox.limits.cpu_millis = 2000;
+        bounded.sandbox.limits.memory_bytes = 3 * 1024 * 1024 * 1024;
+        bounded.sandbox.limits.disk_bytes = 6 * 1024 * 1024 * 1024;
+        let limited = start_request(&bounded, "i-7", 7, &[], &config).unwrap();
+        assert_eq!(limited.resources["CPU"], 2000.0);
+        assert_eq!(limited.resources["Memory"], 3072.0);
+        assert_eq!(limited.writable_layer_limit_bytes, 6 * 1024 * 1024 * 1024);
+        for resource in ["cpu", "memory"] {
+            let mut invalid = spec.clone();
+            if resource == "cpu" {
+                invalid.sandbox.limits.cpu_millis = (1 << 53) + 1;
+            } else {
+                invalid.sandbox.limits.memory_bytes = (1 << 53) + 1;
+            }
+            assert!(matches!(
+                start_request(&invalid, "i-7", 7, &[], &config),
+                Err(Error::Invalid(_))
+            ));
+        }
         assert_eq!(
             request.rootfs.unwrap().source,
             Some(proto::rootfs_config::Source::ImageUrl("image:tag".into()))
