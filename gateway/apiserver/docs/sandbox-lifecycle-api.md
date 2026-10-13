@@ -143,9 +143,11 @@ flight under another identity. JSON object key order does not change the digest;
 about an unknown network outcome outside API Server.
 
 For pause, resume, reload, network replacement, and snapshot creation, malformed or missing
-lifecycle IDs and invalid local input map to `400`; downstream business
-rejection maps to `409`; API Server-to-Node transport failure maps to `503`; and
-malformed/invalid authoritative response data maps to `500`. Reload retains
+lifecycle IDs and invalid local input map to `400`; ownership or lifecycle
+conflicts map to `409`; insufficient capacity maps to `429` with
+`RESOURCE_EXHAUSTED`, `after_backoff`, and `not_started`. API Server-to-Node
+transport failure maps to `503`; malformed/invalid authoritative response data
+maps to `500`. Reload retains
 its `{"success":false}` decoded data on an error response. A `503`, a gateway
 failure, or a lost connection can be an unknown result: retry only with the
 same request ID and then query the authoritative lifecycle or catalog state.
