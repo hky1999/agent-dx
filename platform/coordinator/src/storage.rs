@@ -6,7 +6,9 @@ mod claims;
 pub use claims::{ClaimOutcome, LocalClaim};
 mod collection;
 mod credentials;
+mod execution;
 mod failure;
+pub use execution::StoredExecution;
 mod recovery;
 mod snapshots;
 use crate::Node;
@@ -75,7 +77,7 @@ impl Header {
     fn validate(&self) -> Result<()> {
         if !matches!(
             (self.schema, self.host_budgets.is_some()),
-            (1, false) | (2, true)
+            (1, false) | (2, true) | (3, _)
         ) || self.shards == 0
             || self.next_node_shard >= self.shards
             || self.epoch == 0
@@ -115,6 +117,9 @@ pub struct Recovery {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredEnvironment {
+    /// Pending physical attempts retain budget independently of the last result.
+    #[serde(default)]
+    pub execution: Option<StoredExecution>,
     /// Durable age of a terminal failure; retries and Coordinator restarts do not reset it.
     #[serde(default)]
     pub failed_since_unix_seconds: Option<u64>,
@@ -153,6 +158,7 @@ impl StoredEnvironment {
             .as_ref()
             .is_some_and(|r| r.state == EnvironmentState::Failed && !r.restart_pending)
             && !self.recovery.as_ref().is_some_and(|r| r.pending)
+            && !self.execution.as_ref().is_some_and(|e| e.pending)
             && self.recovery_point(now).is_none()
             && self
                 .failed_since_unix_seconds
@@ -170,10 +176,16 @@ impl StoredEnvironment {
         }
     }
     pub fn resources_held(&self) -> bool {
-        (!self.invalidated && self.recovery.as_ref().is_some_and(|r| r.pending))
+        self.execution.as_ref().is_some_and(|e| e.pending)
+            || (!self.invalidated && self.recovery.as_ref().is_some_and(|r| r.pending))
             || self.result.as_ref().is_none_or(|r| r.resources_held)
     }
     pub(crate) fn effective_record(&self) -> EnvironmentRecord {
+        if !self.invalidated {
+            if let Some(execution) = self.execution.as_ref().filter(|e| e.pending) {
+                return execution.authorization.target.clone();
+            }
+        }
         self.result.clone().unwrap_or_else(|| EnvironmentRecord {
             restart_attempts: 0,
             restart_pending: false,
@@ -196,6 +208,9 @@ impl StoredEnvironment {
             return Err(Error::Conflict);
         }
         validate_device_assignment(&self.spec.scheduling.devices, &self.assignment.devices)?;
+        if let Some(execution) = &self.execution {
+            execution.validate(self)?;
+        }
         if let Some(r) = &self.result {
             validate_result(r)?;
             if r.spec != self.spec || r.assignment != self.assignment {
@@ -1058,6 +1073,7 @@ impl Session {
             }
         }
         let record = StoredEnvironment {
+            execution: None,
             failed_since_unix_seconds: None,
             recovery: None,
             invalidated: false,
@@ -1150,6 +1166,10 @@ impl Session {
                 return Ok(stored_environment);
             }
             if stored_environment.invalidated
+                || stored_environment
+                    .execution
+                    .as_ref()
+                    .is_some_and(|e| e.pending)
                 || &stored_environment.assignment != previous
                 || stored_environment
                     .result
@@ -1163,6 +1183,7 @@ impl Session {
             if node.shard_id != replacement.shard_id {
                 return Err(Error::Conflict);
             }
+            stored_environment.execution = None;
             stored_environment.assignment = replacement.clone();
             stored_environment.result = None;
             stored_environment.validate()?;
@@ -1227,10 +1248,30 @@ impl Session {
                 return Err(Error::NotFound);
             };
             let mut stored_environment: StoredEnvironment = decode(environment_value)?;
-            if !next_result(&stored_environment, &result)? {
+            execution::check_result(
+                &stored_environment,
+                &result,
+                header.host_budgets.is_some() || header.schema == 3,
+            )?;
+            let mut previous = stored_environment.clone();
+            if !stored_environment.invalidated
+                && stored_environment
+                    .execution
+                    .as_ref()
+                    .is_some_and(|e| e.pending)
+                && stored_environment.result.as_ref() != Some(&result)
+            {
+                let mut target = stored_environment.effective_record();
+                target.state = EnvironmentState::Failed;
+                previous.result = Some(target);
+            }
+            if !next_result(&previous, &result)? {
                 return Ok(result);
             }
-            if result.state != EnvironmentState::Paused {
+            if let Some(execution) = &mut stored_environment.execution {
+                execution.pending = false;
+            }
+            if result.state != EnvironmentState::Paused || stored_environment.execution.is_some() {
                 if let Some(recovery) = &mut stored_environment.recovery {
                     recovery.pending = false;
                 }

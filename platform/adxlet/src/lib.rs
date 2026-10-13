@@ -60,8 +60,49 @@ pub struct RuntimeObservation {
     pub running: bool,
 }
 
+/// Materialized checkpoint input for an authorized replacement execution.
+pub struct ExecutionRestore<'a> {
+    pub path: &'a std::path::Path,
+    pub origin: Option<&'a adx_core::runtime::RuntimeIdentity>,
+}
+
 #[async_trait]
 pub trait RuntimeDriver: Send + Sync {
+    /// Persist the exact target as not yet dispatched before requesting central
+    /// authorization. Errors must prevent dispatch; cancellation remains recoverable.
+    async fn prepare_execution(&self, target: &EnvironmentRecord) -> Result<()>;
+    /// Execute the exact authorized target. Physical adapters must carry its
+    /// deadline through request preparation and enforce it at the dispatch boundary.
+    async fn execute_authorized(
+        &self,
+        authorization: &adx_core::execution::ExecutionAuthorization,
+        restore: Option<ExecutionRestore<'_>>,
+    ) -> Result<std::net::IpAddr> {
+        authorization.check_dispatch_now()?;
+        let target = &authorization.target;
+        match restore {
+            Some(restore) => {
+                self.restore_from(
+                    &target.spec,
+                    &target.runtime.id,
+                    target.assignment.generation,
+                    &target.assignment.devices,
+                    restore.path,
+                    restore.origin,
+                )
+                .await
+            }
+            None => {
+                self.start(
+                    &target.spec,
+                    &target.runtime.id,
+                    target.assignment.generation,
+                    &target.assignment.devices,
+                )
+                .await
+            }
+        }
+    }
     async fn stats(&self, _runtime_id: &str) -> Result<metrics::RuntimeUsage> {
         Err(Error::Unavailable("runtime usage is unavailable".into()))
     }
@@ -191,6 +232,13 @@ pub trait Routes: Send + Sync {
 
 #[async_trait]
 pub trait StateSink: Send + Sync {
+    /// Requires a Coordinator-persisted reservation before any replacement execution.
+    /// Local result journaling is never sufficient authority to start a runtime.
+    async fn authorize_execution(
+        &self,
+        request: &adx_core::execution::ExecutionRequest,
+    ) -> Result<adx_core::execution::ExecutionAuthorization>;
+
     /// Normal path: Coordinator -> cluster store. On outage, return Journaled only
     /// after a durable local append. Reject stale assignment generations and
     /// revisions. Repeated commits of an identical record are idempotent.
@@ -243,6 +291,7 @@ impl Admission {
 }
 
 pub(crate) struct Services {
+    execution_reconciliation_required: std::sync::atomic::AtomicBool,
     runtime: Arc<dyn RuntimeDriver>,
     runtime_control: Option<runtime_control::RuntimeControlClient>,
     readiness: Arc<dyn Readiness>,
@@ -281,6 +330,7 @@ impl Adxlet {
             lifecycle_ready: tokio::sync::RwLock::new(true),
             retired_environments: Mutex::default(),
             services: Arc::new(Services {
+                execution_reconciliation_required: std::sync::atomic::AtomicBool::new(false),
                 runtime,
                 runtime_control: None,
                 readiness,
@@ -339,7 +389,17 @@ impl Adxlet {
         Ok(self)
     }
 
+    /// The report loop must fetch an authoritative catalog after an unknown grant.
     pub async fn sync_proxy(&self) -> Result<()> {
+        if self
+            .services
+            .execution_reconciliation_required
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(Error::Unavailable(
+                "execution authorization requires reconciliation".into(),
+            ));
+        }
         self.services.routes.ensure_synced().await
     }
 
@@ -440,7 +500,12 @@ impl Adxlet {
     }
 
     pub fn accepting_allocations(&self) -> bool {
-        if !self.lifecycle_ready.try_read().is_ok_and(|ready| *ready) {
+        if self
+            .services
+            .execution_reconciliation_required
+            .load(std::sync::atomic::Ordering::Acquire)
+            || !self.lifecycle_ready.try_read().is_ok_and(|ready| *ready)
+        {
             return false;
         }
         let admission = self

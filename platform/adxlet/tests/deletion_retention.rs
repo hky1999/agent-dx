@@ -1,3 +1,4 @@
+mod execution_authority;
 use adx_core::{Assignment, EnvironmentRecord, EnvironmentSpec, Resources, Result};
 use adx_protocol::{auth::Peers, control as pb};
 use adxlet::{Adxlet, Durability, Readiness, Routes, RuntimeDriver, StateSink};
@@ -18,6 +19,9 @@ impl Default for Dependencies {
 
 #[async_trait]
 impl RuntimeDriver for Dependencies {
+    async fn prepare_execution(&self, _: &adx_core::EnvironmentRecord) -> adx_core::Result<()> {
+        Ok(())
+    }
     async fn is_running(&self, _: &str) -> Result<bool> {
         Ok(true)
     }
@@ -57,6 +61,12 @@ impl Routes for Dependencies {
 
 #[async_trait]
 impl StateSink for Dependencies {
+    async fn authorize_execution(
+        &self,
+        request: &adx_core::execution::ExecutionRequest,
+    ) -> adx_core::Result<adx_core::execution::ExecutionAuthorization> {
+        execution_authority::authorize(request)
+    }
     async fn commit(&self, _: &EnvironmentRecord) -> Result<Durability> {
         Ok(*self.0.lock().expect("test state lock is healthy"))
     }

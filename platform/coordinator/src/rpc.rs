@@ -715,7 +715,16 @@ impl CoordinatorRpc {
             if accepted.state != EnvironmentState::Failed {
                 stored.failed_since_unix_seconds = None;
             }
-            if accepted.state != EnvironmentState::Paused {
+            let execution_completed = stored.execution.as_ref().is_some_and(|execution| {
+                execution.authorization.target.runtime.id == accepted.runtime.id
+                    && accepted.revision > execution.authorization.target.revision
+            });
+            if execution_completed {
+                if let Some(execution) = &mut stored.execution {
+                    execution.pending = false;
+                }
+            }
+            if accepted.state != EnvironmentState::Paused || execution_completed {
                 if let Some(recovery) = &mut stored.recovery {
                     recovery.pending = false;
                 }
@@ -1024,25 +1033,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                     .filter(|i| {
                         i.assignment.node_id == r.node_id && requires_node_reconciliation(i)
                     })
-                    .map(|i| {
-                        i.result
-                            .unwrap_or_else(|| EnvironmentRecord {
-                                restart_attempts: 0,
-                                restart_pending: false,
-                                runtime: adx_core::Runtime {
-                                    id: format!("{}-{}", i.spec.id, i.assignment.generation),
-                                    ip: None,
-                                },
-                                spec: i.spec,
-                                assignment: i.assignment,
-                                state: EnvironmentState::Pending,
-                                revision: 0,
-                                resources_held: true,
-                                checkpoint: None,
-                                last_operation: None,
-                            })
-                            .try_into()
-                    })
+                    .map(|i| i.effective_record().try_into())
                     .collect::<Result<Vec<_>>>()
                     .map_err(status)?;
                 let snapshots = state
@@ -1286,6 +1277,64 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
             })
             .await
     }
+    async fn authorize_execution(
+        &self,
+        request: Request<pb::AuthorizeExecutionRequest>,
+    ) -> std::result::Result<Response<pb::AuthorizeExecutionResponse>, Status> {
+        let trace =
+            adx_observability::trace::Trace::rpc("coordinator.authorize_execution", &request);
+        trace
+            .run_result(async {
+                let principal = self.0.peers.authenticate(&request)?;
+                let raw = request.into_inner();
+                let execution: adx_core::execution::ExecutionRequest = raw
+                    .execution
+                    .ok_or_else(|| Status::invalid_argument("execution request required"))?
+                    .try_into()
+                    .map_err(status)?;
+                if principal != Principal::Node(execution.source.assignment.node_id.clone()) {
+                    return Err(Status::permission_denied(
+                        "only owning node may request execution",
+                    ));
+                }
+                let service = self.clone();
+                // Accepted reservations survive cancellation of the caller's RPC.
+                tokio::spawn(async move {
+                    let mut state = service.0.state.lock().await;
+                    state.recover_authoritative_state().await.map_err(status)?;
+                    state.healthy().map_err(status)?;
+                    state
+                        .live_claimant(
+                            &execution.source.assignment.node_id,
+                            &raw.node_session_id,
+                            service.0.heartbeat_timeout,
+                        )
+                        .map_err(status)?;
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_err(|_| Status::unavailable("system clock before epoch"))?
+                        .as_millis();
+                    let now = u64::try_from(now)
+                        .map_err(|_| Status::unavailable("system clock overflow"))?;
+                    state.needs_recovery = true;
+                    let authorization = state
+                        .session
+                        .authorize_execution(execution, &raw.node_session_id, now)
+                        .await;
+                    state.recover_authoritative_state().await.map_err(status)?;
+                    service.0.changed.notify_waiters();
+                    Ok(Response::new(pb::AuthorizeExecutionResponse {
+                        authorization: Some(
+                            authorization.map_err(status)?.try_into().map_err(status)?,
+                        ),
+                    }))
+                })
+                .await
+                .map_err(|_| Status::internal("execution authorization task failed"))?
+            })
+            .await
+    }
+
     async fn commit_environment(
         &self,
         request: Request<pb::CommitEnvironmentRequest>,
@@ -1377,6 +1426,7 @@ mod reconciliation_tests {
             devices: vec![],
         };
         let mut environment = StoredEnvironment {
+            execution: None,
             failed_since_unix_seconds: None,
             recovery: None,
             invalidated: false,

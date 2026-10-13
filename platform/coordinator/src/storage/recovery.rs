@@ -3,7 +3,7 @@ use super::*;
 
 impl StoredEnvironment {
     pub fn recovery_point(&self, now: u64) -> Option<&adx_core::RestorePoint> {
-        if !self.invalidated {
+        if !self.invalidated || self.resources_held() {
             return None;
         }
         let record = self.result.as_ref()?;
@@ -92,6 +92,7 @@ impl Session {
                 restart_attempts: 0,
                 restart_pending: false,
             });
+            stored_environment.execution = None;
             stored_environment.assignment = replacement.clone();
             stored_environment.invalidated = false;
             stored_environment.failed_since_unix_seconds = None;

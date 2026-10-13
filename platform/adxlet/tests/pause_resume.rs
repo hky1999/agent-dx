@@ -1,3 +1,4 @@
+mod execution_authority;
 use adx_core::{
     Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Error, Resources, Result,
 };
@@ -15,11 +16,14 @@ use std::{
 
 #[derive(Default)]
 struct Backend {
+    authorization_error: Mutex<Option<Error>>,
+    expired_authorization: Mutex<bool>,
     snapshots: Mutex<BTreeMap<String, adx_core::snapshots::Snapshot>>,
     fail_snapshot_publish: Mutex<bool>,
     running: Mutex<BTreeSet<String>>,
     events: Mutex<Vec<String>>,
     unavailable_commit: Mutex<bool>,
+    unavailable_running_commit: Mutex<bool>,
     fail_restore: Mutex<bool>,
     fail_start: Mutex<bool>,
     activity: Mutex<Option<(u64, u64)>>,
@@ -40,6 +44,9 @@ impl Backend {
 }
 #[async_trait]
 impl RuntimeDriver for Backend {
+    async fn prepare_execution(&self, _: &adx_core::EnvironmentRecord) -> adx_core::Result<()> {
+        Ok(())
+    }
     async fn inventory(&self) -> Result<Vec<adxlet::RuntimeObservation>> {
         Ok(self
             .running
@@ -235,9 +242,30 @@ impl Routes for Backend {
 }
 #[async_trait]
 impl StateSink for Backend {
+    async fn authorize_execution(
+        &self,
+        request: &adx_core::execution::ExecutionRequest,
+    ) -> adx_core::Result<adx_core::execution::ExecutionAuthorization> {
+        self.event("authorize");
+        if *self.unavailable_commit.lock().unwrap() {
+            return Err(Error::Unavailable("Coordinator unavailable".into()));
+        }
+        if let Some(error) = self.authorization_error.lock().unwrap().clone() {
+            return Err(error);
+        }
+        let mut grant = execution_authority::authorize(request)?;
+        if *self.expired_authorization.lock().unwrap() {
+            grant.issued_unix_millis = 0;
+            grant.deadline_unix_millis = request.timeout_millis;
+        }
+        Ok(grant)
+    }
     async fn commit(&self, r: &EnvironmentRecord) -> Result<Durability> {
         self.event(&format!("commit:{:?}", r.state));
-        if *self.unavailable_commit.lock().unwrap() {
+        if *self.unavailable_commit.lock().unwrap()
+            || (*self.unavailable_running_commit.lock().unwrap()
+                && r.state == EnvironmentState::Running)
+        {
             Err(Error::Unavailable("Coordinator unavailable".into()))
         } else {
             Ok(Durability::Published)
@@ -418,7 +446,14 @@ async fn pause_resume_preserves_environment_changes_execution_and_fences_delayed
     assert_eq!(node.used(), spec.resources);
     assert_eq!(
         &backend.events.lock().unwrap()[5..],
-        ["restore", "ready", "activate", "commit:Running"]
+        [
+            "commit:Paused",
+            "authorize",
+            "restore",
+            "ready",
+            "activate",
+            "commit:Running"
+        ]
     );
     assert_eq!(
         h.resume(resume(paused.record.revision)).await.unwrap(),
@@ -1089,7 +1124,7 @@ async fn snapshot_publication_failure_attempts_to_resume_source() {
 }
 
 #[tokio::test]
-async fn snapshot_checkpoint_commit_failure_still_attempts_source_resume() {
+async fn snapshot_checkpoint_commit_failure_keeps_source_paused_until_authorized() {
     use adxlet::checkpoint::SnapshotRequest;
     let (_temp, backend, node, spec, assignment) = fixture();
     let h = node.environment(spec, assignment).unwrap();
@@ -1104,6 +1139,12 @@ async fn snapshot_checkpoint_commit_failure_still_attempts_source_resume() {
         })
         .await
         .is_err());
+    assert!(backend.running.lock().unwrap().is_empty());
+    assert_eq!(node.used(), Resources::default());
+    *backend.unavailable_commit.lock().unwrap() = false;
+    let paused = h.sync().await.unwrap();
+    assert_eq!(paused.record.state, EnvironmentState::Paused);
+    h.resume(resume(paused.record.revision)).await.unwrap();
     assert_eq!(backend.running.lock().unwrap().len(), 1);
 }
 
@@ -1334,10 +1375,10 @@ async fn recovery_retries_publication_without_repeating_backend_restore() {
         restart_attempts: 0,
         restart_pending: false,
     };
-    *backend.unavailable_commit.lock().unwrap() = true;
+    *backend.unavailable_running_commit.lock().unwrap() = true;
     assert!(node.recover_environment(seed.clone()).await.is_err());
     assert_eq!(backend.running.lock().unwrap().len(), 1);
-    *backend.unavailable_commit.lock().unwrap() = false;
+    *backend.unavailable_running_commit.lock().unwrap() = false;
     let result = node.recover_environment(seed.clone()).await.unwrap();
     assert_eq!(result.durability, Durability::Published);
     assert_eq!(result.record.state, EnvironmentState::Running);
@@ -1627,4 +1668,141 @@ async fn pause_retires_control_state_only_after_the_backend_stop_barrier() {
     *backend.fail_remove.lock().unwrap() = false;
     handle.delete().await.unwrap();
     assert!(hub.is_empty());
+}
+
+#[tokio::test]
+async fn resume_requires_central_authority_before_crossing_execution_boundary() {
+    let (_temp, backend, node, spec, assignment) = fixture();
+    let handle = node.environment(spec, assignment).unwrap();
+    let running = handle.create().await.unwrap();
+    let paused = handle.pause(pause(running.record.revision)).await.unwrap();
+    backend.events.lock().unwrap().clear();
+    *backend.unavailable_commit.lock().unwrap() = true;
+    assert!(handle.resume(resume(paused.record.revision)).await.is_err());
+    let events = backend.events.lock().unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|event| event == "restore" || event == "start"),
+        "an unavailable authority must not allow physical execution: {events:?}"
+    );
+    assert!(backend.running.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn resume_capacity_rejection_preserves_source_and_allows_same_request_retry() {
+    let (_temp, backend, node, spec, assignment) = fixture();
+    let handle = node.environment(spec.clone(), assignment).unwrap();
+    let running = handle.create().await.unwrap();
+    let paused = handle.pause(pause(running.record.revision)).await.unwrap();
+    backend.events.lock().unwrap().clear();
+    *backend.authorization_error.lock().unwrap() = Some(Error::NoCapacity);
+    assert_eq!(
+        handle.resume(resume(paused.record.revision)).await,
+        Err(Error::NoCapacity)
+    );
+    assert_eq!(handle.sync().await.unwrap().record, paused.record);
+    assert_eq!(node.used(), Resources::default());
+    assert!(!backend
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|e| e == "restore"));
+    *backend.authorization_error.lock().unwrap() = None;
+    let resumed = handle.resume(resume(paused.record.revision)).await.unwrap();
+    assert_ne!(resumed.record.runtime.id, paused.record.runtime.id);
+    assert_eq!(node.used(), spec.execution_resources());
+    assert_eq!(
+        handle.resume(resume(paused.record.revision)).await.unwrap(),
+        resumed
+    );
+    assert_eq!(
+        backend
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| *e == "restore")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn expired_execution_authorization_cleans_target_without_dispatch() {
+    let (_temp, backend, node, spec, assignment) = fixture();
+    let handle = node.environment(spec, assignment).unwrap();
+    let running = handle.create().await.unwrap();
+    let paused = handle.pause(pause(running.record.revision)).await.unwrap();
+    backend.events.lock().unwrap().clear();
+    *backend.expired_authorization.lock().unwrap() = true;
+    assert!(handle.resume(resume(paused.record.revision)).await.is_err());
+    let result = handle.sync().await.unwrap().record;
+    assert_eq!(result.state, EnvironmentState::Paused);
+    assert_ne!(result.runtime.id, paused.record.runtime.id);
+    assert!(result.revision > paused.record.revision);
+    assert_eq!(node.used(), Resources::default());
+    let events = backend.events.lock().unwrap();
+    assert!(!events.iter().any(|e| e == "restore"));
+    assert_eq!(events.iter().filter(|e| *e == "remove").count(), 1);
+}
+
+#[tokio::test]
+async fn unknown_execution_authorization_requires_authoritative_reconciliation() {
+    let (_temp, backend, node, spec, assignment) = fixture();
+    let handle = node.environment(spec, assignment).unwrap();
+    let running = handle.create().await.unwrap();
+    let paused = handle.pause(pause(running.record.revision)).await.unwrap();
+    *backend.authorization_error.lock().unwrap() = Some(Error::Unavailable(
+        "authorization reply lost after reservation".into(),
+    ));
+    backend.events.lock().unwrap().clear();
+    assert!(handle.resume(resume(paused.record.revision)).await.is_err());
+    assert!(backend.running.lock().unwrap().is_empty());
+    assert_eq!(node.used(), Resources::default());
+    assert!(
+        node.sync_proxy().await.is_err(),
+        "the report loop must request authoritative reconciliation after an unknown grant"
+    );
+    assert!(!node.accepting_allocations());
+}
+
+#[tokio::test]
+async fn pending_execution_catalog_replaces_retired_source_controller() {
+    use adx_core::execution::{ExecutionKind, ExecutionRequest};
+    let (_temp, backend, node, spec, assignment) = fixture();
+    let handle = node.environment(spec.clone(), assignment.clone()).unwrap();
+    let running = handle.create().await.unwrap();
+    let paused = handle.pause(pause(running.record.revision)).await.unwrap();
+    let pending = ExecutionRequest {
+        source: paused.record.clone(),
+        kind: ExecutionKind::Resume,
+        operation_id: "lost-reply".into(),
+        expected_revision: paused.record.revision,
+        timeout_millis: 30_000,
+    }
+    .target()
+    .unwrap();
+    node.pause_lifecycle().await;
+    node.reconcile(vec![pending.clone()]).await.unwrap();
+    let settled = node
+        .environment(spec, assignment)
+        .unwrap()
+        .sync()
+        .await
+        .unwrap();
+    assert_eq!(
+        settled.record.runtime.id, pending.runtime.id,
+        "cleanup must settle the reserved target, not replay the old source"
+    );
+    assert_eq!(settled.record.state, EnvironmentState::Failed);
+    assert!(settled.record.revision > pending.revision);
+    assert!(!settled.record.resources_held);
+    assert_eq!(node.used(), Resources::default());
+    assert!(backend.running.lock().unwrap().is_empty());
+    assert!(
+        handle.sync().await.is_err(),
+        "old source controller must be fenced"
+    );
 }

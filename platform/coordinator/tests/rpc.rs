@@ -139,6 +139,9 @@ struct Backend {
 }
 #[async_trait::async_trait]
 impl RuntimeDriver for Backend {
+    async fn prepare_execution(&self, _: &adx_core::EnvironmentRecord) -> adx_core::Result<()> {
+        Ok(())
+    }
     async fn inventory(&self) -> Result<Vec<adxlet::RuntimeObservation>> {
         Ok(self
             .running
@@ -146,7 +149,11 @@ impl RuntimeDriver for Backend {
             .unwrap()
             .iter()
             .map(|id| {
-                let (environment, generation) = id.rsplit_once('-').unwrap();
+                let base = id
+                    .rsplit_once("-r")
+                    .filter(|(_, suffix)| suffix.parse::<u64>().is_ok())
+                    .map_or(id.as_str(), |(base, _)| base);
+                let (environment, generation) = base.rsplit_once('-').unwrap();
                 adxlet::RuntimeObservation {
                     environment_id: environment.into(),
                     runtime_id: id.clone(),
@@ -169,6 +176,19 @@ impl RuntimeDriver for Backend {
         let allocation = self.session.get(&spec.id).await?;
         assert_eq!(allocation.assignment.generation, generation);
         assert_eq!(allocation.spec, *spec);
+        assert!(allocation.resources_held());
+        if id != format!("{}-{generation}", spec.id) {
+            let execution = allocation
+                .execution
+                .as_ref()
+                .expect("replacement must be authorized before execution");
+            assert!(execution.pending);
+            assert_eq!(execution.authorization.target.runtime.id, id);
+            assert_eq!(
+                execution.authorization.target.assignment.generation,
+                generation
+            );
+        }
         self.started.fetch_add(1, Ordering::SeqCst);
         self.running.lock().unwrap().insert(id.into());
         Ok("10.0.0.2".parse().unwrap())
@@ -2523,6 +2543,9 @@ async fn coordinator_restart_releases_snapshot_pins_for_lost_memory_queue_only()
 struct RecoveryBackend(Backend);
 #[async_trait::async_trait]
 impl RuntimeDriver for RecoveryBackend {
+    async fn prepare_execution(&self, _: &adx_core::EnvironmentRecord) -> adx_core::Result<()> {
+        Ok(())
+    }
     async fn inventory(&self) -> Result<Vec<adxlet::RuntimeObservation>> {
         self.0.inventory().await
     }

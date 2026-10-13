@@ -140,6 +140,10 @@ impl Adxlet {
         for (id, (_, assignment, handle)) in controllers {
             if catalog.get(&id).is_none_or(|r| {
                 r.assignment != assignment
+                    || matches!(
+                        r.state,
+                        EnvironmentState::Starting | EnvironmentState::Resuming
+                    )
                     || (matches!(
                         r.state,
                         EnvironmentState::Failed | EnvironmentState::Deleted
@@ -150,7 +154,17 @@ impl Adxlet {
                 // Drain accepted operations, then clean locally without inventing a
                 // cluster record for an identity the authority does not own.
                 handle.discard().await?;
-                self.remember_retired(&assignment, None);
+                // Replacing the physical execution under the same Assignment must
+                // not tombstone that Assignment. The old handle itself is retired.
+                if catalog.get(&id).is_none_or(|r| {
+                    r.assignment != assignment
+                        || !matches!(
+                            r.state,
+                            EnvironmentState::Starting | EnvironmentState::Resuming
+                        )
+                }) {
+                    self.remember_retired(&assignment, None);
+                }
                 self.environments
                     .lock()
                     .expect("shared state lock poisoned")
@@ -226,6 +240,9 @@ impl Adxlet {
             .lock()
             .expect("shared state lock poisoned")
             .clear();
+        self.services
+            .execution_reconciliation_required
+            .store(false, std::sync::atomic::Ordering::Release);
         *ready = true;
         Ok(())
     }

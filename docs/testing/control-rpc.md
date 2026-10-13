@@ -44,6 +44,8 @@ Node 的删除入口只接受本机已经管理的精确 Assignment；不会因�
 
 ## StateSink 的成功条件
 
+`CoordinatorStateSink::authorize_execution` 通过带节点身份的 `AuthorizeExecution` RPC 获得中心持久授权，严格核对完整请求、目标和节点会话。回复超时不代表没有预留；相同请求回读原授权，期限不延期。本机结果日志不授权新执行。公开恢复、重启、reload、本地 failover 和暂停失败回滚共用此路径。配套源码需要一起部署，旧 Coordinator 没有该 RPC 时新节点关闭替换执行，不降级绕过授权。宿主容量配置的生产入口仍待接通，见 [存储契约](coordinator-storage.md)。
+
 `CoordinatorStateSink` 使用带节点客户端证书的 Channel 调用 CommitEnvironment，校验响应包含完全相同的 EnvironmentRecord，才返回 Published。超时／断线返回 Unavailable，版本或身份冲突返回 Conflict；不把未提交结果当作成功。
 
 删除已在本机完成、但 Redis 提交失败时，adxlet 保留 Deleted 结果。后续同一删除调用只重新提交结果，不再次删除运行时。底层 CoordinatorStateSink 仅返回 Published 或错误；产品节点外层 SQLite JournalSink 在符合降级条件时持久化结果并返回 Journaled。Journaled 不等于集群发布成功，详见 [节点降级契约](node-lifecycle.md)。
@@ -57,7 +59,8 @@ Coordinator 收到 Published 的创建结果后再读取已提交记录核对，
 | Coordinator.RegisterNode | Node(node_id) | 证书身份必须与注册 ID 一致 |
 | Coordinator.CreateEnvironment | API Server | CallerContext 与 Spec 租户匹配，或已认证管理员 |
 | Coordinator.GetEnvironment | API Server 或归属 Node | 租户权限／节点归属 |
-| Coordinator.CommitEnvironment | 归属 Node | 完整 Assignment、Spec、实例 revision 由存储层核验 |
+| Coordinator.CommitEnvironment | 归属 Node | 完整 Assignment、Spec、实例 revision 及替换执行授权由存储层核验 |
+| Coordinator.AuthorizeExecution | 归属 Node | 当前已对账会话、完整源结果、操作身份、目标执行及持久容量 |
 | Node.CreateEnvironment | Coordinator | 本机 node_id、Spec、Assignment、设备分配 |
 | Node.DeleteEnvironment | API Server | 租户权限、本机控制器、完整 Assignment |
 
@@ -78,7 +81,8 @@ cargo test --locked -p adx-coordinator -p adxlet -p adx-protocol -p adx-core -p 
 
 [RPC 协作测试](../../platform/coordinator/tests/rpc.rs) 覆盖：
 
-- 运行时 Start 入口直接查询真实 Redis，确认 Assignment 已提交；并发相同创建只启动一次。
+- 运行时 Start 入口直接查询真实 Redis，确认 Assignment 已提交；替换执行还检查待执行授权与目标 Runtime；并发相同创建只启动一次。
+- 同宿主预算不足时恢复在 RuntimeDriver 调用前拒绝，释放邻居后相同请求可以恢复，重复回复不启动第二个执行。
 - 真实 mTLS 的 Node / API Server / Coordinator 角色隔离、未知证书拒绝、跨租户读写拒绝、过期 Assignment 拒绝。
 - adxlet 查询地址返回，API Server 直达节点删除；重复删除不重复调用后端。
 - 容量耗尽后的创建请求等待，API Server 超时后操作继续，释放资源后成功执行。

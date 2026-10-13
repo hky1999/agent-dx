@@ -1,3 +1,4 @@
+mod execution_authority;
 use adx_core::{
     Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Error, Resources, Result,
 };
@@ -12,6 +13,15 @@ struct Coordinator {
 }
 #[async_trait]
 impl StateSink for Coordinator {
+    async fn authorize_execution(
+        &self,
+        request: &adx_core::execution::ExecutionRequest,
+    ) -> adx_core::Result<adx_core::execution::ExecutionAuthorization> {
+        if let Some(error) = self.failure.lock().unwrap().clone() {
+            return Err(error);
+        }
+        execution_authority::authorize(request)
+    }
     async fn commit(&self, record: &EnvironmentRecord) -> Result<Durability> {
         if let Some(e) = self.failure.lock().unwrap().clone() {
             return Err(e);
@@ -176,4 +186,46 @@ async fn authoritative_failure_discards_newer_local_running_result() {
     journal.recover(&[failed]).await.unwrap();
     journal.flush().await.unwrap();
     assert!(coordinator.records.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn local_result_journal_never_authorizes_a_new_execution_during_outage() {
+    let tmp = tempfile::tempdir().unwrap();
+    let coordinator = Arc::new(Coordinator::default());
+    let sink = JournalSink::new(tmp.path().join("journal.sqlite"), coordinator.clone());
+    let mut source = record(3);
+    source.state = EnvironmentState::Paused;
+    source.resources_held = false;
+    source.runtime.ip = None;
+    source.checkpoint = Some(adx_core::RestorePoint {
+        id: "checkpoint".into(),
+        origin: None,
+        source_runtime_id: "i-1".into(),
+        expires_at_unix_seconds: u64::MAX,
+        artifact: adx_core::CheckpointArtifact {
+            storage: "local".into(),
+            location: "artifact".into(),
+            size_bytes: 1,
+        },
+    });
+    *coordinator.failure.lock().unwrap() = Some(Error::Unavailable("offline".into()));
+    assert_eq!(sink.commit(&source).await.unwrap(), Durability::Journaled);
+    let request = adx_core::execution::ExecutionRequest {
+        source: source.clone(),
+        kind: adx_core::execution::ExecutionKind::Resume,
+        operation_id: "resume".into(),
+        expected_revision: 3,
+        timeout_millis: 1_000,
+    };
+    assert!(matches!(
+        sink.authorize_execution(&request).await,
+        Err(Error::Unavailable(_))
+    ));
+    assert_eq!(sink.pending().await.unwrap(), 1);
+    assert!(coordinator.records.lock().unwrap().is_empty());
+    *coordinator.failure.lock().unwrap() = None;
+    let grant = sink.authorize_execution(&request).await.unwrap();
+    assert_eq!(grant.request.source, source);
+    assert_eq!(sink.pending().await.unwrap(), 0);
+    assert_eq!(*coordinator.records.lock().unwrap(), vec![source]);
 }

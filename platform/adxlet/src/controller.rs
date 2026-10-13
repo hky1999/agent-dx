@@ -7,6 +7,7 @@ use std::{sync::Arc, time::Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
+mod execution;
 mod lifecycle;
 mod monitor;
 mod snapshots;
@@ -555,41 +556,39 @@ impl Controller {
         restore_checkpoint: bool,
         completion: Option<(String, u64, LifecycleKind)>,
     ) -> Result<OperationResult> {
-        let runtime_id = if restart {
-            format!(
-                "{}-{}-r{}",
-                self.record.spec.id,
-                self.record.assignment.generation,
-                self.record.revision.checked_add(1).ok_or(Error::Conflict)?
-            )
+        let authorization = if restart {
+            use adx_core::execution::ExecutionKind;
+            let (kind, id, expected) = if let Some((id, revision, _)) = &completion {
+                (ExecutionKind::Reload, id.clone(), *revision)
+            } else {
+                (
+                    if restore_checkpoint {
+                        ExecutionKind::Failover
+                    } else {
+                        ExecutionKind::Restart
+                    },
+                    format!("restart-{}", self.record.revision),
+                    self.record.revision,
+                )
+            };
+            Some(self.prepare_execution(kind, id, expected).await?)
         } else {
-            self.record.runtime.id.clone()
-        };
-        if !self.held || restart {
-            self.services
-                .admission
-                .lock()
-                .expect("shared state lock poisoned")
-                .reserve(&runtime_id, &self.record.spec, &self.record.assignment)?;
-        }
-        if restart {
-            self.record.runtime.id = runtime_id;
-            self.record.runtime.ip = None;
-            // restart_attempts belongs to the configured cold-restart policy.
-            // Checkpoint replacement (explicit reload or failover) has its own
-            // recovery contract and must not be rejected by Coordinator as a cold
-            // restart from a non-Failed record.
-            if !restore_checkpoint {
-                self.record.restart_attempts = self
-                    .record
-                    .restart_attempts
-                    .checked_add(1)
-                    .ok_or(Error::Conflict)?;
+            if !self.held {
+                self.services
+                    .admission
+                    .lock()
+                    .expect("shared state lock poisoned")
+                    .reserve(
+                        &self.record.runtime.id,
+                        &self.record.spec,
+                        &self.record.assignment,
+                    )?;
             }
-        }
-        self.held = true;
-        self.record.resources_held = true;
-        self.transition(Event::Start)?;
+            self.held = true;
+            self.record.resources_held = true;
+            self.transition(Event::Start)?;
+            None
+        };
         let operation_started = Instant::now();
         let attempt = timeout(self.services.operation_timeout, async {
             self.services.readiness.expect_runtime(&self.record)?;
@@ -608,6 +607,22 @@ impl Controller {
                             let path = store.materialize(&cp.artifact).await?;
                             // Firecracker reads restore files after the RPC has returned.
                             self.recovery_files = Some(path);
+                            if let Some(grant) = &authorization {
+                                return self
+                                    .services
+                                    .runtime
+                                    .execute_authorized(
+                                        grant,
+                                        Some(crate::ExecutionRestore {
+                                            path: self
+                                                .recovery_files
+                                                .as_ref()
+                                                .ok_or(Error::Conflict)?,
+                                            origin: cp.origin.as_ref(),
+                                        }),
+                                    )
+                                    .await;
+                            }
                             self.services
                                 .runtime
                                 .restore_from(
@@ -622,6 +637,9 @@ impl Controller {
                                 )
                                 .await
                         } else {
+                            if let Some(grant) = &authorization {
+                                return self.services.runtime.execute_authorized(grant, None).await;
+                            }
                             self.services
                                 .runtime
                                 .start(
@@ -732,6 +750,7 @@ impl Controller {
         .await
         .map_err(|_| Error::Unavailable("environment cleanup timed out".into()))??;
         self.recovery_files = None;
+        self.record.runtime.ip = None;
         self.services.metrics.remove(&self.record.spec.id);
         self.release_capacity()
     }

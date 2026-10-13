@@ -22,6 +22,8 @@ service CoordinatorService {
   // Node-owned state decisions are persisted by Coordinator. This does not transfer
   // ownership of the Environment lifecycle to Coordinator.
   rpc CommitEnvironment(CommitEnvironmentRequest) returns (CommitEnvironmentResponse);
+  // Reserves a replacement execution before the node performs physical work.
+  rpc AuthorizeExecution(AuthorizeExecutionRequest) returns (AuthorizeExecutionResponse);
 }
 
 service NodeService {
@@ -157,3 +159,31 @@ message ClaimEnvironmentResponse {
     bool fallback = 3; // Definitive no-write result; safe to release this attempt's hold.
   }
 }
+
+
+// Complete source and request identity fence retries; expiry never releases a hold.
+enum ExecutionKind {
+  EXECUTION_KIND_UNSPECIFIED = 0;
+  EXECUTION_KIND_RESUME = 1;
+  EXECUTION_KIND_RESTART = 2;
+  EXECUTION_KIND_RELOAD = 3;
+  EXECUTION_KIND_FAILOVER = 4;
+  EXECUTION_KIND_PAUSE_ROLLBACK = 5;
+}
+message ExecutionRequest {
+  EnvironmentRecord source = 1;
+  ExecutionKind kind = 2;
+  string operation_id = 3;
+  uint64 expected_revision = 4;
+  uint64 timeout_millis = 5;
+}
+message ExecutionAuthorization {
+  ExecutionRequest request = 1;
+  EnvironmentRecord target = 2;
+  string node_session_id = 3;
+  uint64 coordinator_epoch = 4;
+  uint64 issued_unix_millis = 5;
+  uint64 deadline_unix_millis = 6;
+}
+message AuthorizeExecutionRequest { ExecutionRequest execution = 1; string node_session_id = 2; }
+message AuthorizeExecutionResponse { ExecutionAuthorization authorization = 1; }

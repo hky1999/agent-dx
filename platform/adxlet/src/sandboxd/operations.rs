@@ -14,6 +14,15 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+pub(super) fn now_millis() -> Result<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(unavailable)?
+        .as_millis()
+        .try_into()
+        .map_err(unavailable)
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct OperationIntent {
     pub id: String,
@@ -23,12 +32,7 @@ pub(super) struct OperationIntent {
 }
 impl OperationIntent {
     pub fn new(kind: &str, fingerprint: String, duration: Duration) -> Result<Self> {
-        let now: u64 = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(unavailable)?
-            .as_millis()
-            .try_into()
-            .map_err(unavailable)?;
+        let now = now_millis()?;
         let duration: u64 = duration.as_millis().try_into().map_err(unavailable)?;
         let deadline_unix_millis = now
             .checked_add(duration)
@@ -89,6 +93,18 @@ impl OperationRecord {
             .is_some_and(|generation| !valid_resource_generation(generation))
         {
             return Err(unavailable("invalid durable physical identity"));
+        }
+        if let StartState::Prepared(fingerprint) | StartState::Cancelled(fingerprint) = &self.state
+        {
+            if fingerprint.len() != 64
+                || !fingerprint.bytes().all(|b| b.is_ascii_hexdigit())
+                || self.start.is_some()
+                || self.action.is_some()
+                || self.backend.is_some()
+                || self.retired_generation.is_some()
+            {
+                return Err(unavailable("invalid durable unstarted execution"));
+            }
         }
         let has_physical = self
             .backend

@@ -510,6 +510,36 @@ impl CoordinatorStateSink {
 }
 #[async_trait::async_trait]
 impl StateSink for CoordinatorStateSink {
+    async fn authorize_execution(
+        &self,
+        execution: &adx_core::execution::ExecutionRequest,
+    ) -> Result<adx_core::execution::ExecutionAuthorization> {
+        let mut request = Request::new(pb::AuthorizeExecutionRequest {
+            execution: Some(execution.clone().try_into()?),
+            node_session_id: self.session_id.clone(),
+        });
+        adx_observability::trace::inject_metadata(request.metadata_mut());
+        request.set_timeout(self.timeout);
+        let mut client = self
+            .client
+            .read()
+            .expect("shared state lock poisoned")
+            .clone();
+        let response = tokio::time::timeout(self.timeout, client.authorize_execution(request))
+            .await
+            .map_err(|_| Error::Unavailable("execution authorization RPC timed out".into()))?
+            .map_err(dependency_status)?
+            .into_inner();
+        let grant: adx_core::execution::ExecutionAuthorization = response
+            .authorization
+            .ok_or_else(|| Error::Unavailable("execution authorization missing".into()))?
+            .try_into()?;
+        if grant.request != *execution || grant.node_session_id != self.session_id {
+            return Err(Error::Conflict);
+        }
+        Ok(grant)
+    }
+
     async fn commit(&self, record: &EnvironmentRecord) -> Result<Durability> {
         let mut request = Request::new(pb::CommitEnvironmentRequest {
             record: Some(record.clone().try_into()?),

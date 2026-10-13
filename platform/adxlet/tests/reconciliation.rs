@@ -1,3 +1,4 @@
+mod execution_authority;
 use adx_core::{
     Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Resources, Result,
 };
@@ -19,6 +20,9 @@ struct Backend {
 }
 #[async_trait]
 impl RuntimeDriver for Backend {
+    async fn prepare_execution(&self, _: &adx_core::EnvironmentRecord) -> adx_core::Result<()> {
+        Ok(())
+    }
     async fn inventory(&self) -> Result<Vec<RuntimeObservation>> {
         if self
             .fail_inventory
@@ -90,6 +94,12 @@ impl Routes for Backend {
 }
 #[async_trait]
 impl StateSink for Backend {
+    async fn authorize_execution(
+        &self,
+        request: &adx_core::execution::ExecutionRequest,
+    ) -> adx_core::Result<adx_core::execution::ExecutionAuthorization> {
+        execution_authority::authorize(request)
+    }
     async fn commit(&self, r: &EnvironmentRecord) -> Result<Durability> {
         self.events
             .lock()

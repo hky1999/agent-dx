@@ -1,4 +1,5 @@
 //! Local gRPC/UDS contract tests against the pinned protocol, not sandboxd E2E.
+mod execution_authority;
 use adx_core::{Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Resources};
 use adxlet::sandboxd::proto::sandbox_service_server::SandboxService;
 use adxlet::{
@@ -32,6 +33,7 @@ struct Server {
     lose_delete_reply_once: Arc<std::sync::atomic::AtomicBool>,
     retired_generation: Option<String>,
     unready: Arc<std::sync::atomic::AtomicUsize>,
+    capabilities_delay_millis: Arc<std::sync::atomic::AtomicU64>,
     running: Arc<Mutex<bool>>,
     xpu: Arc<Mutex<Vec<XpuAllocation>>>,
     entered: Arc<Semaphore>,
@@ -73,6 +75,7 @@ impl Default for Server {
             lose_delete_reply_once: Arc::default(),
             retired_generation: None,
             unready: Arc::default(),
+            capabilities_delay_millis: Arc::default(),
             running: Arc::default(),
             xpu: Arc::default(),
             entered: Arc::new(Semaphore::new(0)),
@@ -408,6 +411,10 @@ impl sandbox_service_server::SandboxService for Server {
         _: Request<ListAvailableRuntimesRequest>,
     ) -> Result<Response<ListAvailableRuntimesResponse>, Status> {
         use std::sync::atomic::Ordering;
+        tokio::time::sleep(Duration::from_millis(
+            self.capabilities_delay_millis.load(Ordering::SeqCst),
+        ))
+        .await;
         if self
             .unready
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
@@ -1033,6 +1040,8 @@ async fn late_backend_of_failed_start_is_deleted_not_adopted() {
 
 #[derive(Default)]
 struct LifecycleHooks {
+    expired_authorization: std::sync::atomic::AtomicBool,
+    authorization_remaining_millis: std::sync::atomic::AtomicU64,
     records: Mutex<Vec<EnvironmentRecord>>,
     activations: std::sync::atomic::AtomicUsize,
 }
@@ -1059,6 +1068,33 @@ impl Routes for LifecycleHooks {
 
 #[async_trait::async_trait]
 impl StateSink for LifecycleHooks {
+    async fn authorize_execution(
+        &self,
+        request: &adx_core::execution::ExecutionRequest,
+    ) -> adx_core::Result<adx_core::execution::ExecutionAuthorization> {
+        let mut authorization = execution_authority::authorize(request)?;
+        if self
+            .expired_authorization
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            authorization.issued_unix_millis = 0;
+            authorization.deadline_unix_millis = request.timeout_millis;
+        }
+        let remaining = self
+            .authorization_remaining_millis
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if remaining > 0 {
+            authorization.deadline_unix_millis = authorization
+                .issued_unix_millis
+                .checked_add(remaining)
+                .unwrap();
+            authorization.issued_unix_millis = authorization
+                .deadline_unix_millis
+                .checked_sub(request.timeout_millis)
+                .unwrap();
+        }
+        Ok(authorization)
+    }
     async fn commit(&self, record: &EnvironmentRecord) -> adx_core::Result<Durability> {
         self.records.lock().unwrap().push(record.clone());
         Ok(Durability::Published)
@@ -2588,4 +2624,250 @@ async fn stateful_policy_keeps_execd_replies_independent_of_conntrack_generation
             "Execd replies must survive updates to the stateful policy generation"
         );
     }
+}
+
+#[tokio::test]
+async fn expired_replacement_permission_settles_never_dispatched_target_with_journal() {
+    let server = Server::default();
+    let (adapter, _harness) = connect(server.clone()).await;
+    let hooks = Arc::new(LifecycleHooks::default());
+    let node = lifecycle_node(adapter, &hooks);
+    let mut specification = spec();
+    specification.lifecycle.restart = Some(adx_core::lifecycle::RestartPolicy {
+        max_attempts: 1,
+        initial_backoff_seconds: 1,
+        max_backoff_seconds: 1,
+    });
+    let environment = node
+        .environment(specification, lifecycle_assignment())
+        .unwrap();
+    environment.create().await.unwrap();
+    *server.running.lock().unwrap() = false;
+    node.monitor_environments().await.unwrap();
+    hooks
+        .expired_authorization
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(node.monitor_environments().await.is_err());
+    assert_eq!(
+        server.starts.lock().unwrap().len(),
+        1,
+        "expired permission must never dispatch a replacement"
+    );
+    assert_eq!(
+        node.used(),
+        Resources::default(),
+        "a durably unstarted target must settle without treating a missing journal as proof"
+    );
+    let settled = environment.sync().await.unwrap().record;
+    assert!(!settled.resources_held);
+    assert!(settled.runtime.id.contains("-r"));
+}
+
+fn prepared_execution_permission() -> adx_core::execution::ExecutionAuthorization {
+    let mut specification = spec();
+    specification.lifecycle.restart = Some(adx_core::lifecycle::RestartPolicy {
+        max_attempts: 1,
+        initial_backoff_seconds: 1,
+        max_backoff_seconds: 1,
+    });
+    let request = adx_core::execution::ExecutionRequest {
+        source: EnvironmentRecord {
+            spec: specification,
+            assignment: lifecycle_assignment(),
+            runtime: adx_core::Runtime {
+                id: "i-1".into(),
+                ip: None,
+            },
+            state: EnvironmentState::Failed,
+            revision: 1,
+            resources_held: false,
+            checkpoint: None,
+            last_operation: None,
+            restart_attempts: 0,
+            restart_pending: true,
+        },
+        kind: adx_core::execution::ExecutionKind::Restart,
+        operation_id: "test-replacement".into(),
+        expected_revision: 1,
+        timeout_millis: 5000,
+    };
+    execution_authority::authorize(&request).unwrap()
+}
+fn prepared_execution_target() -> EnvironmentRecord {
+    prepared_execution_permission().target
+}
+
+#[tokio::test]
+async fn journal_prepared_target_survives_restart_and_cancels_without_dispatch() {
+    let server = Server::default();
+    let (adapter, harness) = connect(server.clone()).await;
+    let mut target = prepared_execution_target();
+    target.spec.env.insert(
+        "PREPARED_TEST_SECRET".into(),
+        "synthetic-private-value".into(),
+    );
+    adapter.prepare_execution(&target).await.unwrap();
+    adapter.prepare_execution(&target).await.unwrap();
+    let payload: String =
+        rusqlite::Connection::open(harness._directory.path().join("operations.sqlite"))
+            .unwrap()
+            .query_row(
+                "SELECT payload FROM operations WHERE runtime_id=?1",
+                [&target.runtime.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+    assert!(payload.contains("Prepared"));
+    assert!(!payload.contains("PREPARED_TEST_SECRET"));
+    assert!(!payload.contains("synthetic-private-value"));
+    drop(adapter);
+    let adapter = reconnect_with_journal(&harness).await;
+    adapter.remove(&target.runtime.id).await.unwrap();
+    adapter.remove(&target.runtime.id).await.unwrap();
+    drop(adapter);
+    let adapter = reconnect_with_journal(&harness).await;
+    assert_eq!(
+        adapter.prepare_execution(&target).await,
+        Err(adx_core::Error::Conflict)
+    );
+    assert_eq!(
+        adapter
+            .start(&target.spec, &target.runtime.id, 1, &[])
+            .await,
+        Err(adx_core::Error::Conflict)
+    );
+    assert!(server.starts.lock().unwrap().is_empty());
+    assert!(server.conditional_deletes.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn journal_prepared_target_binds_full_spec_and_can_start_once() {
+    let server = Server::default();
+    let (adapter, harness) = connect(server.clone()).await;
+    let permission = prepared_execution_permission();
+    let target = permission.target.clone();
+    adapter.prepare_execution(&target).await.unwrap();
+    drop(adapter);
+    let adapter = reconnect_with_journal(&harness).await;
+    let mut changed = target.clone();
+    changed.spec.env.insert("changed".into(), "value".into());
+    assert_eq!(
+        adapter.prepare_execution(&changed).await,
+        Err(adx_core::Error::Conflict)
+    );
+    assert_eq!(
+        adapter
+            .start(&changed.spec, &target.runtime.id, 1, &[])
+            .await,
+        Err(adx_core::Error::Conflict)
+    );
+    assert!(server.starts.lock().unwrap().is_empty());
+    assert_eq!(
+        adapter
+            .start(&target.spec, &target.runtime.id, 1, &[])
+            .await,
+        Err(adx_core::Error::Conflict)
+    );
+    let first = adapter.execute_authorized(&permission, None).await.unwrap();
+    assert_eq!(
+        adapter.execute_authorized(&permission, None).await.unwrap(),
+        first
+    );
+    assert_eq!(server.starts.lock().unwrap().len(), 1);
+    adapter.remove(&target.runtime.id).await.unwrap();
+}
+
+#[tokio::test]
+async fn journal_preparation_write_failure_prevents_dispatch() {
+    let server = Server::default();
+    let (adapter, harness) = connect(server.clone()).await;
+    let target = prepared_execution_target();
+    std::fs::remove_file(harness._directory.path().join("operations.sqlite")).unwrap();
+    assert!(adapter.prepare_execution(&target).await.is_err());
+    assert!(adapter
+        .start(&target.spec, &target.runtime.id, 1, &[])
+        .await
+        .is_err());
+    assert!(adapter.remove(&target.runtime.id).await.is_err());
+    assert!(server.starts.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn replacement_permission_expiring_during_capabilities_never_dispatches() {
+    let server = Server::default();
+    let (adapter, _harness) = connect(server.clone()).await;
+    let hooks = Arc::new(LifecycleHooks::default());
+    let node = lifecycle_node(adapter, &hooks);
+    let mut specification = spec();
+    specification.lifecycle.restart = Some(adx_core::lifecycle::RestartPolicy {
+        max_attempts: 1,
+        initial_backoff_seconds: 1,
+        max_backoff_seconds: 1,
+    });
+    let environment = node
+        .environment(specification, lifecycle_assignment())
+        .unwrap();
+    environment.create().await.unwrap();
+    *server.running.lock().unwrap() = false;
+    node.monitor_environments().await.unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    hooks
+        .authorization_remaining_millis
+        .store(100, std::sync::atomic::Ordering::SeqCst);
+    server
+        .capabilities_delay_millis
+        .store(300, std::sync::atomic::Ordering::SeqCst);
+    let result = node.monitor_environments().await;
+    assert_eq!(
+        server.start_operations.lock().unwrap().len(),
+        1,
+        "permission expired while preparing the request; replacement must not reach sandboxd"
+    );
+    assert!(result.is_err());
+    assert_eq!(node.used(), Resources::default());
+    assert!(!environment.sync().await.unwrap().record.resources_held);
+}
+
+#[tokio::test]
+async fn authorized_start_persists_original_deadline_for_reopened_cleanup() {
+    let server = Server {
+        transport_error_after_start: true,
+        hide_inventory: true,
+        ..Default::default()
+    };
+    let (adapter, harness) =
+        connect_with_timeout(server.clone(), HashMap::new(), Duration::from_secs(30)).await;
+    let permission = prepared_execution_permission();
+    let id = permission.target.runtime.id.clone();
+    adapter.prepare_execution(&permission.target).await.unwrap();
+    assert!(adapter.execute_authorized(&permission, None).await.is_err());
+    let request = server.start_operations.lock().unwrap()[0].clone();
+    assert_eq!(
+        request.deadline_unix_millis, permission.deadline_unix_millis,
+        "adapter must not extend the Coordinator deadline"
+    );
+    let payload: String =
+        rusqlite::Connection::open(harness._directory.path().join("operations.sqlite"))
+            .unwrap()
+            .query_row(
+                "SELECT payload FROM operations WHERE runtime_id=?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+    let journal: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(
+        journal["start"]["deadline_unix_millis"].as_u64().unwrap(),
+        permission.deadline_unix_millis
+    );
+    drop(adapter);
+    let adapter = reconnect_with_journal(&harness).await;
+    adapter.remove(&id).await.unwrap();
+    let query = server.start_queries.lock().unwrap()[0].clone();
+    assert_eq!(query.deadline_unix_millis, permission.deadline_unix_millis);
+    assert_eq!(query.operation_id, request.operation_id);
+    assert_eq!(query.request_fingerprint, request.request_fingerprint);
+    assert_eq!(server.starts.lock().unwrap().len(), 1);
+    assert!(!*server.running.lock().unwrap());
 }

@@ -26,24 +26,7 @@ impl Session {
                 }
                 // A pending recovery also owns a reservation before its result arrives.
                 let resources_held = environment.resources_held();
-                let mut result = environment
-                    .result
-                    .clone()
-                    .unwrap_or_else(|| EnvironmentRecord {
-                        spec: environment.spec.clone(),
-                        assignment: environment.assignment.clone(),
-                        runtime: adx_core::Runtime {
-                            id: format!("{}-{}", environment_id, environment.assignment.generation),
-                            ip: None,
-                        },
-                        revision: 0,
-                        state: EnvironmentState::Pending,
-                        resources_held: true,
-                        checkpoint: None,
-                        last_operation: None,
-                        restart_attempts: 0,
-                        restart_pending: false,
-                    });
+                let mut result = environment.effective_record();
                 result.state = EnvironmentState::Failed;
                 result.revision = result.revision.checked_add(1).ok_or(Error::Conflict)?;
                 result.resources_held = resources_held;

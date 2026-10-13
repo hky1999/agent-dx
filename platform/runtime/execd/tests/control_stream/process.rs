@@ -114,6 +114,9 @@ fn record() -> EnvironmentRecord {
 struct Backend;
 #[async_trait]
 impl RuntimeDriver for Backend {
+    async fn prepare_execution(&self, _: &adx_core::EnvironmentRecord) -> adx_core::Result<()> {
+        Ok(())
+    }
     async fn start(
         &self,
         _: &EnvironmentSpec,
@@ -199,6 +202,9 @@ struct ManagedRuntime {
 }
 #[async_trait]
 impl RuntimeDriver for ManagedRuntime {
+    async fn prepare_execution(&self, _: &adx_core::EnvironmentRecord) -> adx_core::Result<()> {
+        Ok(())
+    }
     async fn start(
         &self,
         _: &EnvironmentSpec,
@@ -246,6 +252,14 @@ struct Publication {
 }
 #[async_trait]
 impl adxlet::StateSink for Publication {
+    async fn authorize_execution(
+        &self,
+        _: &adx_core::execution::ExecutionRequest,
+    ) -> adx_core::Result<adx_core::execution::ExecutionAuthorization> {
+        Err(adx_core::Error::Invalid(
+            "replacement is outside this process fixture".into(),
+        ))
+    }
     async fn commit(&self, record: &EnvironmentRecord) -> adx_core::Result<adxlet::Durability> {
         *self.record.lock().unwrap() = Some(record.clone());
         if record.checkpoint.is_some() {

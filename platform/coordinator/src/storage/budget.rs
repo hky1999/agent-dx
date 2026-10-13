@@ -125,7 +125,7 @@ impl Session {
             statuses(&raw, &budgets, None)?;
             // Schema 1 binaries must reject this namespace rather than silently
             // deserialize away the host budget on their next header write.
-            header.schema = 2;
+            header.schema = header.schema.max(2);
             header.host_budgets = Some(budgets.clone());
             header.advance()?;
             if self

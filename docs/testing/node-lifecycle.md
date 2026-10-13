@@ -7,7 +7,7 @@ adxlet 拥有实例串行状态机。Coordinator 提供归属校验、Redis 持�
 `EnvironmentSpec.lifecycle` 包含 `idle_timeout_seconds` 和可选 `restart`。HTTP 保留 `idleTimeoutSeconds`，新增 `restartPolicy`；Python SDK 支持 `RestartPolicy(max_attempts=3, initial_backoff_seconds=1, max_backoff_seconds=30)`。
 
 - 空闲超时为 0 时不回收。启用后，运行实例的 Execd 活跃客户端请求数与 Relay 流计数必须同时为 0，且活动版本在整个空闲窗口内未改变。后台命令仍计入 Execd 状态与活动版本，但客户端退出后不会仅因命令仍运行而阻止回收。采样失败或活动版本改变会重置窗口。adxlet 执行删除。
-- RuntimeDriver 确认执行退出后，节点先退役路由、确认旧执行清理，再标记 Failed。启用重启时，按照指数退避和累计重试上限重新申请本机资源，并分配新的执行 ID，Environment ID 与归属代次保持。
+- RuntimeDriver 确认执行退出后，节点先退役路由、确认旧执行清理，再标记 Failed。启用重启时，按照指数退避和累计重试上限发布清理后的源记录，再申请本机资源及中心持久授权，并分配新的执行 ID，Environment ID 与归属代次保持。
 - `restart_attempts` 和 `restart_pending` 随实例结果写入 Redis／降级日志。进程重启不重置次数。显式删除取消重启。清理未确认时保留资源，禁止启动替代执行。
 - 可配置 `execd_health_failure_threshold`；省略时不以健康探测失败触发重启。连续失败达到阈值后，仍须先确认旧执行清理。健康检查只覆盖 Execd。
 - 初次 Start 失败、超时或应答丢失均判定创建 Failed；不会触发运行中退出的自动重启策略。节点先退役路由并要求 RuntimeDriver 确认旧执行及迟到启动不再存在，再归还标量和设备预留并提交结果。清理失败或超时保留预留，Failed 结果也保留 `resources_held=true`。Failed 控制器继续重试清理，确认退役后提高 revision 并提交预算释放结果，不转成 Running。节点重启按权威目录对账。
@@ -16,7 +16,7 @@ adxlet 拥有实例串行状态机。Coordinator 提供归属校验、Redis 持�
 
 `EnvironmentSpec.resources` 保存请求值，`sandbox.limits` 保存执行上限；上限为零时采用对应请求值。Coordinator 的过滤、评分和预留、节点直接准入、临时预留转交与重启对账均采用 `EnvironmentSpec.execution_resources()` 得到的执行额度。CPU、内存与显式磁盘额度必须完整预留，不能仅预留较小请求值后给运行时发放更大上限。Start 使用同一额度，并拒绝超过 sandboxd 数值精度的 CPU／内存上限。
 
-此规则保持当前固定资源配置的保守准入。请求和磁盘上限均为零时仍不设置可写层配额，不能声称所有磁盘使用已经受预算约束。动态授权、扩缩容、恢复之前的中心持久预留和同宿主多个节点的共享账本尚未实现；不能用请求与执行上限的差额宣称已支持安全超卖。现有持久实例规格可重建本机预留，但不等于独立的持久宿主预算。
+此规则保持当前固定资源配置的保守准入。请求和磁盘上限均为零时仍不设置可写层配额，不能声称所有磁盘使用已经受预算约束。替换执行的中心持久预留已经接通；同宿主多个节点共享容量的存储接口已经实现，生产配置尚未启用。独立动态资源授权和扩缩容仍待完成，不能用请求与执行上限的差额宣称已支持安全超卖。具体状态及配置边界见 [宿主准入与执行授权](coordinator-storage.md)。
 
 `resource_source` 选择以下之一，也可保留既有 `capacity_file`。两者不能同时配置。
 
@@ -61,9 +61,11 @@ sandboxd 的 `/resource` 通过 Unix Socket 提供 CPU 核数、内存／存储�
 2. 只有 Coordinator 不可用才尝试 SQLite 落盘，WAL 使用 FULL 同步。明确的权限、归属和版本拒绝不会降级。落盘失败不会报告 Journaled。
 3. SQLite 保存有序、去重的待补写结果，不保存完整实例目录。暂停后恢复等连续操作必须按序补写，不能只保留最后状态。
 4. 本地操作已完成不等于集群可见。内部 RPC 返回 Journaled；公共暂停／恢复 API 返回暂不可用并说明集群发布待完成。Ingress 仍使用缓存路由，由 Relay 复核本机绑定。
-5. 当前节点进程在已对账的状态下可继续处理生命周期操作，心跳恢复后补写日志。补写成功后清理旧制品。
+5. 当前节点进程在已对账的状态下可继续处理删除、暂停和清理，并在心跳恢复后补写结果。恢复、重启等创建新执行的操作必须先发布原记录并取得 `AuthorizeExecution` 授权，不能降级为本地许可。补写成功后清理旧制品。
 6. 节点进程重启后，先等 Coordinator 完整目录。日志记录仅在归属／请求规格匹配且版本更新时补写；已提交结果和退役归属被清除。补写后再次读取目录，再与真实 backend 对账，最后开放生命周期和新准入。
 7. Coordinator 不可用时不能以 SQLite 缺记录为由清理或重建运行实例。SQLite 损坏也不能解释为空目录。
+
+`JournalSink::authorize_execution` 先按序发布该实例的待补交结果，再调用中心；任何不可用都返回错误，不把授权请求追加为可执行的本地日志。
 
 本地目录是降级可用性的条件；删除日志意味着丢失其中尚未进入 Redis 的结果。日志不是 Ingress 的发现或路由来源。
 
@@ -87,3 +89,9 @@ Rust 用例位于 adxlet 的 `journal.rs`、`resources.rs`、`pause_resume.rs` �
 
 同一轮最终目录中实例全部 Deleted，资源已释放，sandboxd 清单与 checkpoint 目录为空，服务正常停止。
 证据位于 `out/ci/pause-resume/fc-r7/evidence/`，包括 `sdk/result.json`、`lifecycle/result.json`、`catalog-final.json`、`inventory-final.txt` 和 `result.json`；构建/部署完整日志位于 `out/ci/stage-2/{linux-2,package-2,fc-r7}.log`。回归日志为 `rust-5.log`（141 项测试，Clippy 通过）及 `clients-4.log`（Go 检查及 138 项 SDK 测试）。这些是本地证据，Kubernetes 验收尚未包含新增生命周期场景。
+
+替换执行在申请中心授权之前，先在 sandboxd 适配器的持久日志记录 `Prepared` 目标指纹，不保存环境变量明文。未派发的目标可在重启后取消并结算；`Cancelled` 禁止同一 Runtime 迟到启动。缺失日志仍视为未知，不能证明执行不存在。实际 Start 保留独立的完整请求指纹、期限与物理代际日志。
+
+授权回复未知时，节点停止新准入，心跳循环重新读取 Coordinator 的完整目录。对账排空旧控制器，清理精确的预留目标并发布终态。同一 Assignment 内替换执行只退役旧控制器，不给整个 Assignment 写退役标记。明确的容量拒绝保留源状态供重试。中断目标沿用既有 Failed 对账契约，不在自动对账期间悄悄重新执行。
+
+`RuntimeDriver::execute_authorized` 接收完整授权和可选的已物化恢复输入。sandboxd 适配器在能力查询和请求准备后再次核对原期限，把较早的授权／本机 RPC 截止时间持久保存并传入 `StartOperation`，实际发送前再检查。已准备的替换目标不能经不带授权的普通 Start 入口启动。超时之前尚未派发的本机意图必须先持久封闭，才能按未创建结算；请求已经发出后仍按未知结果对账。

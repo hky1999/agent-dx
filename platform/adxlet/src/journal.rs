@@ -199,6 +199,28 @@ impl JournalSink {
 
 #[async_trait]
 impl StateSink for JournalSink {
+    async fn authorize_execution(
+        &self,
+        request: &adx_core::execution::ExecutionRequest,
+    ) -> Result<adx_core::execution::ExecutionAuthorization> {
+        let ready = self.ready.read().await;
+        if !*ready {
+            return Err(unavailable("authoritative recovery required"));
+        }
+        let serial = self
+            .environments
+            .lock()
+            .await
+            .entry(request.source.spec.id.clone())
+            .or_default()
+            .clone();
+        let _serial = serial.lock().await;
+        self.publish(self.entries(Some(request.source.spec.id.clone())).await?)
+            .await?;
+        // No append fallback: a local journal cannot allocate host capacity.
+        self.upstream.authorize_execution(request).await
+    }
+
     async fn commit(&self, record: &EnvironmentRecord) -> Result<Durability> {
         let ready = self.ready.read().await;
         if !*ready {

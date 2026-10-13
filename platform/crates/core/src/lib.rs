@@ -1,6 +1,7 @@
 //! Environment, runtime, and resource contracts shared by the control plane.
 
 pub mod checkpoint;
+pub mod execution;
 pub mod lifecycle;
 pub mod runtime_profile;
 pub mod snapshots;

@@ -1,7 +1,8 @@
 use super::*;
 use crate::checkpoint::{now, validate_operation};
+use adx_core::execution::ExecutionKind;
 use adx_core::{CompletedOperation, LifecycleKind, RestorePoint};
-use std::{path::Path, time::Duration};
+use std::time::Duration;
 
 impl Controller {
     pub(super) async fn reload(
@@ -268,17 +269,13 @@ impl Controller {
                     source_runtime_id: self.record.runtime.id.clone(),
                 });
                 self.transition(Event::Checkpointed)?;
-                let artifact = &self
-                    .record
-                    .checkpoint
-                    .as_ref()
-                    .ok_or(Error::Conflict)?
-                    .artifact;
-                let path = services.store.materialize(artifact).await?;
-                let rollback = self.restore_execution(&path).await;
-                if self.held {
-                    self.recovery_files = Some(path);
-                }
+                let rollback = self
+                    .restore_execution(
+                        ExecutionKind::PauseRollback,
+                        request.operation_id.clone(),
+                        request.expected_revision,
+                    )
+                    .await;
                 if rollback.is_err() && self.record.state != EnvironmentState::Failed {
                     self.transition(Event::Fail)?;
                 }
@@ -305,36 +302,38 @@ impl Controller {
         );
         self.sync().await
     }
-    async fn restore_execution(&mut self, path: &Path) -> Result<()> {
-        let next_revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
-        let runtime_id = format!(
-            "{}-{}-r{}",
-            self.record.spec.id, self.record.assignment.generation, next_revision
-        );
-        self.services
-            .admission
-            .lock()
-            .expect("shared state lock poisoned")
-            .reserve(&runtime_id, &self.record.spec, &self.record.assignment)?;
-        self.record.runtime.id = runtime_id;
-        self.held = true;
-        self.record.resources_held = true;
-        self.transition(Event::Resume)?;
+    async fn restore_execution(
+        &mut self,
+        kind: ExecutionKind,
+        operation_id: String,
+        expected_revision: u64,
+    ) -> Result<()> {
+        let grant = self
+            .prepare_execution(kind, operation_id, expected_revision)
+            .await?;
         let attempt = async {
+            let checkpoint = self.record.checkpoint.as_ref().ok_or(Error::Conflict)?;
+            let store = &self
+                .services
+                .checkpoint
+                .as_ref()
+                .ok_or(Error::Conflict)?
+                .store;
+            self.recovery_files = Some(store.materialize(&checkpoint.artifact).await?);
             self.services.readiness.expect_runtime(&self.record)?;
             self.record.runtime.ip = Some(
                 self.services
                     .runtime
-                    .restore_from(
-                        &self.record.spec,
-                        &self.record.runtime.id,
-                        self.record.assignment.generation,
-                        &self.record.assignment.devices,
-                        path,
-                        self.record
-                            .checkpoint
-                            .as_ref()
-                            .and_then(|cp| cp.origin.as_ref()),
+                    .execute_authorized(
+                        &grant,
+                        Some(crate::ExecutionRestore {
+                            path: self.recovery_files.as_ref().ok_or(Error::Conflict)?,
+                            origin: self
+                                .record
+                                .checkpoint
+                                .as_ref()
+                                .and_then(|cp| cp.origin.as_ref()),
+                        }),
                     )
                     .await?,
             );
@@ -398,12 +397,13 @@ impl Controller {
         if cp.expires_at_unix_seconds <= now()? {
             return Err(Error::Invalid("checkpoint expired".into()));
         }
-        let services = self.services.checkpoint.clone().ok_or(Error::Conflict)?;
-        let path = services.store.materialize(&cp.artifact).await?;
-        let restored = self.restore_execution(&path).await;
-        if self.held {
-            self.recovery_files = Some(path);
-        }
+        let restored = self
+            .restore_execution(
+                ExecutionKind::Resume,
+                request.operation_id.clone(),
+                request.expected_revision,
+            )
+            .await;
         if let Err(error) = restored {
             if let Err(commit) = self.sync().await {
                 return Err(Error::Unavailable(format!(

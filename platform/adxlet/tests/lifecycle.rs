@@ -1,3 +1,4 @@
+mod execution_authority;
 use adx_core::{
     Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Error, Resources, Result,
 };
@@ -57,6 +58,9 @@ impl Dependencies {
 
 #[async_trait]
 impl RuntimeDriver for Dependencies {
+    async fn prepare_execution(&self, _: &adx_core::EnvironmentRecord) -> adx_core::Result<()> {
+        Ok(())
+    }
     async fn is_running(&self, _: &str) -> Result<bool> {
         Ok(self.actual.load(std::sync::atomic::Ordering::SeqCst))
     }
@@ -117,6 +121,12 @@ impl Routes for Dependencies {
 }
 #[async_trait]
 impl StateSink for Dependencies {
+    async fn authorize_execution(
+        &self,
+        request: &adx_core::execution::ExecutionRequest,
+    ) -> adx_core::Result<adx_core::execution::ExecutionAuthorization> {
+        execution_authority::authorize(request)
+    }
     async fn commit(&self, record: &EnvironmentRecord) -> Result<Durability> {
         self.event(&format!("commit:{:?}", record.state))?;
         Ok(*self.durability.lock().unwrap())

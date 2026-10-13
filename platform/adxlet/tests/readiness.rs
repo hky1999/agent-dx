@@ -23,6 +23,9 @@ struct Runtime {
 }
 #[async_trait]
 impl RuntimeDriver for Runtime {
+    async fn prepare_execution(&self, _: &adx_core::EnvironmentRecord) -> adx_core::Result<()> {
+        Ok(())
+    }
     async fn start(
         &self,
         _: &EnvironmentSpec,

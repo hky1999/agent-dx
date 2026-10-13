@@ -937,6 +937,14 @@ async fn sqlite_replays_pause_and_resume_after_redis_and_node_sink_restart() {
     struct Sink(Arc<adx_coordinator::storage::Session>);
     #[async_trait::async_trait]
     impl StateSink for Sink {
+        async fn authorize_execution(
+            &self,
+            _: &adx_core::execution::ExecutionRequest,
+        ) -> adx_core::Result<adx_core::execution::ExecutionAuthorization> {
+            Err(Error::Unavailable(
+                "this journal fixture does not allocate executions".into(),
+            ))
+        }
         async fn commit(&self, r: &EnvironmentRecord) -> adx_core::Result<Durability> {
             self.0.commit(r.clone()).await?;
             Ok(Durability::Published)

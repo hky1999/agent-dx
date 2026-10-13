@@ -53,6 +53,9 @@ impl Default for Config {
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 enum StartState {
     Idle,
+    // Persisted before central permission. Neither state has dispatched Start.
+    Prepared(String),
+    Cancelled(String),
     Started(IpAddr),
     Settled,
     Failed,
@@ -271,6 +274,18 @@ impl Sandboxd {
         generation: u64,
         devices: &[adx_core::scheduling::DeviceAllocation],
     ) -> Result<Request<proto::StartRequest>> {
+        let prepared = {
+            let state = self.cell(runtime_id).lock_owned().await;
+            match &*state {
+                StartState::Prepared(fingerprint) => Some(fingerprint.clone()),
+                _ => None,
+            }
+        };
+        if let Some(expected) = prepared {
+            if operations::fingerprint(&(spec, runtime_id, generation, devices))? != expected {
+                return Err(Error::Conflict);
+            }
+        }
         let mut config = self.config.clone();
         // Runtime capability metadata owns the guest paths. Never inherit caller
         // values that could redirect the privileged checkpoint handoff.
@@ -293,12 +308,64 @@ impl Sandboxd {
             spec, runtime_id, generation, devices, &config,
         )?))
     }
+    async fn restore_request(
+        &self,
+        spec: &EnvironmentSpec,
+        runtime_id: &str,
+        generation: u64,
+        devices: &[adx_core::scheduling::DeviceAllocation],
+        path: &Path,
+        origin: Option<&adx_core::runtime::RuntimeIdentity>,
+    ) -> Result<Request<proto::StartRequest>> {
+        self.checkpoint_supported(&spec.runtime_class).await?;
+        if !path.is_absolute() {
+            return Err(Error::Invalid("absolute checkpoint path required".into()));
+        }
+        let mut request = self
+            .execution_request(spec, runtime_id, generation, devices)
+            .await?;
+        if let Some(origin) = origin {
+            let context = adx_core::runtime::RuntimeRestore {
+                target: adx_core::runtime::RuntimeIdentity {
+                    environment_id: spec.id.clone(),
+                    runtime_id: runtime_id.into(),
+                    ownership_generation: generation,
+                },
+                origin: Some(origin.clone()),
+            };
+            context.validate(origin)?;
+            request.get_mut().envs.insert(
+                "ADX_RESTORE_ORIGIN".into(),
+                serde_json::to_string(origin).map_err(unavailable)?,
+            );
+        }
+        request.get_mut().checkpoint_info = Some(proto::CheckpointInfo {
+            checkpoint_dir: path
+                .to_str()
+                .ok_or_else(|| Error::Invalid("checkpoint path is not UTF-8".into()))?
+                .into(),
+        });
+        Ok(request)
+    }
     async fn execute_start(
         &self,
         runtime_id: &str,
         mut request: Request<proto::StartRequest>,
+        execution_deadline: Option<u64>,
     ) -> Result<IpAddr> {
         let mut state = self.cell(runtime_id).lock_owned().await;
+        if (matches!(*state, StartState::Prepared(_)) && execution_deadline.is_none())
+            || (matches!(*state, StartState::Idle) && execution_deadline.is_some())
+        {
+            return Err(Error::Conflict);
+        }
+        if let Some(deadline) = execution_deadline {
+            if operations::now_millis()? >= deadline {
+                return Err(unavailable(
+                    "execution authorization expired before dispatch",
+                ));
+            }
+        }
         let fingerprint = operations::fingerprint(request.get_ref())?;
         let previous = self
             .operations
@@ -307,14 +374,30 @@ impl Sandboxd {
             .get(runtime_id)
             .and_then(|record| record.start.clone());
         let intent = match previous {
-            Some(intent) if intent.fingerprint != fingerprint => return Err(Error::Conflict),
+            Some(intent)
+                if intent.fingerprint != fingerprint
+                    || execution_deadline
+                        .is_some_and(|deadline| intent.deadline_unix_millis > deadline) =>
+            {
+                return Err(Error::Conflict)
+            }
             Some(intent) => intent,
-            None => OperationIntent::new("start_operation", fingerprint, self.config.rpc_timeout)?,
+            None => {
+                let mut intent =
+                    OperationIntent::new("start_operation", fingerprint, self.config.rpc_timeout)?;
+                if let Some(deadline) = execution_deadline {
+                    intent.deadline_unix_millis = intent.deadline_unix_millis.min(deadline);
+                }
+                intent
+            }
         };
         if let StartState::Started(ip) = *state {
             return Ok(ip);
         }
-        if matches!(*state, StartState::Failed | StartState::NotCreated) {
+        if matches!(
+            *state,
+            StartState::Failed | StartState::NotCreated | StartState::Cancelled(_)
+        ) {
             return Err(Error::Conflict);
         }
         if matches!(
@@ -345,6 +428,17 @@ impl Sandboxd {
         let logical_id = runtime_id.to_string();
         let adapter = self.clone();
         tokio::spawn(async move {
+            if execution_deadline.is_some()
+                && operations::now_millis()? >= intent.deadline_unix_millis
+            {
+                // This task owns the state lock and has not sent the RPC. Seal its
+                // durable intent before cleanup can prove that dispatch is impossible.
+                *state = StartState::NotCreated;
+                adapter.persist(&logical_id, &state, None).await?;
+                return Err(unavailable(
+                    "execution authorization expired before dispatch",
+                ));
+            }
             let operation = proto::StartOperationRequest {
                 start: Some(request.into_inner()),
                 operation_id: intent.id.clone(),
@@ -1174,6 +1268,84 @@ fn runtime_control_peer(config: &Config) -> Result<Option<proto::NetworkEndpoint
 
 #[async_trait]
 impl RuntimeDriver for Sandboxd {
+    async fn execute_authorized(
+        &self,
+        authorization: &adx_core::execution::ExecutionAuthorization,
+        restore: Option<crate::ExecutionRestore<'_>>,
+    ) -> Result<IpAddr> {
+        authorization.check_dispatch_now()?;
+        let target = &authorization.target;
+        let request = match restore {
+            Some(restore) => {
+                self.restore_request(
+                    &target.spec,
+                    &target.runtime.id,
+                    target.assignment.generation,
+                    &target.assignment.devices,
+                    restore.path,
+                    restore.origin,
+                )
+                .await?
+            }
+            None => {
+                self.execution_request(
+                    &target.spec,
+                    &target.runtime.id,
+                    target.assignment.generation,
+                    &target.assignment.devices,
+                )
+                .await?
+            }
+        };
+        authorization.check_dispatch_now()?;
+        self.execute_start(
+            &target.runtime.id,
+            request,
+            Some(authorization.deadline_unix_millis),
+        )
+        .await
+    }
+    async fn prepare_execution(&self, target: &adx_core::EnvironmentRecord) -> Result<()> {
+        target.spec.validate()?;
+        adx_core::scheduling::validate_device_assignment(
+            &target.spec.scheduling.devices,
+            &target.assignment.devices,
+        )?;
+        if target.assignment.generation == 0
+            || !matches!(
+                target.state,
+                adx_core::EnvironmentState::Starting | adx_core::EnvironmentState::Resuming
+            )
+            || target.revision == 0
+            || !target.resources_held
+            || target.runtime.ip.is_some()
+            || target.assignment.environment_id != target.spec.id
+            || !adx_core::valid_runtime_id(
+                &target.spec.id,
+                target.assignment.generation,
+                &target.runtime.id,
+            )
+        {
+            return Err(Error::Conflict);
+        }
+        let fingerprint = operations::fingerprint(&(
+            &target.spec,
+            target.runtime.id.as_str(),
+            target.assignment.generation,
+            target.assignment.devices.as_slice(),
+        ))?;
+        let mut state = self.cell(&target.runtime.id).lock_owned().await;
+        match &*state {
+            StartState::Idle => (),
+            StartState::Prepared(previous) if *previous == fingerprint => (),
+            _ => return Err(Error::Conflict),
+        }
+        if self.physical_identity(&target.runtime.id).await?.is_some() {
+            return Err(Error::Conflict);
+        }
+        *state = StartState::Prepared(fingerprint);
+        self.persist(&target.runtime.id, &state, None).await
+    }
     async fn stats(&self, runtime_id: &str) -> Result<crate::metrics::RuntimeUsage> {
         let value = Sandboxd::stats(self, runtime_id).await?;
         Ok(crate::metrics::RuntimeUsage {
@@ -1229,35 +1401,10 @@ impl RuntimeDriver for Sandboxd {
         path: &Path,
         origin: Option<&adx_core::runtime::RuntimeIdentity>,
     ) -> Result<IpAddr> {
-        self.checkpoint_supported(&spec.runtime_class).await?;
-        if !path.is_absolute() {
-            return Err(Error::Invalid("absolute checkpoint path required".into()));
-        }
-        let mut request = self
-            .execution_request(spec, runtime_id, generation, devices)
+        let request = self
+            .restore_request(spec, runtime_id, generation, devices, path, origin)
             .await?;
-        if let Some(origin) = origin {
-            let context = adx_core::runtime::RuntimeRestore {
-                target: adx_core::runtime::RuntimeIdentity {
-                    environment_id: spec.id.clone(),
-                    runtime_id: runtime_id.into(),
-                    ownership_generation: generation,
-                },
-                origin: Some(origin.clone()),
-            };
-            context.validate(origin)?;
-            request.get_mut().envs.insert(
-                "ADX_RESTORE_ORIGIN".into(),
-                serde_json::to_string(origin).map_err(unavailable)?,
-            );
-        }
-        request.get_mut().checkpoint_info = Some(proto::CheckpointInfo {
-            checkpoint_dir: path
-                .to_str()
-                .ok_or_else(|| Error::Invalid("checkpoint path is not UTF-8".into()))?
-                .into(),
-        });
-        self.execute_start(runtime_id, request).await
+        self.execute_start(runtime_id, request, None).await
     }
     async fn inventory(&self) -> Result<Vec<crate::RuntimeObservation>> {
         self.list_id("")
@@ -1322,14 +1469,19 @@ impl RuntimeDriver for Sandboxd {
         let request = self
             .execution_request(spec, runtime_id, ownership_generation, devices)
             .await?;
-        self.execute_start(runtime_id, request).await
+        self.execute_start(runtime_id, request, None).await
     }
 
     async fn remove(&self, runtime_id: &str) -> Result<()> {
         let mut state = self.cell(runtime_id).lock_owned().await;
         let failed_start = matches!(*state, StartState::Failed | StartState::StartUncertain);
         let mut physical = self.physical_identity(runtime_id).await?;
-        if physical.is_some() && matches!(*state, StartState::NotCreated) {
+        if physical.is_some()
+            && matches!(
+                *state,
+                StartState::NotCreated | StartState::Prepared(_) | StartState::Cancelled(_)
+            )
+        {
             return Err(unavailable(
                 "a rejected creation unexpectedly has a physical execution",
             ));
@@ -1397,7 +1549,11 @@ impl RuntimeDriver for Sandboxd {
             self.persist(runtime_id, &state, None).await?;
         } else if !matches!(
             *state,
-            StartState::Idle | StartState::Failed | StartState::NotCreated
+            StartState::Idle
+                | StartState::Failed
+                | StartState::NotCreated
+                | StartState::Prepared(_)
+                | StartState::Cancelled(_)
         ) || (self.journal.is_some()
             && !self
                 .operations
@@ -1423,12 +1579,13 @@ impl RuntimeDriver for Sandboxd {
             .remove(runtime_id);
         // A failed create cannot become successful through a retry of the same
         // execution. Keep its identity terminal so a later backend is cleanup-only.
-        *state = if matches!(*state, StartState::NotCreated) {
-            StartState::NotCreated
-        } else if failed_start || self.journal.is_some() {
-            StartState::Failed
-        } else {
-            StartState::Idle
+        *state = match &*state {
+            StartState::Prepared(fingerprint) | StartState::Cancelled(fingerprint) => {
+                StartState::Cancelled(fingerprint.clone())
+            }
+            StartState::NotCreated => StartState::NotCreated,
+            _ if failed_start || self.journal.is_some() => StartState::Failed,
+            _ => StartState::Idle,
         };
         self.persist(runtime_id, &state, None).await?;
         Ok(())
@@ -1465,7 +1622,10 @@ impl Sandboxd {
         ) {
             return Err(unavailable("execution outcome requires reconciliation"));
         }
-        if matches!(*state, StartState::Failed | StartState::NotCreated) {
+        if matches!(
+            *state,
+            StartState::Failed | StartState::NotCreated | StartState::Cancelled(_)
+        ) {
             return Err(Error::Conflict);
         }
         let physical = self
