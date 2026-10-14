@@ -716,3 +716,162 @@ async fn physical_memory_resolution_never_dispatches_a_live_grant_from_old_autho
     assert!(memory.grows.lock().unwrap().is_empty());
     assert!(memory.shrinks.lock().unwrap().is_empty());
 }
+
+fn partial_stats(request: &MemoryAuthorization) -> StatsResponse {
+    let mut stats = physical_stats();
+    stats.resource_revision = request.request.source.resource_revision + 1;
+    stats.resource_operation_id = request.request.operation_id.clone();
+    stats.memory_limit_bytes = request.request.target_limit_bytes;
+    stats.memory_high_bytes = request.request.source.memory_high_bytes;
+    stats
+}
+#[tokio::test]
+async fn physical_memory_retirement_proves_closed_partial_growth_and_shrink_after_journal_reopen() {
+    for shrinking in [false, true] {
+        let memory = MemoryServer::default();
+        let mut source = physical_stats();
+        if shrinking {
+            source.memory_limit_bytes = 256 * MIB;
+            source.memory_high_bytes = 192 * MIB;
+        }
+        *memory.stats.lock().unwrap() = Some(source);
+        let (adapter, harness, record) = memory_fixture(memory.clone()).await;
+        let request = expired_grant(
+            &adapter.observe_memory(&record).await.unwrap(),
+            if shrinking { 128 * MIB } else { 256 * MIB },
+        );
+        let partial = partial_stats(&request);
+        *memory.stats.lock().unwrap() = Some(partial.clone());
+        *memory.reply.lock().unwrap() = Some(ResizeResourcesResponse {
+            actual: Some(partial.clone()),
+            complete: false,
+            update_error: "partial write".into(),
+        });
+        assert!(adapter.resolve_memory(&record, &request).await.is_err());
+        assert!(
+            adapter
+                .memory_retirement_required(&record)
+                .await
+                .expect("closed partial proof"),
+            "partial growth and shrink require explicit failure cleanup"
+        );
+        drop(adapter);
+        let reopened = reconnect_with_journal(&harness).await;
+        assert!(reopened.memory_retirement_required(&record).await.unwrap());
+        assert_eq!(*memory.stats.lock().unwrap(), Some(partial));
+        assert!(memory.grows.lock().unwrap().is_empty());
+        assert!(memory.shrinks.lock().unwrap().is_empty());
+        assert_eq!(
+            memory
+                .resolutions
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .original
+                .as_ref()
+                .unwrap()
+                .deadline_unix_ms,
+            request.deadline_unix_millis as i64
+        );
+    }
+}
+#[tokio::test]
+async fn physical_memory_retirement_rejects_unknown_foreign_live_or_inconsistent_results() {
+    for case in 0..18 {
+        let memory = MemoryServer::default();
+        *memory.stats.lock().unwrap() = Some(physical_stats());
+        let (adapter, _harness, record) = memory_fixture(memory.clone()).await;
+        let sample = adapter.observe_memory(&record).await.unwrap();
+        let request = if case == 13 {
+            grant(&sample, 256 * MIB)
+        } else {
+            expired_grant(&sample, 256 * MIB)
+        };
+        let mut partial = partial_stats(&request);
+        // Save the original intent through the resolver; this never dispatches writes.
+        *memory.stats.lock().unwrap() = Some(partial.clone());
+        *memory.reply.lock().unwrap() = Some(ResizeResourcesResponse {
+            actual: Some(partial.clone()),
+            complete: false,
+            update_error: String::new(),
+        });
+        assert!(adapter.resolve_memory(&record, &request).await.is_err());
+        let mut complete = false;
+        match case {
+            0 => partial.resource_generation = "foreign".into(),
+            1 => partial.resource_revision += 1,
+            2 => partial.resource_operation_id = "foreign".into(),
+            3 => partial.resource_operation_pending = true,
+            4 => partial.frozen = true,
+            5 => partial.frozen_known = false,
+            6 => partial.memory_limit_known = false,
+            7 => partial.memory_high_known = false,
+            8 => partial.memory_high_unlimited = true,
+            9 => partial.cpu_quota_usec += 1,
+            10 => partial.memory_limit_bytes = 512 * MIB,
+            11 => partial.memory_high_bytes = 80 * MIB,
+            12 => complete = true,
+            13 => (),
+            14 => partial.cpu_period_usec += 1,
+            15 => partial.elastic_policy = "{}".into(),
+            16 => partial.resource_revision_known = false,
+            _ => {
+                let mut other = partial.clone();
+                other.memory_high_bytes = 192 * MIB;
+                *memory.after_reply.lock().unwrap() = Some(other);
+            }
+        }
+        *memory.stats.lock().unwrap() = Some(partial.clone());
+        *memory.reply.lock().unwrap() = Some(ResizeResourcesResponse {
+            actual: Some(partial),
+            complete,
+            update_error: String::new(),
+        });
+        assert!(
+            !matches!(adapter.memory_retirement_required(&record).await, Ok(true)),
+            "case {case} must not authorize cleanup"
+        );
+        assert!(memory.grows.lock().unwrap().is_empty());
+        assert!(memory.shrinks.lock().unwrap().is_empty());
+    }
+}
+#[tokio::test]
+async fn physical_memory_retirement_requires_original_journal_and_does_not_reject_exact_results() {
+    let memory = MemoryServer::default();
+    *memory.stats.lock().unwrap() = Some(physical_stats());
+    let (adapter, _harness, record) = memory_fixture(memory.clone()).await;
+    let request = expired_grant(&adapter.observe_memory(&record).await.unwrap(), 256 * MIB);
+    *memory.stats.lock().unwrap() = Some(partial_stats(&request));
+    assert!(!adapter.memory_retirement_required(&record).await.unwrap());
+    assert!(memory.resolutions.lock().unwrap().is_empty());
+    let mut result = partial_stats(&request);
+    for target in [false, true] {
+        result.memory_limit_bytes = if target { 256 * MIB } else { 128 * MIB };
+        result.memory_high_bytes = result.memory_limit_bytes * 3 / 4;
+        *memory.stats.lock().unwrap() = Some(result.clone());
+        *memory.reply.lock().unwrap() = Some(ResizeResourcesResponse {
+            actual: Some(result.clone()),
+            complete: target,
+            update_error: String::new(),
+        });
+        adapter.resolve_memory(&record, &request).await.unwrap();
+        assert!(!adapter.memory_retirement_required(&record).await.unwrap());
+    }
+}
+
+#[tokio::test]
+async fn physical_memory_retirement_requires_confirmed_daemon_reply() {
+    let memory = MemoryServer {
+        lose_reply: true,
+        ..Default::default()
+    };
+    *memory.stats.lock().unwrap() = Some(physical_stats());
+    let (adapter, _harness, record) = memory_fixture(memory.clone()).await;
+    let request = expired_grant(&adapter.observe_memory(&record).await.unwrap(), 256 * MIB);
+    *memory.stats.lock().unwrap() = Some(partial_stats(&request));
+    assert!(adapter.resolve_memory(&record, &request).await.is_err());
+    assert!(adapter.memory_retirement_required(&record).await.is_err());
+    assert!(memory.grows.lock().unwrap().is_empty());
+    assert!(memory.shrinks.lock().unwrap().is_empty());
+}

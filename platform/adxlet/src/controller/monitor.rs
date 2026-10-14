@@ -45,6 +45,25 @@ impl Controller {
             if self.workload_checkpoint().await? {
                 return Ok(());
             }
+            let memory_result = self.adjust_memory().await;
+            if memory_result.is_err()
+                && matches!(
+                    tokio::time::timeout(
+                        self.services.operation_timeout,
+                        self.services
+                            .runtime
+                            .memory_retirement_required(&self.record),
+                    )
+                    .await,
+                    Ok(Ok(true))
+                )
+            {
+                // A proven terminal partial write fails this execution. The
+                // existing conditional cleanup remains the release barrier.
+                return self.unexpected_exit().await;
+            }
+            // Sample activity after all memory RPCs, which may have waited or
+            // timed out while new requests entered the runtime.
             let runtime_activity = if self.record.spec.lifecycle.idle_timeout_seconds > 0
                 || self.services.health_failure_threshold.is_some()
             {
@@ -67,9 +86,8 @@ impl Controller {
                     }
                 }
             }
-            self.adjust_memory().await?;
             if self.record.spec.lifecycle.idle_timeout_seconds == 0 {
-                return Ok(());
+                return memory_result;
             }
             let sample = tokio::time::timeout(self.services.operation_timeout, async {
                 let runtime = runtime_activity?;
@@ -88,6 +106,7 @@ impl Controller {
                                 )
                             {
                                 self.delete().await?;
+                                return Ok(());
                             }
                         }
                         _ => self.idle = Some((stamp, Instant::now())),
@@ -96,6 +115,9 @@ impl Controller {
                 // Unknown, stale or active observations restart the idle window.
                 _ => self.idle = None,
             }
+            // A memory observation or center failure cannot suppress the
+            // independent idle lifecycle. Preserve the error if still running.
+            memory_result?;
         } else if self.record.state == EnvironmentState::Failed && self.record.restart_pending {
             let Some(policy) = &self.record.spec.lifecycle.restart else {
                 return Ok(());

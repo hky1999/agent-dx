@@ -139,6 +139,13 @@ pub trait RuntimeDriver: Send + Sync {
             "memory operation reconciliation is unsupported".into(),
         ))
     }
+    /// Prove a closed partial memory write from the durable original request,
+    /// after its deadline, with independent matching physical readback. True
+    /// permits ordinary failure cleanup, never budget release before retirement.
+    /// Unknown, unsupported or inconsistent evidence must not return true.
+    async fn memory_retirement_required(&self, _record: &EnvironmentRecord) -> Result<bool> {
+        Ok(false)
+    }
     async fn stats(&self, _runtime_id: &str) -> Result<metrics::RuntimeUsage> {
         Err(Error::Unavailable("runtime usage is unavailable".into()))
     }

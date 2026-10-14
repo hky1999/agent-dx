@@ -1301,6 +1301,12 @@ impl RuntimeDriver for Sandboxd {
     ) -> Result<adx_core::memory::MemorySample> {
         self.memory_resolution(record, authorization).await
     }
+    async fn memory_retirement_required(
+        &self,
+        record: &adx_core::EnvironmentRecord,
+    ) -> Result<bool> {
+        self.memory_failure_requires_retirement(record).await
+    }
     async fn execute_authorized(
         &self,
         authorization: &adx_core::execution::ExecutionAuthorization,

@@ -1160,3 +1160,61 @@ async fn memory_control_rejects_incomplete_unchanged_proof_without_affecting_nei
         assert_eq!(s.get("neighbor").await.unwrap(), before);
     }
 }
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn memory_failed_partial_execution_keeps_hold_across_restart_until_exact_retirement() {
+    let (rig, s, mut record, mut birth) = fixture_with_elastic(true).await;
+    birth.memory_limit_bytes = 128 * MIB;
+    birth.memory_high_bytes = 96 * MIB;
+    s.reconcile_memory(sample(&birth, 32, 1000), "boot-first", 1000, None)
+        .await
+        .unwrap();
+    let mut neighbor = record.spec.clone();
+    neighbor.id = "neighbor".into();
+    let mut placement = record.assignment.clone();
+    placement.environment_id = neighbor.id.clone();
+    placement.generation = 2;
+    s.reserve(neighbor, placement).await.unwrap();
+    let before = s.get("neighbor").await.unwrap();
+    let grant = s
+        .authorize_memory(request(&birth, "partial-growth", 256), "boot-first", 2000)
+        .await
+        .unwrap();
+    assert_eq!(held(&s).await, 384 * MIB);
+    record.state = EnvironmentState::Failed;
+    record.revision += 1;
+    record.runtime.ip = None;
+    s.commit(record.clone()).await.unwrap();
+    assert_eq!(
+        held(&s).await,
+        384 * MIB,
+        "failure is not physical retirement"
+    );
+    assert_eq!(
+        s.get("a")
+            .await
+            .unwrap()
+            .memory
+            .unwrap()
+            .pending
+            .unwrap()
+            .authorization,
+        grant
+    );
+    let reopened = rig.store().await.begin(1).await.unwrap();
+    assert_eq!(held(&reopened).await, 384 * MIB);
+    let mut retired = record.clone();
+    retired.resources_held = false;
+    retired.revision += 1;
+    let mut foreign = retired.clone();
+    foreign.runtime.id = "a-1-99".into();
+    assert!(reopened.commit(foreign).await.is_err());
+    assert_eq!(held(&reopened).await, 384 * MIB);
+    for _ in 0..2 {
+        reopened.commit(retired.clone()).await.unwrap();
+        assert_eq!(held(&reopened).await, 128 * MIB);
+        assert!(reopened.get("a").await.unwrap().memory.is_none());
+        assert_eq!(reopened.get("neighbor").await.unwrap(), before);
+    }
+}

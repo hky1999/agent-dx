@@ -29,6 +29,12 @@ struct Rig {
     wrong_identity: AtomicBool,
     applied: AtomicUsize,
     resolved: AtomicUsize,
+    fail_observe: AtomicBool,
+    retirement_proven: AtomicBool,
+    fail_remove: AtomicBool,
+    activity_unknown: AtomicBool,
+    active_requests: AtomicUsize,
+    activate_during_memory: AtomicBool,
 }
 impl Rig {
     fn sample(&self) -> MemorySample {
@@ -82,11 +88,23 @@ impl RuntimeDriver for Rig {
         Ok(self.actual.lock().unwrap().is_some())
     }
     async fn remove(&self, _: &str) -> Result<()> {
+        if self.fail_remove.load(Ordering::SeqCst) {
+            return Err(Error::Unavailable("physical retirement unknown".into()));
+        }
         *self.actual.lock().unwrap() = None;
         Ok(())
     }
     async fn observe_memory(&self, _: &EnvironmentRecord) -> Result<MemorySample> {
+        if self.activate_during_memory.swap(false, Ordering::SeqCst) {
+            self.active_requests.store(1, Ordering::SeqCst);
+        }
+        if self.fail_observe.load(Ordering::SeqCst) {
+            return Err(Error::Unavailable("memory observation unavailable".into()));
+        }
         Ok(self.sample())
+    }
+    async fn memory_retirement_required(&self, _: &EnvironmentRecord) -> Result<bool> {
+        Ok(self.retirement_proven.load(Ordering::SeqCst))
     }
     async fn resolve_memory(
         &self,
@@ -205,12 +223,21 @@ impl StateSink for Rig {
 }
 #[async_trait]
 impl Readiness for Rig {
+    async fn activity(&self, _: &EnvironmentRecord) -> Result<(u64, u64)> {
+        if self.activity_unknown.load(Ordering::SeqCst) {
+            return Err(Error::Unavailable("activity unknown".into()));
+        }
+        Ok((1, self.active_requests.load(Ordering::SeqCst) as u64))
+    }
     async fn wait_ready(&self, _: &EnvironmentRecord) -> Result<()> {
         Ok(())
     }
 }
 #[async_trait]
 impl Routes for Rig {
+    async fn activity(&self, _: &EnvironmentRecord) -> Result<(String, u64, u64)> {
+        Ok(("proxy-session".into(), 1, 0))
+    }
     async fn activate(&self, _: &EnvironmentRecord) -> Result<()> {
         Ok(())
     }
@@ -219,6 +246,11 @@ impl Routes for Rig {
     }
 }
 async fn rig() -> (Arc<Rig>, Arc<Adxlet>, adxlet::EnvironmentHandle) {
+    rig_with_idle(0).await
+}
+async fn rig_with_idle(
+    idle_timeout_seconds: u64,
+) -> (Arc<Rig>, Arc<Adxlet>, adxlet::EnvironmentHandle) {
     let rig = Arc::new(Rig {
         node: Mutex::default(),
         actual: Mutex::default(),
@@ -229,6 +261,12 @@ async fn rig() -> (Arc<Rig>, Arc<Adxlet>, adxlet::EnvironmentHandle) {
         wrong_identity: AtomicBool::new(false),
         applied: AtomicUsize::new(0),
         resolved: AtomicUsize::new(0),
+        fail_observe: AtomicBool::new(false),
+        retirement_proven: AtomicBool::new(false),
+        fail_remove: AtomicBool::new(false),
+        activity_unknown: AtomicBool::new(false),
+        active_requests: AtomicUsize::new(0),
+        activate_during_memory: AtomicBool::new(false),
     });
     let node = Arc::new(Adxlet::new(
         "node".into(),
@@ -260,7 +298,10 @@ async fn rig() -> (Arc<Rig>, Arc<Adxlet>, adxlet::EnvironmentHandle) {
         priority: 0,
         runtime_profile: None,
         snapshot_id: None,
-        lifecycle: Default::default(),
+        lifecycle: adx_core::lifecycle::LifecyclePolicy {
+            idle_timeout_seconds,
+            ..Default::default()
+        },
         env: Default::default(),
         scheduling: Default::default(),
         sandbox: adx_core::sandbox::SandboxOptions {
@@ -416,4 +457,117 @@ async fn memory_actor_resolves_old_epoch_or_session_without_redispatching() {
         assert_eq!(node.used().memory_bytes, 128 * MIB);
         handle.delete().await.unwrap();
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn memory_actor_unknown_observation_does_not_block_configured_idle_retirement() {
+    let (rig, node, handle) = rig_with_idle(10).await;
+    rig.fail_observe.store(true, Ordering::SeqCst);
+    assert!(handle.tick().await.is_err());
+    assert_eq!(node.used().memory_bytes, 128 * MIB);
+    tokio::time::advance(Duration::from_secs(10)).await;
+    let deleted = handle
+        .tick()
+        .await
+        .expect("memory errors must not block independently proven idle deletion")
+        .unwrap();
+    assert_eq!(deleted.record.state, adx_core::EnvironmentState::Deleted);
+    assert_eq!(node.used(), Resources::default());
+    assert!(rig.actual.lock().unwrap().is_none());
+    handle.delete().await.unwrap();
+}
+#[tokio::test(start_paused = true)]
+async fn memory_actor_center_memory_failure_does_not_block_idle_retirement() {
+    let (rig, node, handle) = rig_with_idle(10).await;
+    rig.fail_center.store(true, Ordering::SeqCst);
+    assert!(handle.tick().await.is_err());
+    tokio::time::advance(Duration::from_secs(10)).await;
+    assert!(handle
+        .tick()
+        .await
+        .expect("independent lifecycle publication remains available")
+        .is_some());
+    assert_eq!(node.used(), Resources::default());
+    assert_eq!(rig.applied.load(Ordering::SeqCst), 0);
+}
+#[tokio::test]
+async fn memory_actor_proven_partial_write_retires_only_after_physical_confirmation() {
+    let (rig, node, handle) = rig().await;
+    handle.tick().await.unwrap();
+    assert_eq!(node.used().memory_bytes, 256 * MIB);
+    rig.fail_observe.store(true, Ordering::SeqCst);
+    rig.retirement_proven.store(true, Ordering::SeqCst);
+    rig.fail_remove.store(true, Ordering::SeqCst);
+    assert!(handle.tick().await.is_err());
+    let failed = handle.sync().await.unwrap().record;
+    assert_eq!(
+        failed.state,
+        adx_core::EnvironmentState::Failed,
+        "proven partial writes must enter the existing failure cleanup path"
+    );
+    assert!(failed.resources_held);
+    assert_eq!(node.used().memory_bytes, 256 * MIB);
+    assert!(rig.actual.lock().unwrap().is_some());
+    rig.fail_remove.store(false, Ordering::SeqCst);
+    handle.tick().await.unwrap();
+    assert!(!handle.sync().await.unwrap().record.resources_held);
+    assert_eq!(node.used(), Resources::default());
+    assert_eq!(rig.applied.load(Ordering::SeqCst), 1);
+    handle.delete().await.unwrap();
+    handle.delete().await.unwrap();
+}
+#[tokio::test(start_paused = true)]
+async fn memory_actor_unknown_memory_cannot_authorize_retirement_or_bypass_activity() {
+    let (rig, node, handle) = rig_with_idle(10).await;
+    rig.fail_observe.store(true, Ordering::SeqCst);
+    rig.active_requests.store(1, Ordering::SeqCst);
+    assert!(handle.tick().await.is_err());
+    tokio::time::advance(Duration::from_secs(20)).await;
+    assert!(handle.tick().await.is_err());
+    rig.active_requests.store(0, Ordering::SeqCst);
+    rig.activity_unknown.store(true, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(20)).await;
+    assert!(handle.tick().await.is_err());
+    assert_eq!(
+        handle.sync().await.unwrap().record.state,
+        adx_core::EnvironmentState::Running
+    );
+    assert_eq!(node.used().memory_bytes, 128 * MIB);
+    rig.activity_unknown.store(false, Ordering::SeqCst);
+    assert!(handle.tick().await.is_err());
+    tokio::time::advance(Duration::from_secs(9)).await;
+    assert!(handle.tick().await.is_err());
+    assert_eq!(
+        handle.sync().await.unwrap().record.state,
+        adx_core::EnvironmentState::Running
+    );
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(handle.tick().await.unwrap().is_some());
+    assert_eq!(node.used(), Resources::default());
+}
+
+#[tokio::test(start_paused = true)]
+async fn memory_actor_activity_after_memory_wait_invalidates_previous_idle_observation() {
+    let (rig, node, handle) = rig_with_idle(10).await;
+    rig.fail_observe.store(true, Ordering::SeqCst);
+    assert!(handle.tick().await.is_err());
+    tokio::time::advance(Duration::from_secs(10)).await;
+    rig.activate_during_memory.store(true, Ordering::SeqCst);
+    assert!(
+        handle.tick().await.is_err(),
+        "an activity observation taken before memory work cannot authorize idle deletion"
+    );
+    assert_eq!(
+        handle.sync().await.unwrap().record.state,
+        adx_core::EnvironmentState::Running
+    );
+    assert_eq!(node.used().memory_bytes, 128 * MIB);
+    assert!(rig.actual.lock().unwrap().is_some());
+    rig.active_requests.store(0, Ordering::SeqCst);
+    assert!(handle.tick().await.is_err());
+    tokio::time::advance(Duration::from_secs(9)).await;
+    assert!(handle.tick().await.is_err());
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(handle.tick().await.unwrap().is_some());
+    assert_eq!(node.used(), Resources::default());
 }

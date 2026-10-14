@@ -8,6 +8,8 @@ use adx_core::{EnvironmentRecord, EnvironmentState, Error, Result};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+mod failure;
+
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct MemoryDispatch {
     pub authorization: MemoryAuthorization,
@@ -36,6 +38,35 @@ impl MemoryDispatch {
         }
         Ok(())
     }
+}
+fn resolution_request(
+    authorization: &MemoryAuthorization,
+) -> Result<proto::ResolveResourceOperationRequest> {
+    authorization.validate()?;
+    let request = &authorization.request;
+    let source = &request.source;
+    let expected = proto::ResourceLimits {
+        cpu_quota_usec: i64::try_from(source.cpu_quota_usec).map_err(unavailable)?,
+        cpu_period_usec: source.cpu_period_usec,
+        memory_limit_bytes: source.memory_limit_bytes,
+    };
+    let target = proto::ResourceLimits {
+        memory_limit_bytes: request.target_limit_bytes,
+        ..expected
+    };
+    Ok(proto::ResolveResourceOperationRequest {
+        original: Some(proto::ResizeResourcesRequest {
+            sandbox_id: source.identity.sandbox_id.clone(),
+            resource_generation: source.identity.resource_generation.clone(),
+            expected: Some(expected),
+            target: Some(target),
+            deadline_unix_ms: i64::try_from(authorization.deadline_unix_millis)
+                .map_err(unavailable)?,
+            operation_id: request.operation_id.clone(),
+            expected_revision: source.resource_revision,
+        }),
+        shrink: request.target_limit_bytes < source.memory_limit_bytes,
+    })
 }
 fn check_record(record: &EnvironmentRecord) -> Result<()> {
     record.spec.validate()?;
@@ -74,11 +105,11 @@ fn high(record: &EnvironmentRecord, limit: u64) -> Result<u64> {
     }
     Ok(aligned)
 }
-fn sample(
+fn check_physical_stats(
     record: &EnvironmentRecord,
     physical: &BackendIdentity,
-    value: proto::StatsResponse,
-) -> Result<MemorySample> {
+    value: &proto::StatsResponse,
+) -> Result<()> {
     let ceiling = record.spec.execution_ceiling();
     let expected_policy = serde_json::json!({
         "version":1,
@@ -98,11 +129,21 @@ fn sample(
             != expected_policy
         || u128::from(u64::try_from(value.cpu_quota_usec).map_err(unavailable)?) * 1000
             != u128::from(ceiling.cpu_millis) * u128::from(value.cpu_period_usec)
-        || value.memory_high_bytes != high(record, value.memory_limit_bytes)?
     {
         return Err(unavailable(
             "incomplete or mismatched physical memory observation",
         ));
+    }
+    Ok(())
+}
+fn sample(
+    record: &EnvironmentRecord,
+    physical: &BackendIdentity,
+    value: proto::StatsResponse,
+) -> Result<MemorySample> {
+    check_physical_stats(record, physical, &value)?;
+    if value.memory_high_bytes != high(record, value.memory_limit_bytes)? {
+        return Err(Error::Conflict);
     }
     let observation = MemoryObservation {
         identity: MemoryIdentity {
@@ -257,31 +298,10 @@ impl Sandboxd {
                 .map_err(unavailable)?
                 .insert(record.runtime.id.clone(), entry);
         }
-        let expected = proto::ResourceLimits {
-            cpu_quota_usec: i64::try_from(source.cpu_quota_usec).map_err(unavailable)?,
-            cpu_period_usec: source.cpu_period_usec,
-            memory_limit_bytes: source.memory_limit_bytes,
-        };
-        let target = proto::ResourceLimits {
-            memory_limit_bytes: request.target_limit_bytes,
-            ..expected
-        };
         let response = self
             .client
             .clone()
-            .resolve_resource_operation(self.request(proto::ResolveResourceOperationRequest {
-                original: Some(proto::ResizeResourcesRequest {
-                    sandbox_id: source.identity.sandbox_id.clone(),
-                    resource_generation: source.identity.resource_generation.clone(),
-                    expected: Some(expected),
-                    target: Some(target),
-                    deadline_unix_ms:
-                        i64::try_from(authorization.deadline_unix_millis).map_err(unavailable)?,
-                    operation_id: request.operation_id.clone(),
-                    expected_revision: source.resource_revision,
-                }),
-                shrink: request.target_limit_bytes < source.memory_limit_bytes,
-            }))
+            .resolve_resource_operation(self.request(resolution_request(authorization)?))
             .await
             .map_err(unavailable)?
             .into_inner();
