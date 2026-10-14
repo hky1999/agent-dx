@@ -17,6 +17,7 @@ struct Create {
     memory: i64,
     cpu_limit: i64,
     mem_limit: i64,
+    elastic_memory: Option<adx_core::memory::ElasticMemoryPolicy>,
     #[serde(rename = "storageMb")]
     storage: Option<i64>,
     storage_limit_mb: i64,
@@ -578,6 +579,18 @@ pub fn create_spec_with_environment(
     if cpu_limit < cpu || memory_limit < memory || disk_limit < disk {
         return Err(invalid("resource limits cannot be below requests"));
     }
+    if r.elastic_memory.is_some() {
+        if root.runtime != "runsc" || snapshot.is_some() {
+            return Err(invalid(
+                "elastic memory requires runsc and does not support snapshot cloning",
+            ));
+        }
+        if cpu_limit < 10 {
+            return Err(invalid(
+                "elastic memory requires a CPU limit of at least 10 millicores",
+            ));
+        }
+    }
     let readonly = root
         .readonly
         .or_else(|| runtime_profile.map(|value| value.rootfs.readonly))
@@ -619,7 +632,7 @@ pub fn create_spec_with_environment(
             memory_bytes: memory_limit,
             disk_bytes: disk_limit,
         },
-        elastic_memory: None,
+        elastic_memory: r.elastic_memory,
         extra_config,
     };
     sandbox

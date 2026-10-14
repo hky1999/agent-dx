@@ -25,12 +25,22 @@ Coordinator 配置省略 `memory_control` 时，不生成新的自动调整操�
 }
 ```
 
-另外必须配置可信 `host_budgets`，并在内部 Environment 创建规格中显式设置
-`sandbox.elastic_memory.high_per_mille`。请求内存是出生额度和下限，执行限制是允许上限。
-当前公开 HTTP 与 Python SDK 尚未暴露此选项。节点注册通过独立的
+另外必须配置可信 `host_budgets`。公开创建 HTTP 请求通过
+`"elastic_memory": {"high_per_mille": 750}` 显式启用；Python SDK 对应
+`Sandbox(cpu=500, memory=128, mem_limit=256, elastic_memory=ElasticMemoryPolicy(750))`，
+其中 `ElasticMemoryPolicy` 从 `adx_sandbox` 导入。请求内存是出生额度和下限，
+执行限制是允许上限；省略或传入 null 保持固定执行额度。
+此字段映射到内部 `sandbox.elastic_memory`，不接受未知策略字段、非法比例或不支持的运行时。
+节点注册通过独立的
 `memory_control_version=1` 字段声明能力；旧节点、未知能力版本和用户标签均不能授权弹性出生。
 带弹性配置的调度禁用不检查此能力的聚合优化，持久准入再次检查实际节点能力。
-仅支持 runsc，内存取整数 MiB，CPU 与磁盘保持执行上限。
+仅支持 runsc，不支持从 snapshotId 克隆；内存取整数 MiB，上界不超过 2^53 字节，
+memory.high 至少为 4096 字节。实际 CPU 配额至少为 10 millicores，CPU 与磁盘保持执行上限。
+sandboxd 的 `[plugin.resource].memory_high_ratio` 必须与请求一致，例如 0.75 对应 750。
+这是 daemon 全局配置，也会影响该 daemon 新建的固定额度沙箱的软节流阈值；不会改变其硬上限。
+`memory.high` 不是绝对 OOM 保护。只有 SDK 选项不会自动打开中心策略；未启用中心策略时
+弹性实例保持出生额度。旧公开服务器可能忽略未知字段，因此必须部署匹配的服务端和 SDK，
+并以实际出生额度和物理回读验收，不能只根据创建返回成功判断启用。
 
 ## 决策与结算
 
@@ -61,5 +71,5 @@ CPU 配额、memory.max、memory.high、用量、冻结和操作完成事实。�
 源码测试包括真实 Redis 下的共享预算、持续观察窗口、会话替换和未知占用；
 节点模拟运行时下的派发顺序、回复丢失、中心不可用、本地准入；以及 mTLS RPC 的鉴权、
 授权、结算和退役。sandboxd 适配器另有真实 Unix socket 服务测试。
-这些测试不代替物理验收；匹配生产构建、部署、公开创建入口、恢复峰值策略、
+这些测试不代替物理验收；匹配生产构建、部署、公开入口的物理验收、恢复峰值策略、
 完整冻结与组件故障矩阵、25 次资源双周期和25次正值预算退役仍须完成。

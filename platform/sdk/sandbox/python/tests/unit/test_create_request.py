@@ -69,6 +69,34 @@ class CreateRequestTests(unittest.TestCase):
         self.pool_factory.assert_not_called()
         self.assertEqual(self.exchanges, [])
 
+    def test_elastic_memory_is_explicit_and_preserves_bounds(self):
+        import adx_sandbox as sdk
+
+        body = self.capture_create(cpu=500, memory=128, mem_limit=256,
+                                   elastic_memory=sdk.ElasticMemoryPolicy())
+        self.assertEqual(body["elastic_memory"], {"high_per_mille": 750})
+        self.assertEqual((body["cpu"], body["memory"], body["mem_limit"]), (500, 128, 256))
+        self.assertNotIn("elastic_memory", self.capture_create())
+        self.assertNotIn("elastic_memory", self.capture_create(elastic_memory=None))
+
+    def test_elastic_memory_invalid_inputs_never_open_transport(self):
+        import adx_sandbox as sdk
+
+        for ratio in (True, 750.5, "750", 0, 1000):
+            with self.subTest(ratio=ratio), self.assertRaises((ValueError, TypeError)):
+                sdk.ElasticMemoryPolicy(high_per_mille=ratio)
+        for options in (
+            {"runtime": "kata"}, {"snapshot_id": "snapshot"},
+            {"cpu": 9}, {"memory": True}, {"mem_limit": 8589934593},
+            {"memory": 128, "mem_limit": 127}, {"cpu_limit": -1},
+            {"memory": 1, "elastic_memory": sdk.ElasticMemoryPolicy(1)},
+            {"elastic_memory": {"high_per_mille": 750}},
+        ):
+            options = {"elastic_memory": sdk.ElasticMemoryPolicy(), **options}
+            with self.subTest(options=options), self.assertRaises((ValueError, TypeError)):
+                Sandbox(connection=self.connection, **options)
+        self.assert_no_transport_setup()
+
     def test_omitted_options_inherit_cluster_defaults(self):
         body = self.capture_create()
         self.assertTrue({"network", "xpu", "storageMb", "extra_config"}.isdisjoint(body))

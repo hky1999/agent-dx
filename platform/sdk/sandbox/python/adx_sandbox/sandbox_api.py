@@ -23,6 +23,7 @@ from .types import (
     ADX_GET_DEFAULT_TIMEOUT,
     ConnectionConfig,
     DataPlaneSecurityPolicy,
+    ElasticMemoryPolicy,
     Mount,
     NetworkPolicy,
     PauseResult,
@@ -305,6 +306,7 @@ class Sandbox:
         detached: bool = False,
         node_id: Optional[str] = None,
         *,
+        elastic_memory: Optional[ElasticMemoryPolicy] = None,
         rootfs_readonly: Optional[bool] = None,
         labels: Optional[Dict[str, str]] = None,
         schedule_affinities: Optional[List[Dict[str, Any]]] = None,
@@ -327,6 +329,9 @@ class Sandbox:
         Args:
             image: Container image to use (e.g. ``"python:3.12-slim"``).
             rootfs: S3-compatible EROFS root filesystem configuration.
+            elastic_memory: 显式启用 runsc 内存弹性。memory 是出生额度及下界，
+                mem_limit 是允许上界，零表示沿用 memory。CPU 保持固定；
+                不支持 snapshot_id 克隆，服务端必须启用匹配的自动策略。
             rootfs_readonly: Optional override for the deployment rootfs
                 ``readonly`` default. Omitting it inherits the deployment
                 setting, including when replacing the source with *image* or
@@ -391,6 +396,27 @@ class Sandbox:
             raise TypeError("rootfs_readonly must be a boolean or None")
         if snapshot_id is not None and (not isinstance(snapshot_id, str) or not snapshot_id.strip()):
             raise ValueError("snapshot_id must be a non-empty string")
+        if elastic_memory is not None:
+            if not isinstance(elastic_memory, ElasticMemoryPolicy):
+                raise TypeError("elastic_memory must be an ElasticMemoryPolicy")
+            if runtime not in (None, "runsc") or snapshot_id is not None:
+                raise ValueError("elastic memory requires runsc without snapshot cloning")
+            for field, value, minimum in (
+                ("cpu", cpu, 1), ("memory", memory, 1),
+                ("cpu_limit", cpu_limit, 0), ("mem_limit", mem_limit, 0),
+            ):
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise TypeError(f"{field} must be an integer")
+                if value < minimum:
+                    raise ValueError(f"{field} is below its minimum")
+            if (cpu_limit and cpu_limit < cpu) or (mem_limit and mem_limit < memory):
+                raise ValueError("elastic resource ceilings cannot be below requests")
+            if (cpu_limit or cpu) < 10:
+                raise ValueError("elastic memory requires at least 10 CPU millicores")
+            if (mem_limit or memory) > (1 << 33):
+                raise ValueError("elastic memory ceiling exceeds 2^53 bytes")
+            if (memory * (1 << 20) * elastic_memory.high_per_mille + 999) // 1000 < 4096:
+                raise ValueError("elastic memory.high must span at least one 4096-byte page")
         if not isinstance(failover, bool):
             raise TypeError("failover must be a boolean")
         if not isinstance(inherit_entrypoint, bool):
@@ -524,6 +550,8 @@ class Sandbox:
             body["rootfs"]["readonly"] = rootfs_readonly
         if name:
             body["name"] = name
+        if elastic_memory is not None:
+            body["elastic_memory"] = elastic_memory.to_dict()
         resource_values = {
             "cpu": cpu,
             "memory": memory,

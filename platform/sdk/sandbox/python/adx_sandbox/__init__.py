@@ -6,6 +6,7 @@ from .types import (
     DataPlaneSecurityPolicy,
     DNSPolicy,
     DNSRule,
+    ElasticMemoryPolicy,
     EntryInfo,
     Mount,
     NetworkPolicy,
@@ -25,6 +26,7 @@ from .types import (
 SDK_CAPABILITIES = frozenset(
     {
         "local-close",
+        "elastic-memory",
         "explicit-connection-config",
         "tunnel-proxy-port",
         "recoverable-commands",
@@ -35,6 +37,7 @@ SDK_CAPABILITIES = frozenset(
 __all__ = [
     # current API
     "Sandbox",
+    "ElasticMemoryPolicy",
     "Shell",
     "Shells",
     "CommandHandle",

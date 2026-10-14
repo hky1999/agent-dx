@@ -17,6 +17,22 @@ ADX_GET_TIMEOUT_BUFFER = 30
 
 
 @dataclass(frozen=True)
+class ElasticMemoryPolicy:
+    """显式启用内存弹性；high_per_mille 必须与节点的软节流比例一致。"""
+
+    high_per_mille: int = 750
+
+    def __post_init__(self) -> None:
+        if isinstance(self.high_per_mille, bool) or not isinstance(self.high_per_mille, int):
+            raise TypeError("high_per_mille must be an integer")
+        if not 1 <= self.high_per_mille <= 999:
+            raise ValueError("high_per_mille must be between 1 and 999")
+
+    def to_dict(self) -> Dict[str, int]:
+        return {"high_per_mille": self.high_per_mille}
+
+
+@dataclass(frozen=True)
 class RestartPolicy:
     """Bounded node-local restart after an unexpected runtime exit."""
 

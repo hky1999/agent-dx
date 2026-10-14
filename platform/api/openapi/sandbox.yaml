@@ -649,7 +649,23 @@ components:
           type: integer
           format: int64
           minimum: 0
-          description: Execution cgroup memory limit in MiB; zero inherits `memory`.
+          description: Execution cgroup memory limit in MiB; zero inherits `memory`. With elastic_memory, this is the allowed ceiling.
+        elastic_memory:
+          type: [object, "null"]
+          additionalProperties: false
+          required: [high_per_mille]
+          description: |
+            显式启用 runsc 内存弹性；省略或 null 保持固定额度行为。
+            memory 是出生额度及下界，mem_limit 是允许上界，零沿用 memory。
+            内存必须是整数 MiB，上界不得超过 2^53 字节，memory.high 至少为 4096 字节。
+            不支持 snapshotId 克隆；CPU 上限至少为 10 millicores，且不自动调整。
+            自动增长需要部署启用中心策略，high_per_mille 必须匹配 sandboxd 配置。
+          properties:
+            high_per_mille:
+              type: integer
+              minimum: 1
+              maximum: 999
+              description: memory.high 相对 memory.max 的千分比，是软节流阈值。
         storageMb: {type: integer, format: int64, minimum: 1}
         storage_limit_mb:
           type: integer

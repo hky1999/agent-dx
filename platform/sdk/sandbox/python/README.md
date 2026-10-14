@@ -445,3 +445,22 @@ optional `weight` and `preferredPriority`. `node_id` remains a hard requirement
 when combined with alternatives. See [placement rules](https://gitcode.com/openJiuwen/agent-dx/blob/refactor/docs/testing/http-node-placement.md)
 for the matching, ranking and label contracts. Caller-provided option lists are
 copied before the SDK adds a node constraint.
+
+## 显式内存弹性
+
+匹配本分支的服务端和 sandboxd 配置后，可以传入公开类型 `ElasticMemoryPolicy`：
+
+```python
+from adx_sandbox import ElasticMemoryPolicy, Sandbox
+
+with Sandbox(cpu=500, memory=128, mem_limit=256,
+             elastic_memory=ElasticMemoryPolicy(high_per_mille=750)) as sandbox:
+    print(sandbox.commands.list())
+```
+
+`memory` 是出生额度及下界，`mem_limit` 是允许上界，单位均为 MiB；零上界沿用出生额度。
+省略 `elastic_memory` 或传入 `None` 保持固定执行额度。仅支持 runsc，不支持 snapshot_id 克隆；
+CPU 配额固定，至少 10 millicores。比例范围为 1 到 999，必须匹配节点的 memory.high 比例；
+内存上界不得超过 2^53 字节，出生 memory.high 至少为 4096 字节。非法值在建立连接前拒绝。
+自动增长还需显式启用 Coordinator 策略；旧服务端可能忽略字段，必须核对实际物理额度。
+配置与验收边界见[自动内存控制](../../../../docs/deployment/memory-control.md)。
