@@ -203,6 +203,24 @@ impl ResourceLedger {
         self.reservations.insert(id.into(), resources);
         Ok(())
     }
+    pub fn reservation(&self, id: &str) -> Option<Resources> {
+        self.reservations.get(id).copied()
+    }
+    /// Compare and replace one runtime's hold without disturbing its neighbors.
+    /// Decreases remain possible after a capacity reduction; growth must fit.
+    pub fn replace(&mut self, id: &str, expected: Resources, target: Resources) -> Result<()> {
+        target.validate()?;
+        if self.reservations.get(id) != Some(&expected) {
+            return Err(Error::Conflict);
+        }
+        let used = self.used.saturating_sub(expected).checked_add(target)?;
+        if !target.fits(&expected) && !used.fits(&self.capacity) {
+            return Err(Error::NoCapacity);
+        }
+        self.reservations.insert(id.into(), target);
+        self.used = used;
+        Ok(())
+    }
     pub fn release(&mut self, id: &str) -> Result<()> {
         let resources = self.reservations.remove(id).ok_or(Error::NotFound)?;
         self.used = self.used.saturating_sub(resources);

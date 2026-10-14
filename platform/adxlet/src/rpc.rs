@@ -510,6 +510,36 @@ impl CoordinatorStateSink {
 }
 #[async_trait::async_trait]
 impl StateSink for CoordinatorStateSink {
+    async fn reconcile_memory(
+        &self,
+        sample: &adx_core::memory::MemorySample,
+    ) -> Result<adx_core::memory::MemoryDecision> {
+        let mut request = Request::new(pb::ReconcileMemoryRequest {
+            sample: Some(sample.clone().try_into()?),
+            node_session_id: self.session_id.clone(),
+        });
+        adx_observability::trace::inject_metadata(request.metadata_mut());
+        request.set_timeout(self.timeout);
+        let mut client = self
+            .client
+            .read()
+            .expect("shared state lock poisoned")
+            .clone();
+        let response = tokio::time::timeout(self.timeout, client.reconcile_memory(request))
+            .await
+            .map_err(|_| Error::Unavailable("memory reconciliation RPC timed out".into()))?
+            .map_err(dependency_status)?
+            .into_inner();
+        let decision: adx_core::memory::MemoryDecision = response
+            .decision
+            .ok_or_else(|| Error::Unavailable("memory decision missing".into()))?
+            .try_into()?;
+        if decision.observed != sample.observation || decision.node_session_id != self.session_id {
+            return Err(Error::Conflict);
+        }
+        Ok(decision)
+    }
+
     async fn authorize_execution(
         &self,
         execution: &adx_core::execution::ExecutionRequest,

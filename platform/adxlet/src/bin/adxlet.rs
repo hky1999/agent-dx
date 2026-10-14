@@ -375,6 +375,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         heartbeat_sequence: 0,
         reconciling: true,
         runtime_classes: vec![],
+        memory_control_version: 1,
     };
     // Bind before registration so dispatch cannot race an unbound address.
     let node_rpc = NodeRpc::new(manager.clone(), peers, session_id.clone())

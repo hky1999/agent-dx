@@ -60,6 +60,7 @@ service_impl!(pb::coordinator_service_server::CoordinatorService, {
     create_environment(CreateEnvironmentRequest) -> EnvironmentResult,
     commit_environment(CommitEnvironmentRequest) -> CommitEnvironmentResponse,
     authorize_execution(AuthorizeExecutionRequest) -> AuthorizeExecutionResponse,
+    reconcile_memory(ReconcileMemoryRequest) -> ReconcileMemoryResponse,
 ]);
 
 service_impl!(pb::node_service_server::NodeService, {

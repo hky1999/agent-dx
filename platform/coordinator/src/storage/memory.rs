@@ -1,5 +1,18 @@
 //! Dynamic memory is accounted by the same host CAS as creation and recovery.
 use super::*;
+mod control;
+pub use control::MemoryControlPolicy;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MemoryWindow {
+    last_unix_millis: u64,
+    low_since_unix_millis: Option<u64>,
+    low_samples: u32,
+    #[serde(default)]
+    last_counted_unix_millis: u64,
+}
+
 use adx_core::memory::{MemoryAuthorization, MemoryObservation, MemoryRequest};
 use adx_core::Resources;
 
@@ -15,6 +28,8 @@ pub struct StoredMemoryOperation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoredMemory {
+    #[serde(default)]
+    pub(crate) window: MemoryWindow,
     pub confirmed: MemoryObservation,
     pub pending: Option<StoredMemoryOperation>,
     pub completed: BTreeMap<String, StoredMemoryOperation>,
@@ -208,6 +223,7 @@ impl Session {
                 return Err(Error::Conflict);
             }
             environment.memory = Some(StoredMemory {
+                window: MemoryWindow::default(),
                 confirmed: observation.clone(),
                 pending: None,
                 completed: BTreeMap::new(),
@@ -332,7 +348,7 @@ impl Session {
     ) -> Result<()> {
         grant.validate()?;
         observation.validate()?;
-        if grant.node_session_id != node_session_id || observation != grant.request.completion()? {
+        if observation != grant.request.completion()? {
             return Err(Error::Conflict);
         }
         let field = format!(

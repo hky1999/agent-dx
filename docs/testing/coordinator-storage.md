@@ -81,7 +81,7 @@ WatchNodes 同一次持久读取发布 `host_budget_configured`、宿主容量�
 
 ## 内存额度的持久授权基础
 
-`platform/crates/core/src/memory.rs` 定义完整物理身份、确认观察、请求及授权；`storage/memory.rs` 提供 `initialize_memory`、`authorize_memory` 和 `complete_memory`。这是存储层接口，当前尚未通过控制 RPC 和节点准入接入 sandboxd 资源操作或自动策略；sandboxd 适配层的方法独立实现并验证，部署中的固定额度行为不因这份实现而改变。
+`platform/crates/core/src/memory.rs` 定义完整物理身份、确认观察、请求及授权；`storage/memory.rs` 提供 `initialize_memory`、`authorize_memory` 和 `complete_memory`。存储接口已通过 ReconcileMemory RPC 接到节点准入与 sandboxd 条件资源操作；自动策略显式启用。部署中的固定额度行为不因源码修改而改变。
 
 初始化要求有效节点会话、Running 记录、已配置宿主预算和完整出生观察。固定配置必须匹配原执行上限；显式配置 `sandbox.elastic_memory` 的首次创建必须匹配请求内存。资源 revision 必须为 1，操作编号必须为空，CPU 配额与原执行规格一致，memory.max 和 memory.high 必须是有限、正值且按 4096 字节对齐的已知值，物理执行必须已经解冻。
 
@@ -143,3 +143,9 @@ cargo clippy --locked -p adx-coordinator -p adx-core -p adx-scheduling --all-tar
 内存请求在核心类型中限制为最多 60000 毫秒的原期限和最多 128 字节、无空白的可打印 ASCII
 操作 ID，与 sandboxd 条件资源接口一致。无法派发的请求在持久预留之前拒绝。
 节点适配层的行为及尚未接通的生产路径见[条件内存操作适配层](node-lifecycle.md#条件内存操作适配层)。
+
+
+`Session::reconcile_memory` 在同一宿主预算比较更新中完成初始化、精确结果结算、
+持续低用量窗口更新及新授权预留。新窗口使用 schema 5，旧写入者不能忽略该状态。
+当前会话可以结算原会话的精确物理结果，但不能重用旧授权执行。
+节点能力和自动策略要求见[自动内存控制](../deployment/memory-control.md)。

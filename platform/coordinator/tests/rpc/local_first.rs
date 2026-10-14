@@ -127,6 +127,7 @@ impl Rig {
             let mut coordinator =
                 pb::coordinator_service_client::CoordinatorServiceClient::new(client);
             let mut register = pb::RegisterNodeRequest {
+                memory_control_version: 0,
                 runtime_classes: vec![
                     "runsc".into(),
                     "runc".into(),
@@ -285,6 +286,7 @@ async fn failed_gc_cleans_invalidated_owner_and_fences_delayed_running() {
     rig.claimants[0]
         .register_node(pb::RegisterNodeRequest {
             runtime_classes: node.node.runtime_classes,
+            memory_control_version: 0,
             node_id: "a".into(),
             node_address: node.address,
             proxy_address: node.proxy_address,
@@ -340,6 +342,7 @@ async fn redis_restart_recovers_scheduler_after_failed_node_heartbeat() {
     let node = &stored.nodes["a"];
     let heartbeat = pb::RegisterNodeRequest {
         runtime_classes: vec!["runsc".into(), "runc".into()],
+        memory_control_version: 0,
         node_id: "a".into(),
         node_address: node.address.clone(),
         proxy_address: node.proxy_address.clone(),
@@ -668,6 +671,7 @@ async fn environment_directory_increment_does_not_rescan_control_history() {
     rig.claimants[0]
         .register_node(pb::RegisterNodeRequest {
             runtime_classes: stored.node.runtime_classes,
+            memory_control_version: 0,
             node_id: stored.node.id,
             node_address: stored.address,
             proxy_address: stored.proxy_address,
@@ -1152,6 +1156,7 @@ async fn local_first_https_directory_round_robin_and_concurrent_creation() {
         let node = &rig.session.snapshot().await.unwrap().nodes[if i == 0 { "a" } else { "b" }];
         rig.claimants[i]
             .register_node(pb::RegisterNodeRequest {
+                memory_control_version: 0,
                 runtime_classes: vec![
                     "runsc".into(),
                     "runc".into(),

@@ -35,7 +35,8 @@ impl Filter for RuntimeFit {
         "runtime-fit"
     }
     fn filter(&self, r: &EnvironmentSpec, c: &Candidate<'_>) -> Result<bool> {
-        Ok(c.node.runtime_classes.contains(&r.runtime_class))
+        Ok(c.node.runtime_classes.contains(&r.runtime_class)
+            && (r.sandbox.elastic_memory.is_none() || c.node.memory_control_version == 1))
     }
 }
 pub struct NodeAffinity;

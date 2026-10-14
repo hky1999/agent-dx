@@ -48,6 +48,7 @@ fn invalid_profiles_and_out_of_range_scores_are_rejected() {
     let framework = Framework::new(vec![], vec![weighted("bad", MAX_SCORE + 1, 1)]).unwrap();
     let request = request();
     let node = Node {
+        memory_control_version: 0,
         runtime_classes: vec![
             "runsc".into(),
             "runc".into(),
@@ -112,6 +113,7 @@ fn runtime_filter_rejects_unsupported_or_unreported_backend() {
         labels: Default::default(),
         devices: vec![],
         runtime_classes: vec!["runc".into()],
+        memory_control_version: 0,
     };
     let snapshot = Default::default();
     let framework = Framework::builtin(Placement::Pack);
@@ -149,6 +151,7 @@ impl Filter for FailingFilter {
 fn filter_failure_is_an_error_not_an_eligible_candidate() {
     let request = request();
     let node = Node {
+        memory_control_version: 0,
         runtime_classes: vec![
             "runsc".into(),
             "runc".into(),
@@ -183,6 +186,7 @@ fn high_weights_accumulate_without_wrapping_and_zero_disk_is_supported() {
     let mut request = request();
     request.resources.disk_bytes = 0;
     let node = Node {
+        memory_control_version: 0,
         runtime_classes: vec![
             "runsc".into(),
             "runc".into(),

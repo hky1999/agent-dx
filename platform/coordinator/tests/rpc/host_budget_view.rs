@@ -29,6 +29,7 @@ async fn host_budget_watch_preserves_offline_reservations_and_closes_on_storage_
                 capacity,
                 available: true,
                 runtime_classes: vec!["runc".into()],
+                memory_control_version: 0,
                 labels: Default::default(),
                 devices: vec![],
             },

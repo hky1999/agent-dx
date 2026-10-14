@@ -18,7 +18,7 @@ adxlet 拥有实例串行状态机。Coordinator 提供归属校验、Redis 持�
 
 内部 Environment 协议可显式配置 `sandbox.elastic_memory={"high_per_mille":750}`。此时 `execution_resources()` 的内存为请求值，作为出生额度和缩容下限；CPU 和磁盘仍使用完整上限。仅支持 runsc，请求和允许上限必须为整数 MiB，比例必须大于 0 且小于 1000，出生软限制至少为 4096 字节，CPU 上限至少为 10 毫核；数值超过 sandboxd 精度时拒绝。快照克隆暂不接受该选项。Start 写入 sandboxd 第一版弹性策略标签，CPU 的初值和上限相同，内存分别记录初值和允许上限；不通过修改原始规格记录后续额度。
 
-恢复可能携带已经增长的内存上限，因此中心和节点在恢复前预留完整允许上限，Running 状态本身不能归还差额。Coordinator 从持久内存账户重建确认额度及待执行扩容额度；节点重启只有生命周期记录时保守保留允许上限。sandboxd 适配层已提供完整物理回读和条件扩缩容方法；中心资源控制 RPC、节点内存账户同步和串行生命周期接线尚未完成，节点保守预留尚不能自动收敛到实际额度。此选项当前没有公开 HTTP／Python SDK 入口，也不启用自动调整；适配层会按期望比例核对实际 memory.high，比例不符时拒绝派发。具体边界见 [宿主准入与执行授权](coordinator-storage.md)。
+恢复可能携带已经增长的内存上限，因此中心和节点在恢复前预留完整允许上限，Running 状态本身不能归还差额。Coordinator 从持久内存账户重建确认额度及待执行扩容额度；节点重启只有生命周期记录时保守保留允许上限。sandboxd 适配层已提供完整物理回读和条件扩缩容方法；中心资源 RPC 已接入节点串行生命周期与本地额度更新，保守预留通过完整账户对账收敛；物理闭环尚未验收。此选项当前没有公开 HTTP／Python SDK 入口，也不启用自动调整；适配层会按期望比例核对实际 memory.high，比例不符时拒绝派发。具体边界见 [宿主准入与执行授权](coordinator-storage.md)。
 
 请求和磁盘上限均为零时仍不设置可写层配额，不能声称所有磁盘使用已经受预算约束。宿主共享预算已经有生产配置入口；独立内存授权的存储实现不等于物理动态资源或安全超卖已经验收。
 
@@ -106,7 +106,7 @@ Rust 用例位于 adxlet 的 `journal.rs`、`resources.rs`、`pause_resume.rs` �
 `RuntimeDriver::observe_memory` 和 `apply_memory` 默认返回不支持，sandboxd 实现在
 `platform/adxlet/src/sandboxd/memory.rs`。调用方必须先验证持久授权、取得节点额度，
 并提供当前节点会话和 Coordinator epoch；不能把授权自身的字段当成当前权威状态。
-当前尚未从生产控制 RPC 调用这些方法，也没有启用自动策略。
+节点串行监控通过已认证的 ReconcileMemory RPC 获取中心决策，再调用这些方法；自动策略需要显式配置启用，当前部署状态以外层版本台账为准。
 
 完整观察要求 Running、显式弹性配置、匹配的 Runtime／Assignment／sandbox ID／资源代际，
 以及已知 CPU 配额、memory.current、memory.max、memory.high、资源 revision 和解冻事实。

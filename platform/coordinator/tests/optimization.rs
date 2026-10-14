@@ -3,6 +3,7 @@ use adx_core::{EnvironmentSpec, Resources};
 use std::{sync::Arc, time::Duration};
 fn node(id: &str, cpu: u64) -> Node {
     Node {
+        memory_control_version: 0,
         runtime_classes: vec![
             "runsc".into(),
             "runc".into(),

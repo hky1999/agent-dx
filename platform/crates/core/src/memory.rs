@@ -209,6 +209,45 @@ pub struct MemoryPressure {
     pub oom_kill_events: u64,
 }
 
+/// The authenticated center's account, bound to the exact submitted observation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryDecision {
+    pub observed: MemoryObservation,
+    pub held_resources: crate::Resources,
+    pub authorization: Option<MemoryAuthorization>,
+    pub node_session_id: String,
+    pub coordinator_epoch: u64,
+}
+impl MemoryDecision {
+    pub fn validate(&self) -> Result<()> {
+        self.observed.validate()?;
+        self.held_resources.validate()?;
+        if !valid_id(&self.node_session_id)
+            || self.coordinator_epoch == 0
+            || self.held_resources.memory_bytes < self.observed.memory_limit_bytes
+        {
+            return Err(Error::Conflict);
+        }
+        if let Some(grant) = &self.authorization {
+            grant.validate()?;
+            if grant.request.source.identity != self.observed.identity
+                || (grant.request.source != self.observed
+                    && grant.request.completion()? != self.observed)
+                || self.held_resources.memory_bytes
+                    < grant
+                        .request
+                        .source
+                        .memory_limit_bytes
+                        .max(grant.request.target_limit_bytes)
+            {
+                return Err(Error::Conflict);
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,5 +301,47 @@ mod tests {
                 "sandboxd requires printable ASCII without whitespace: {id:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod ledger_tests {
+    use crate::{Error, ResourceLedger, Resources};
+    fn resources(memory_bytes: u64) -> Resources {
+        Resources {
+            cpu_millis: 500,
+            memory_bytes,
+            disk_bytes: 0,
+        }
+    }
+    #[test]
+    fn memory_hold_replacement_preserves_neighbor_and_allows_release_after_capacity_reduction() {
+        let mut ledger = ResourceLedger::new(Resources {
+            cpu_millis: 1000,
+            memory_bytes: 512,
+            disk_bytes: 0,
+        });
+        ledger.reserve("a", resources(128)).unwrap();
+        ledger.reserve("neighbor", resources(256)).unwrap();
+        assert_eq!(
+            ledger.replace("a", resources(1), resources(256)),
+            Err(Error::Conflict)
+        );
+        assert_eq!(
+            ledger.replace("a", resources(128), resources(300)),
+            Err(Error::NoCapacity)
+        );
+        assert_eq!(ledger.used().memory_bytes, 384);
+        ledger.replace("a", resources(128), resources(256)).unwrap();
+        ledger.set_capacity(Resources {
+            cpu_millis: 1000,
+            memory_bytes: 128,
+            disk_bytes: 0,
+        });
+        ledger.replace("a", resources(256), resources(128)).unwrap();
+        assert_eq!(ledger.reservation("neighbor"), Some(resources(256)));
+        assert_eq!(ledger.used().memory_bytes, 384);
+        ledger.release("a").unwrap();
+        assert_eq!(ledger.used(), resources(256));
     }
 }

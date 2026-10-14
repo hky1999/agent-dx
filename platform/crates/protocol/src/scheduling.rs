@@ -294,6 +294,7 @@ impl TryFrom<wire::RegisterNodeRequest> for model::Node {
             labels: v.labels.into_iter().collect(),
             devices: decode(v.devices)?,
             runtime_classes: v.runtime_classes,
+            memory_control_version: v.memory_control_version,
         };
         node.validate()?;
         Ok(node)

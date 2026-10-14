@@ -251,6 +251,7 @@ struct Inner {
     node_tls: RpcClient,
     timeout: Duration,
     heartbeat_timeout: Duration,
+    memory_policy: OnceLock<crate::storage::MemoryControlPolicy>,
 }
 
 struct PendingClaim {
@@ -432,6 +433,7 @@ impl CoordinatorRpc {
             node_tls: node_tls.into(),
             timeout,
             heartbeat_timeout,
+            memory_policy: OnceLock::new(),
         })))
     }
     /// Invalidate expired executions and their routes before admitting a returning node.
@@ -738,6 +740,15 @@ impl CoordinatorRpc {
         self.0.changed.notify_waiters();
         Ok(true)
     }
+    /// Configure once before serving requests. Policy omission leaves automatic dispatch disabled.
+    pub fn with_memory_policy(self, policy: crate::storage::MemoryControlPolicy) -> Result<Self> {
+        policy.validate()?;
+        self.0
+            .memory_policy
+            .set(policy)
+            .map_err(|_| Error::Conflict)?;
+        Ok(self)
+    }
     async fn commit(
         &self,
         record: EnvironmentRecord,
@@ -763,7 +774,21 @@ impl CoordinatorRpc {
         {
             return Err(Error::Conflict);
         }
+        let dynamic = state
+            .environments
+            .get(&record.spec.id)
+            .is_some_and(|env| env.memory.is_some());
         let accepted = state.session.commit(record).await?;
+        if dynamic {
+            if accepted.state == EnvironmentState::Deleted {
+                state.specs.remove(&accepted.spec.id);
+                state.scheduling_attempts.remove(&accepted.spec.id);
+            }
+            // Retirement and dynamic holds must be loaded from the same authority,
+            // not reconstructed from the lifecycle record's boolean alone.
+            state.needs_recovery = true;
+            state.recover_authoritative_state().await?;
+        }
         if accepted.state == EnvironmentState::Failed {
             let durable = state.session.get(&accepted.spec.id).await?;
             state.remember_environment(durable);
@@ -1357,6 +1382,60 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                 }))
             })
             .await
+    }
+    async fn reconcile_memory(
+        &self,
+        request: Request<pb::ReconcileMemoryRequest>,
+    ) -> std::result::Result<Response<pb::ReconcileMemoryResponse>, Status> {
+        let principal = self.0.peers.authenticate(&request)?;
+        let raw = request.into_inner();
+        let sample: adx_core::memory::MemorySample = raw
+            .sample
+            .ok_or_else(|| Status::invalid_argument("memory sample required"))?
+            .try_into()
+            .map_err(status)?;
+        if principal != Principal::Node(sample.observation.identity.assignment.node_id.clone()) {
+            return Err(Status::permission_denied(
+                "only owning node may report memory",
+            ));
+        }
+        let service = self.clone();
+        // A caller losing its reply does not cancel a persisted reservation.
+        tokio::spawn(async move {
+            let mut state = service.0.state.lock().await;
+            state.recover_authoritative_state().await.map_err(status)?;
+            state.healthy().map_err(status)?;
+            state
+                .live_claimant(
+                    &sample.observation.identity.assignment.node_id,
+                    &raw.node_session_id,
+                    service.0.heartbeat_timeout,
+                )
+                .map_err(status)?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| Status::unavailable("system clock before epoch"))?
+                .as_millis();
+            let now =
+                u64::try_from(now).map_err(|_| Status::unavailable("system clock overflow"))?;
+            state.needs_recovery = true;
+            let result = state
+                .session
+                .reconcile_memory(
+                    sample,
+                    &raw.node_session_id,
+                    now,
+                    service.0.memory_policy.get(),
+                )
+                .await;
+            state.recover_authoritative_state().await.map_err(status)?;
+            service.0.changed.notify_waiters();
+            Ok(Response::new(pb::ReconcileMemoryResponse {
+                decision: Some(result.map_err(status)?.try_into().map_err(status)?),
+            }))
+        })
+        .await
+        .map_err(|_| Status::internal("memory reconciliation task failed"))?
     }
     async fn authorize_execution(
         &self,

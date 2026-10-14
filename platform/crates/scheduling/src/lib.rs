@@ -126,6 +126,7 @@ impl Framework {
     /// builtin-looking names. Reverse hard anti-affinity also disables reuse.
     pub fn supports_aggregation(&self, request: &EnvironmentSpec, snapshot: &Snapshot) -> bool {
         self.builtin_profile
+            && request.sandbox.elastic_memory.is_none()
             && request.execution_resources().disk_bytes == 0
             && request.scheduling == Default::default()
             && !snapshot.has_reverse_anti_affinity()

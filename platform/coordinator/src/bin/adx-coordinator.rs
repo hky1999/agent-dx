@@ -36,6 +36,8 @@ struct Config {
     scheduler_shards: usize,
     #[serde(default)]
     host_budgets: Option<BTreeMap<String, HostBudget>>,
+    #[serde(default)]
+    memory_control: Option<adx_coordinator::storage::MemoryControlPolicy>,
     placement: String,
     rpc_timeout_seconds: u64,
     tls: TlsFiles,
@@ -120,6 +122,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Duration::from_secs(config.heartbeat_timeout_seconds),
     )
     .await?;
+    let rpc = match config.memory_control {
+        Some(policy) => rpc.with_memory_policy(policy)?,
+        None => rpc,
+    };
     let metrics_listener = match config.metrics_listen {
         Some(address) => Some(tokio::net::TcpListener::bind(address).await?),
         None => None,

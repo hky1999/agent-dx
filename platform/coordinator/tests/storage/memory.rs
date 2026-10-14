@@ -14,6 +14,7 @@ async fn fixture_with_elastic(
     let rig = common::Redis::new().await;
     let session = rig.store().await.begin(1).await.unwrap();
     let mut n = node("first");
+    n.memory_control_version = 1;
     n.capacity = Resources {
         cpu_millis: 2000,
         memory_bytes: 512 * MIB,
@@ -532,4 +533,468 @@ async fn memory_elastic_birth_and_recovery_reserve_different_bounds() {
     let scheduler = Coordinator::restore(&s.snapshot().await.unwrap(), Placement::Spread).unwrap();
     let (capacity, available) = scheduler.node_resources("first").unwrap();
     assert_eq!(capacity.memory_bytes - available.memory_bytes, 192 * MIB);
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn memory_current_node_session_settles_predecessor_grant_but_old_writer_is_fenced() {
+    let (_rig, s, _record, observation) = fixture().await;
+    s.initialize_memory(observation.clone(), "boot-first")
+        .await
+        .unwrap();
+    let grant = s
+        .authorize_memory(
+            request(&observation, "shrink-before-restart", 128),
+            "boot-first",
+            1000,
+        )
+        .await
+        .unwrap();
+    let saved = s.snapshot().await.unwrap().nodes["first"].clone();
+    s.register_session(
+        saved.node,
+        saved.address,
+        saved.proxy_address,
+        Some(NodeSession {
+            id: "boot-new".into(),
+            sequence: 1,
+            routable: true,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        s.complete_memory(grant.clone(), completed(&grant), "boot-first")
+            .await,
+        Err(Error::Conflict)
+    );
+    assert_eq!(held(&s).await, 256 * MIB);
+    s.complete_memory(grant.clone(), completed(&grant), "boot-new")
+        .await
+        .unwrap();
+    assert_eq!(held(&s).await, 128 * MIB);
+    s.complete_memory(grant.clone(), completed(&grant), "boot-new")
+        .await
+        .unwrap();
+    assert!(grant.check_dispatch(1001, "boot-new", s.epoch()).is_err());
+}
+
+fn sample(
+    observation: &MemoryObservation,
+    usage_mib: u64,
+    now: u64,
+) -> adx_core::memory::MemorySample {
+    adx_core::memory::MemorySample {
+        observation: observation.clone(),
+        usage_bytes: usage_mib * MIB,
+        peak_bytes: None,
+        cpu_usage_ns: None,
+        pressure: None,
+        observed_unix_millis: now,
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn memory_control_automatically_grows_then_shrinks_only_after_sustained_low_usage() {
+    let (_rig, s, _record, mut observation) = fixture_with_elastic(true).await;
+    observation.memory_limit_bytes = 128 * MIB;
+    observation.memory_high_bytes = 96 * MIB;
+    let policy = adx_coordinator::storage::MemoryControlPolicy::default();
+    let growth = s
+        .reconcile_memory(
+            sample(&observation, 112, 1000),
+            "boot-first",
+            1000,
+            Some(&policy),
+        )
+        .await
+        .unwrap();
+    let grant = growth.authorization.unwrap();
+    assert_eq!(grant.request.target_limit_bytes, 224 * MIB);
+    assert_eq!(growth.held_resources.memory_bytes, 224 * MIB);
+    assert_eq!(held(&s).await, 224 * MIB, "reserve before dispatch");
+    let replay = s
+        .reconcile_memory(
+            sample(&observation, 112, 1100),
+            "boot-first",
+            1100,
+            Some(&policy),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.authorization, Some(grant.clone()));
+    observation = grant.request.completion().unwrap();
+    for now in [7000, 17000, 27000, 37000] {
+        let reply = s
+            .reconcile_memory(
+                sample(&observation, 16, now),
+                "boot-first",
+                now,
+                Some(&policy),
+            )
+            .await
+            .unwrap();
+        assert!(
+            reply.authorization.is_none(),
+            "need five distinct low observations"
+        );
+        assert_eq!(held(&s).await, 224 * MIB);
+    }
+    // Replayed samples cannot advance the low-usage window.
+    for _ in 0..8 {
+        assert!(s
+            .reconcile_memory(
+                sample(&observation, 16, 37000),
+                "boot-first",
+                37000,
+                Some(&policy)
+            )
+            .await
+            .unwrap()
+            .authorization
+            .is_none());
+    }
+    let shrink = s
+        .reconcile_memory(
+            sample(&observation, 16, 47000),
+            "boot-first",
+            47000,
+            Some(&policy),
+        )
+        .await
+        .unwrap()
+        .authorization
+        .unwrap();
+    assert_eq!(shrink.request.target_limit_bytes, 128 * MIB);
+    assert_eq!(
+        held(&s).await,
+        224 * MIB,
+        "proposal does not return physical budget"
+    );
+    let mut frozen = shrink.request.completion().unwrap();
+    frozen.frozen = true;
+    assert!(s
+        .reconcile_memory(
+            sample(&frozen, 16, 47001),
+            "boot-first",
+            47001,
+            Some(&policy)
+        )
+        .await
+        .is_err());
+    assert_eq!(held(&s).await, 224 * MIB);
+    let done = s
+        .reconcile_memory(
+            sample(&shrink.request.completion().unwrap(), 16, 47002),
+            "boot-first",
+            47002,
+            Some(&policy),
+        )
+        .await
+        .unwrap();
+    assert!(done.authorization.is_none());
+    assert_eq!(held(&s).await, 128 * MIB);
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn memory_control_rejects_stale_foreign_and_changed_samples_and_keeps_expired_hold() {
+    let (rig, s, _record, mut observation) = fixture_with_elastic(true).await;
+    observation.memory_limit_bytes = 128 * MIB;
+    observation.memory_high_bytes = 96 * MIB;
+    let policy = adx_coordinator::storage::MemoryControlPolicy::default();
+    assert!(s
+        .reconcile_memory(
+            sample(&observation, 112, 1001),
+            "boot-first",
+            1000,
+            Some(&policy)
+        )
+        .await
+        .is_err());
+    assert!(s
+        .reconcile_memory(
+            sample(&observation, 112, 1000),
+            "boot-first",
+            20000,
+            Some(&policy)
+        )
+        .await
+        .is_err());
+    assert!(s
+        .reconcile_memory(
+            sample(&observation, 112, 1000),
+            "wrong-session",
+            1000,
+            Some(&policy)
+        )
+        .await
+        .is_err());
+    let grant = s
+        .reconcile_memory(
+            sample(&observation, 112, 1000),
+            "boot-first",
+            1000,
+            Some(&policy),
+        )
+        .await
+        .unwrap()
+        .authorization
+        .unwrap();
+    let renewed = rig.store().await.begin(1).await.unwrap();
+    let reply = renewed
+        .reconcile_memory(
+            sample(&observation, 112, 90000),
+            "boot-first",
+            90000,
+            Some(&policy),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply.authorization, Some(grant.clone()));
+    assert!(grant
+        .check_dispatch(90000, "boot-first", reply.coordinator_epoch)
+        .is_err());
+    assert_eq!(held(&renewed).await, 224 * MIB);
+    let mut foreign = grant.request.completion().unwrap();
+    foreign.identity.resource_generation = "other".into();
+    assert!(renewed
+        .reconcile_memory(
+            sample(&foreign, 16, 90001),
+            "boot-first",
+            90001,
+            Some(&policy)
+        )
+        .await
+        .is_err());
+    assert_eq!(held(&renewed).await, 224 * MIB);
+    renewed
+        .reconcile_memory(
+            sample(&grant.request.completion().unwrap(), 16, 90002),
+            "boot-first",
+            90002,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(renewed
+        .get("a")
+        .await
+        .unwrap()
+        .memory
+        .unwrap()
+        .pending
+        .is_none());
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn memory_control_disabled_policy_observes_without_dispatch_and_pressure_does_not_authorize()
+{
+    let (_rig, s, _record, mut observation) = fixture_with_elastic(true).await;
+    observation.memory_limit_bytes = 128 * MIB;
+    observation.memory_high_bytes = 96 * MIB;
+    assert!(s
+        .reconcile_memory(sample(&observation, 112, 1000), "boot-first", 1000, None)
+        .await
+        .unwrap()
+        .authorization
+        .is_none());
+    let mut pressure = sample(&observation, 32, 2000);
+    pressure.pressure = Some(adx_core::memory::MemoryPressure {
+        high_events: 9999,
+        oom_events: 1,
+        oom_kill_events: 0,
+    });
+    assert!(s
+        .reconcile_memory(
+            pressure,
+            "boot-first",
+            2000,
+            Some(&adx_coordinator::storage::MemoryControlPolicy::default())
+        )
+        .await
+        .unwrap()
+        .authorization
+        .is_none());
+    assert_eq!(held(&s).await, 128 * MIB);
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn memory_control_growth_defers_when_neighbor_owns_capacity_without_changing_either_hold() {
+    let (_rig, s, _, mut observation) = fixture_with_elastic(true).await;
+    observation.memory_limit_bytes = 128 * MIB;
+    observation.memory_high_bytes = 96 * MIB;
+    let mut neighbor = spec("neighbor");
+    neighbor.resources.cpu_millis = 500;
+    neighbor.resources.memory_bytes = 384 * MIB;
+    let assignment = Assignment {
+        environment_id: "neighbor".into(),
+        node_id: "first".into(),
+        shard_id: 0,
+        generation: 2,
+        devices: vec![],
+    };
+    s.reserve(neighbor.clone(), assignment.clone())
+        .await
+        .unwrap();
+    let before = s.get("neighbor").await.unwrap();
+    let result = s
+        .reconcile_memory(
+            sample(&observation, 112, 1000),
+            "boot-first",
+            1000,
+            Some(&adx_coordinator::storage::MemoryControlPolicy::default()),
+        )
+        .await
+        .unwrap();
+    assert!(result.authorization.is_none());
+    assert_eq!(result.held_resources.memory_bytes, 128 * MIB);
+    assert_eq!(held(&s).await, 512 * MIB);
+    assert_eq!(s.get("neighbor").await.unwrap(), before);
+    assert!(s.get("a").await.unwrap().memory.unwrap().pending.is_none());
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn memory_control_rejects_elastic_admission_to_old_node_even_with_spoofed_label() {
+    let (_rig, s, mut record, _) = fixture_with_elastic(true).await;
+    let saved = s.snapshot().await.unwrap().nodes["first"].clone();
+    let mut old = saved.node;
+    old.memory_control_version = 0;
+    old.labels
+        .insert("memory_control_version".into(), "1".into());
+    s.register_session(old, saved.address, saved.proxy_address, saved.session)
+        .await
+        .unwrap();
+    record.spec.id = "old-node-attempt".into();
+    record.assignment.environment_id = record.spec.id.clone();
+    record.assignment.generation = 2;
+    assert_eq!(
+        s.reserve(record.spec, record.assignment).await,
+        Err(Error::Conflict)
+    );
+    assert_eq!(held(&s).await, 128 * MIB);
+    assert_eq!(s.get("old-node-attempt").await, Err(Error::NotFound));
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn memory_control_low_window_survives_center_restart_but_observation_gap_resets_it() {
+    let (rig, s, _, mut observation) = fixture_with_elastic(true).await;
+    observation.memory_limit_bytes = 128 * MIB;
+    observation.memory_high_bytes = 96 * MIB;
+    let policy = adx_coordinator::storage::MemoryControlPolicy::default();
+    let grow = s
+        .reconcile_memory(
+            sample(&observation, 112, 1000),
+            "boot-first",
+            1000,
+            Some(&policy),
+        )
+        .await
+        .unwrap()
+        .authorization
+        .unwrap();
+    observation = grow.request.completion().unwrap();
+    for now in [7000, 17000, 27000] {
+        assert!(s
+            .reconcile_memory(
+                sample(&observation, 16, now),
+                "boot-first",
+                now,
+                Some(&policy)
+            )
+            .await
+            .unwrap()
+            .authorization
+            .is_none());
+    }
+    let renewed = rig.store().await.begin(1).await.unwrap();
+    // A missed observation window cannot be interpreted as continuous low usage.
+    for now in [50000, 60000, 70000, 80000] {
+        assert!(renewed
+            .reconcile_memory(
+                sample(&observation, 16, now),
+                "boot-first",
+                now,
+                Some(&policy)
+            )
+            .await
+            .unwrap()
+            .authorization
+            .is_none());
+    }
+    assert!(renewed
+        .reconcile_memory(
+            sample(&observation, 16, 90000),
+            "boot-first",
+            90000,
+            Some(&policy)
+        )
+        .await
+        .unwrap()
+        .authorization
+        .is_some());
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn memory_control_frequent_samples_count_distinct_seconds_and_window_survives_restart() {
+    let (rig, s, _, mut observation) = fixture_with_elastic(true).await;
+    observation.memory_limit_bytes = 128 * MIB;
+    observation.memory_high_bytes = 96 * MIB;
+    let policy = adx_coordinator::storage::MemoryControlPolicy::default();
+    let grow = s
+        .reconcile_memory(
+            sample(&observation, 112, 1000),
+            "boot-first",
+            1000,
+            Some(&policy),
+        )
+        .await
+        .unwrap()
+        .authorization
+        .unwrap();
+    observation = grow.request.completion().unwrap();
+    for now in (7000..27000).step_by(100) {
+        assert!(s
+            .reconcile_memory(
+                sample(&observation, 16, now),
+                "boot-first",
+                now,
+                Some(&policy)
+            )
+            .await
+            .unwrap()
+            .authorization
+            .is_none());
+    }
+    let renewed = rig.store().await.begin(1).await.unwrap();
+    for now in (27000..37000).step_by(100) {
+        assert!(renewed
+            .reconcile_memory(
+                sample(&observation, 16, now),
+                "boot-first",
+                now,
+                Some(&policy)
+            )
+            .await
+            .unwrap()
+            .authorization
+            .is_none());
+    }
+    assert!(renewed
+        .reconcile_memory(
+            sample(&observation, 16, 37000),
+            "boot-first",
+            37000,
+            Some(&policy)
+        )
+        .await
+        .unwrap()
+        .authorization
+        .is_some());
 }

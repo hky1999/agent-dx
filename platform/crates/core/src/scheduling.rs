@@ -40,6 +40,8 @@ pub struct Node {
     /// Runtime classes reported by the local sandboxd service.
     #[serde(default)]
     pub runtime_classes: Vec<String>,
+    #[serde(default)]
+    pub memory_control_version: u32,
 }
 impl Node {
     pub fn validate(&self) -> Result<()> {

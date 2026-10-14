@@ -256,6 +256,14 @@ pub trait Routes: Send + Sync {
 
 #[async_trait]
 pub trait StateSink: Send + Sync {
+    /// Requires current authenticated Coordinator authority; never falls back to local journaling.
+    async fn reconcile_memory(
+        &self,
+        _sample: &adx_core::memory::MemorySample,
+    ) -> Result<adx_core::memory::MemoryDecision> {
+        Err(Error::Unavailable("memory control is unsupported".into()))
+    }
+
     /// Requires a Coordinator-persisted reservation before any replacement execution.
     /// Local result journaling is never sufficient authority to start a runtime.
     async fn authorize_execution(
@@ -280,6 +288,29 @@ pub(crate) struct Admission {
 }
 
 impl Admission {
+    fn memory_hold(&mut self, record: &EnvironmentRecord, target: Resources) -> Result<()> {
+        let ceiling = record.spec.execution_ceiling();
+        if target.cpu_millis != ceiling.cpu_millis
+            || target.disk_bytes != ceiling.disk_bytes
+            || target.memory_bytes < record.spec.resources.memory_bytes
+            || target.memory_bytes > ceiling.memory_bytes
+        {
+            return Err(Error::Conflict);
+        }
+        let previous = self
+            .ledger
+            .reservation(&record.runtime.id)
+            .ok_or(Error::Conflict)?;
+        if target.memory_bytes > previous.memory_bytes
+            && (self.maintenance
+                || self.pressure
+                || self.valid_until.is_none_or(|until| Instant::now() >= until))
+        {
+            return Err(Error::NoCapacity);
+        }
+        self.ledger.replace(&record.runtime.id, previous, target)
+    }
+
     fn reserve(&mut self, id: &str, spec: &EnvironmentSpec, assignment: &Assignment) -> Result<()> {
         self.reserve_resources(id, spec, assignment, spec.execution_resources())
     }

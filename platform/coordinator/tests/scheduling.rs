@@ -28,6 +28,7 @@ fn spec(id: &str, tenant: &str, priority: i32) -> EnvironmentSpec {
 
 fn node(id: &str, capacity: u64) -> Node {
     Node {
+        memory_control_version: 0,
         runtime_classes: vec![
             "runsc".into(),
             "runc".into(),

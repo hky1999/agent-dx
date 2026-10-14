@@ -136,6 +136,7 @@ fn unknown_enums_missing_selectors_and_duplicate_cards_are_rejected() {
 #[test]
 fn registration_preserves_inventory_and_labels() {
     let node = Node::try_from(wire::RegisterNodeRequest {
+        memory_control_version: 0,
         runtime_classes: vec![
             "runsc".into(),
             "runc".into(),

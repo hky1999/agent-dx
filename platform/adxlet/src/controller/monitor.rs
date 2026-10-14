@@ -67,6 +67,7 @@ impl Controller {
                     }
                 }
             }
+            self.adjust_memory().await?;
             if self.record.spec.lifecycle.idle_timeout_seconds == 0 {
                 return Ok(());
             }

@@ -24,6 +24,7 @@ fn request(id: &str, tenant: &str) -> EnvironmentSpec {
 }
 fn node(available: bool) -> Node {
     Node {
+        memory_control_version: 0,
         runtime_classes: vec![
             "runsc".into(),
             "runc".into(),

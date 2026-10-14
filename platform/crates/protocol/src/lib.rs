@@ -1,5 +1,6 @@
 //! Generated transport contracts and validated conversions, without services.
 mod execution;
+mod memory;
 mod runtime_profile;
 mod snapshots;
 pub mod control {

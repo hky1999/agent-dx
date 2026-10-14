@@ -85,6 +85,7 @@ async fn network_create_preserves_tenant_session_and_api_key_checks() {
             .unwrap();
     }));
     let mut register = pb::RegisterNodeRequest {
+        memory_control_version: 0,
         runtime_classes: vec![
             "runsc".into(),
             "runc".into(),

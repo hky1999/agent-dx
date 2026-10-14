@@ -116,6 +116,7 @@ async fn host_budget_rpc_rejects_before_execution_and_recovers_after_release() {
     );
     let mut report = pb::RegisterNodeRequest {
         runtime_classes: vec![spec("capacity").runtime_class],
+        memory_control_version: 0,
         node_id: "node".into(),
         node_address: node_address.to_string(),
         proxy_address: "127.0.0.1:9999".into(),

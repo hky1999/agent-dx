@@ -24,6 +24,8 @@ service CoordinatorService {
   rpc CommitEnvironment(CommitEnvironmentRequest) returns (CommitEnvironmentResponse);
   // Reserves a replacement execution before the node performs physical work.
   rpc AuthorizeExecution(AuthorizeExecutionRequest) returns (AuthorizeExecutionResponse);
+  // Reports exact physical state and obtains the center's durable memory decision.
+  rpc ReconcileMemory(ReconcileMemoryRequest) returns (ReconcileMemoryResponse);
 }
 
 service NodeService {
@@ -59,6 +61,7 @@ message RegisterNodeRequest {
   string session_id = 8; // Unique for one Adxlet process lifetime.
   uint64 heartbeat_sequence = 9;
   bool reconciling = 10;
+  uint32 memory_control_version = 12; // Version 1 supports elastic birth and conditional memory control.
   repeated string runtime_classes = 11; // Available classes discovered through sandboxd's UDS.
 
 }
@@ -201,3 +204,64 @@ message ExecutionAuthorization {
 }
 message AuthorizeExecutionRequest { ExecutionRequest execution = 1; string node_session_id = 2; }
 message AuthorizeExecutionResponse { ExecutionAuthorization authorization = 1; }
+
+message MemoryIdentity {
+  Assignment assignment = 1;
+  string runtime_id = 2;
+  string sandbox_id = 3;
+  string resource_generation = 4;
+}
+
+message MemoryObservation {
+  MemoryIdentity identity = 1;
+  uint64 cpu_quota_usec = 2;
+  uint64 cpu_period_usec = 3;
+  uint64 memory_limit_bytes = 4;
+  uint64 memory_high_bytes = 5;
+  uint64 resource_revision = 6;
+  string operation_id = 7;
+  bool operation_pending = 8;
+  bool frozen = 9;
+}
+
+message MemoryRequest {
+  MemoryObservation source = 1;
+  uint64 target_limit_bytes = 2;
+  uint64 target_high_bytes = 3;
+  string operation_id = 4;
+  uint64 timeout_millis = 5;
+}
+
+message MemoryAuthorization {
+  MemoryRequest request = 1;
+  string node_session_id = 2;
+  uint64 coordinator_epoch = 3;
+  uint64 issued_unix_millis = 4;
+  uint64 deadline_unix_millis = 5;
+}
+
+message MemoryPressure {
+  uint64 high_events = 1;
+  uint64 oom_events = 2;
+  uint64 oom_kill_events = 3;
+}
+
+message MemorySample {
+  MemoryObservation observation = 1;
+  uint64 usage_bytes = 2;
+  optional uint64 peak_bytes = 3;
+  optional uint64 cpu_usage_ns = 4;
+  MemoryPressure pressure = 5;
+  uint64 observed_unix_millis = 6;
+}
+
+message MemoryDecision {
+  MemoryObservation observed = 1;
+  Resources held_resources = 2;
+  MemoryAuthorization authorization = 3;
+  string node_session_id = 4;
+  uint64 coordinator_epoch = 5;
+}
+
+message ReconcileMemoryRequest { MemorySample sample = 1; string node_session_id = 2; }
+message ReconcileMemoryResponse { MemoryDecision decision = 1; }

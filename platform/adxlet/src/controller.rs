@@ -9,6 +9,7 @@ use tokio::time::timeout;
 
 mod execution;
 mod lifecycle;
+mod memory;
 mod monitor;
 mod snapshots;
 mod workload_checkpoint;

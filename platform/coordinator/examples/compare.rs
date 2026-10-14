@@ -10,6 +10,7 @@ use std::{
 const NODES: usize = 1000;
 fn node(i: usize, capacity: u64, revision: usize) -> Node {
     Node {
+        memory_control_version: 0,
         runtime_classes: vec![
             "runsc".into(),
             "runc".into(),

@@ -10,7 +10,7 @@ mod execution;
 mod failure;
 pub use execution::StoredExecution;
 mod memory;
-pub use memory::{StoredMemory, StoredMemoryOperation};
+pub use memory::{MemoryControlPolicy, StoredMemory, StoredMemoryOperation};
 mod recovery;
 mod snapshots;
 use crate::Node;
@@ -79,7 +79,7 @@ impl Header {
     fn validate(&self) -> Result<()> {
         if !matches!(
             (self.schema, self.host_budgets.is_some()),
-            (1, false) | (2, true) | (3, _) | (4, true)
+            (1, false) | (2, true) | (3, _) | (4, true) | (5, true)
         ) || self.shards == 0
             || self.next_node_shard >= self.shards
             || self.epoch == 0

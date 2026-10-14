@@ -199,6 +199,27 @@ impl JournalSink {
 
 #[async_trait]
 impl StateSink for JournalSink {
+    async fn reconcile_memory(
+        &self,
+        sample: &adx_core::memory::MemorySample,
+    ) -> Result<adx_core::memory::MemoryDecision> {
+        let ready = self.ready.read().await;
+        if !*ready {
+            return Err(unavailable("authoritative recovery required"));
+        }
+        let id = &sample.observation.identity.assignment.environment_id;
+        let serial = self
+            .environments
+            .lock()
+            .await
+            .entry(id.clone())
+            .or_default()
+            .clone();
+        let _serial = serial.lock().await;
+        self.publish(self.entries(Some(id.clone())).await?).await?;
+        self.upstream.reconcile_memory(sample).await
+    }
+
     async fn authorize_execution(
         &self,
         request: &adx_core::execution::ExecutionRequest,

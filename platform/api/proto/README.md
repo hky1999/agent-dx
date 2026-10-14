@@ -119,4 +119,11 @@ and credentials do not transfer Environment lifecycle ownership to Coordinator.
 
 ## 显式弹性内存
 
-`SandboxOptions.elastic_memory` 使用 `ElasticMemoryPolicy.high_per_mille` 保存期望的软节流比例。仅支持 runsc 的普通创建，请求内存是出生额度和下限，`limits.memory_bytes` 是允许上限，两者须为整数 MiB。固定配置省略该字段；CPU 和磁盘规则不变。快照克隆暂不支持，公开 HTTP 和 Python SDK 尚未暴露此选项。此协议字段与 sandboxd 出生标签已接通，资源调整 RPC、节点额度同步和自动策略仍待实现，详见[节点资源契约](../../../docs/testing/node-lifecycle.md)。
+`SandboxOptions.elastic_memory` 使用 `ElasticMemoryPolicy.high_per_mille` 保存期望的软节流比例。仅支持 runsc 的普通创建，请求内存是出生额度和下限，`limits.memory_bytes` 是允许上限，两者须为整数 MiB。固定配置省略该字段；CPU 和磁盘规则不变。快照克隆暂不支持，公开 HTTP 和 Python SDK 尚未暴露此选项。此协议字段与 sandboxd 出生标签、ReconcileMemory RPC 和节点额度同步已接通，自动策略须显式配置启用，物理闭环待验收，详见[节点资源契约](../../../docs/testing/node-lifecycle.md)。
+
+
+`RegisterNodeRequest.memory_control_version` 为独立能力版本，只有 1 支持弹性内存。
+`ReconcileMemoryRequest` 携带类型化的 `MemorySample` 与节点会话；响应 `MemoryDecision`
+绑定原观察、当前中心 epoch／节点会话、持久占用和可选原授权。调用方必须核对绑定关系，
+并在物理派发前检查授权原期限与当前身份。资源不足可以返回没有新授权的当前账户；
+鉴权失败、旧会话和错误物理身份不能改变原占用。

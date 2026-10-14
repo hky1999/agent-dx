@@ -7,6 +7,8 @@ mod host_budget_configuration;
 mod host_budget_rejection;
 #[path = "rpc/host_budget_view.rs"]
 mod host_budget_view;
+#[path = "rpc/memory_control.rs"]
+mod memory_control;
 use adx_coordinator::{routes::RoutePublisher, rpc::CoordinatorRpc, storage::Session, Placement};
 use adx_core::{
     scheduling::DeviceAllocation, EnvironmentRecord, EnvironmentSpec, Resources, Result,
@@ -381,6 +383,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     let mut node_coordinator =
         pb::coordinator_service_client::CoordinatorServiceClient::new(channel(ma, "node").await);
     let mut register = pb::RegisterNodeRequest {
+        memory_control_version: 0,
         runtime_classes: vec![
             "runsc".into(),
             "runc".into(),
@@ -1253,6 +1256,7 @@ async fn node_restart_before_expiry_requires_new_session_at_registered_endpoint(
     let mut report = pb::RegisterNodeRequest {
         node_id: "node".into(),
         runtime_classes: vec!["runc".into()],
+        memory_control_version: 0,
         node_address: na.to_string(),
         proxy_address: "127.0.0.1:9999".into(),
         capacity: Some(spec("held").resources.into()),
@@ -1639,6 +1643,7 @@ async fn published_routes_drive_real_gateway_streams_and_reconnect_to_new_coordi
     session
         .register(
             adx_coordinator::Node {
+                memory_control_version: 0,
                 runtime_classes: vec![
                     "runsc".into(),
                     "runc".into(),
@@ -2223,6 +2228,7 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
     let mut client =
         pb::coordinator_service_client::CoordinatorServiceClient::new(channel(ma, "node").await);
     let mut report = pb::RegisterNodeRequest {
+        memory_control_version: 0,
         runtime_classes: vec![
             "runsc".into(),
             "runc".into(),
@@ -2707,6 +2713,7 @@ async fn shared_checkpoint_recovers_only_after_source_cleanup_and_keeps_artifact
         ..Default::default()
     };
     let mut target_report = pb::RegisterNodeRequest {
+        memory_control_version: 0,
         runtime_classes: vec![
             "runsc".into(),
             "runc".into(),
