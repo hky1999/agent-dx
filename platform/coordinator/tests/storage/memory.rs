@@ -998,3 +998,165 @@ async fn memory_control_frequent_samples_count_distinct_seconds_and_window_survi
         .authorization
         .is_some());
 }
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn memory_control_settles_fenced_unchanged_growth_and_can_authorize_again() {
+    let (rig, s, _record, mut birth) = fixture_with_elastic(true).await;
+    birth.memory_limit_bytes = 128 * MIB;
+    birth.memory_high_bytes = 96 * MIB;
+    let policy = adx_coordinator::storage::MemoryControlPolicy::default();
+    let first = s
+        .reconcile_memory(sample(&birth, 112, 1000), "boot-first", 1000, Some(&policy))
+        .await
+        .unwrap();
+    let grant = first.authorization.unwrap();
+    assert_eq!(held(&s).await, 224 * MIB);
+    // Expiry and identical old numbers cannot release an unclosed reservation.
+    let pending = s
+        .reconcile_memory(sample(&birth, 16, 12000), "boot-first", 12000, None)
+        .await
+        .unwrap();
+    assert_eq!(pending.authorization, Some(grant.clone()));
+    assert_eq!(held(&s).await, 224 * MIB);
+    // The daemon has consumed the original revision and closed this operation,
+    // independently proving unchanged, unfrozen physical limits.
+    let mut unchanged = birth.clone();
+    unchanged.resource_revision += 1;
+    unchanged.operation_id = grant.request.operation_id.clone();
+    let settled = s
+        .reconcile_memory(sample(&unchanged, 16, 12001), "boot-first", 12001, None)
+        .await
+        .expect("closed unchanged result must end the pending operation");
+    assert!(settled.authorization.is_none());
+    assert_eq!(held(&s).await, 128 * MIB);
+    let restarted = rig.store().await.begin(1).await.unwrap();
+    let replay = restarted
+        .reconcile_memory(sample(&unchanged, 16, 13000), "boot-first", 13000, None)
+        .await
+        .unwrap();
+    assert!(replay.authorization.is_none());
+    assert_eq!(held(&restarted).await, 128 * MIB);
+    let next = restarted
+        .reconcile_memory(
+            sample(&unchanged, 112, 20000),
+            "boot-first",
+            20000,
+            Some(&policy),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        next.authorization.unwrap().request.operation_id,
+        grant.request.operation_id
+    );
+    assert_eq!(held(&restarted).await, 224 * MIB);
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn memory_control_unchanged_shrink_preserves_budget_and_cannot_replay_target_success() {
+    let (rig, s, _, mut birth) = fixture_with_elastic(true).await;
+    birth.memory_limit_bytes = 128 * MIB;
+    birth.memory_high_bytes = 96 * MIB;
+    s.reconcile_memory(sample(&birth, 32, 1000), "boot-first", 1000, None)
+        .await
+        .unwrap();
+    let grow = s
+        .authorize_memory(
+            request(&birth, "grow-before-failed-shrink", 256),
+            "boot-first",
+            2000,
+        )
+        .await
+        .unwrap();
+    s.complete_memory(grow.clone(), completed(&grow), "boot-first")
+        .await
+        .unwrap();
+    let shrink = s
+        .authorize_memory(
+            request(&completed(&grow), "unchanged-shrink", 128),
+            "boot-first",
+            4000,
+        )
+        .await
+        .unwrap();
+    let actual = shrink.request.unchanged().unwrap();
+    let decision = s
+        .reconcile_memory(sample(&actual, 32, 6000), "boot-first", 6000, None)
+        .await
+        .unwrap();
+    assert!(decision.authorization.is_none());
+    assert_eq!(
+        held(&s).await,
+        256 * MIB,
+        "unchanged shrink cannot return any bytes"
+    );
+    assert_eq!(
+        s.complete_memory(shrink.clone(), completed(&shrink), "boot-first")
+            .await,
+        Err(Error::Conflict)
+    );
+    let reopened = rig.store().await.begin(1).await.unwrap();
+    let stored = reopened.get("a").await.unwrap().memory.unwrap();
+    assert!(stored.completed["unchanged-shrink"].unchanged);
+    assert!(stored.pending.is_none());
+    assert_eq!(held(&reopened).await, 256 * MIB);
+    assert_eq!(
+        reopened
+            .complete_memory(shrink.clone(), completed(&shrink), "boot-first")
+            .await,
+        Err(Error::Conflict)
+    );
+}
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn memory_control_rejects_incomplete_unchanged_proof_without_affecting_neighbor() {
+    let (_rig, s, record, mut birth) = fixture_with_elastic(true).await;
+    birth.memory_limit_bytes = 128 * MIB;
+    birth.memory_high_bytes = 96 * MIB;
+    s.reconcile_memory(sample(&birth, 32, 1000), "boot-first", 1000, None)
+        .await
+        .unwrap();
+    let mut neighbor = record.spec.clone();
+    neighbor.id = "neighbor".into();
+    let mut placement = record.assignment.clone();
+    placement.environment_id = neighbor.id.clone();
+    placement.generation = 2;
+    s.reserve(neighbor, placement).await.unwrap();
+    let before = s.get("neighbor").await.unwrap();
+    let grow = s
+        .authorize_memory(request(&birth, "unknown-growth", 256), "boot-first", 2000)
+        .await
+        .unwrap();
+    assert_eq!(held(&s).await, 384 * MIB);
+    let unchanged = grow.request.unchanged().unwrap();
+    for case in 0..8 {
+        let mut actual = unchanged.clone();
+        match case {
+            0 => actual.resource_revision -= 1,
+            1 => actual.resource_revision += 1,
+            2 => actual.operation_id = "foreign".into(),
+            3 => actual.operation_pending = true,
+            4 => actual.frozen = true,
+            5 => actual.identity.resource_generation = "foreign".into(),
+            6 => actual.memory_high_bytes = 192 * MIB,
+            _ => actual.cpu_quota_usec += 1000,
+        }
+        assert!(
+            s.reconcile_memory(sample(&actual, 32, 4000), "boot-first", 4000, None)
+                .await
+                .is_err(),
+            "case {case}"
+        );
+        assert_eq!(held(&s).await, 384 * MIB);
+        assert_eq!(s.get("neighbor").await.unwrap(), before);
+    }
+    for now in [4000, 4001] {
+        s.reconcile_memory(sample(&unchanged, 32, now), "boot-first", now, None)
+            .await
+            .unwrap();
+        assert_eq!(held(&s).await, 256 * MIB);
+        assert_eq!(s.get("neighbor").await.unwrap(), before);
+    }
+}

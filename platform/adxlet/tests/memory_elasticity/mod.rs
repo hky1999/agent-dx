@@ -74,6 +74,7 @@ use adx_core::memory::{MemoryAuthorization, MemoryRequest};
 pub(super) struct MemoryServer {
     pub stats: Arc<Mutex<Option<StatsResponse>>>,
     pub grows: Arc<Mutex<Vec<ResizeResourcesRequest>>>,
+    pub resolutions: Arc<Mutex<Vec<ResolveResourceOperationRequest>>>,
     pub shrinks: Arc<Mutex<Vec<ShrinkResourcesRequest>>>,
     pub reply: Arc<Mutex<Option<ResizeResourcesResponse>>>,
     pub after_reply: Arc<Mutex<Option<StatsResponse>>>,
@@ -86,6 +87,7 @@ impl Default for MemoryServer {
         Self {
             stats: Arc::default(),
             grows: Arc::default(),
+            resolutions: Arc::default(),
             shrinks: Arc::default(),
             reply: Arc::default(),
             after_reply: Arc::default(),
@@ -96,6 +98,61 @@ impl Default for MemoryServer {
     }
 }
 impl MemoryServer {
+    pub(super) fn resolve(
+        &self,
+        request: ResolveResourceOperationRequest,
+    ) -> Result<Response<ResizeResourcesResponse>, Box<Status>> {
+        self.resolutions.lock().unwrap().push(request.clone());
+        let original = request
+            .original
+            .ok_or_else(|| Status::invalid_argument("original request required"))?;
+        let mut state = self.stats.lock().unwrap();
+        let actual = state.as_mut().unwrap();
+        if original.resource_generation != actual.resource_generation
+            || actual.resource_operation_pending
+            || actual.frozen
+        {
+            return Err(Box::new(Status::failed_precondition(
+                "unresolved physical state",
+            )));
+        }
+        if actual.resource_revision == original.expected_revision {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+            if original.deadline_unix_ms > now {
+                return Err(Box::new(Status::failed_precondition(
+                    "original command has not expired",
+                )));
+            }
+            let expected = original.expected.unwrap();
+            assert_eq!(expected.memory_limit_bytes, actual.memory_limit_bytes);
+            actual.resource_revision += 1;
+            actual.resource_operation_id = original.operation_id.clone();
+        } else if actual.resource_revision != original.expected_revision + 1
+            || actual.resource_operation_id != original.operation_id
+        {
+            return Err(Box::new(Status::failed_precondition("foreign operation")));
+        }
+        if self.lose_reply {
+            return Err(Box::new(Status::unavailable("resolution reply lost")));
+        }
+        let reply = self
+            .reply
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or(ResizeResourcesResponse {
+                actual: Some(actual.clone()),
+                complete: actual.memory_limit_bytes == original.target.unwrap().memory_limit_bytes,
+                update_error: String::new(),
+            });
+        if let Some(changed) = self.after_reply.lock().unwrap().clone() {
+            *actual = changed;
+        }
+        Ok(Response::new(reply))
+    }
     pub async fn apply(
         &self,
         target: ResourceLimits,
@@ -526,4 +583,136 @@ async fn physical_memory_success_reply_cannot_replace_independent_readback() {
         );
         assert_eq!(memory.grows.lock().unwrap().len(), 1);
     }
+}
+
+fn expired_grant(sample: &adx_core::memory::MemorySample, target: u64) -> MemoryAuthorization {
+    let mut value = grant(sample, target);
+    value.issued_unix_millis = 1;
+    value.deadline_unix_millis = 1 + value.request.timeout_millis;
+    value
+}
+#[tokio::test]
+async fn physical_memory_resolution_fences_expired_request_and_reopens_journal_without_mutation() {
+    let memory = MemoryServer::default();
+    *memory.stats.lock().unwrap() = Some(physical_stats());
+    let (adapter, harness, record) = memory_fixture(memory.clone()).await;
+    let request = expired_grant(&adapter.observe_memory(&record).await.unwrap(), 256 * MIB);
+    let actual = adapter.resolve_memory(&record, &request).await.unwrap();
+    assert_eq!(actual.observation, request.request.unchanged().unwrap());
+    let wire = memory.resolutions.lock().unwrap()[0].clone();
+    assert!(!wire.shrink);
+    let original = wire.original.unwrap();
+    assert_eq!(
+        original.deadline_unix_ms,
+        request.deadline_unix_millis as i64
+    );
+    assert_eq!(
+        original.expected_revision,
+        request.request.source.resource_revision
+    );
+    assert_eq!(original.operation_id, request.request.operation_id);
+    assert_eq!(original.expected.unwrap().memory_limit_bytes, 128 * MIB);
+    assert_eq!(original.target.unwrap().memory_limit_bytes, 256 * MIB);
+    assert!(memory.grows.lock().unwrap().is_empty());
+    assert!(memory.shrinks.lock().unwrap().is_empty());
+    drop(adapter);
+    let adapter = reconnect_with_journal(&harness).await;
+    assert_eq!(
+        adapter.observe_memory(&record).await.unwrap().observation,
+        actual.observation
+    );
+    let mut changed = request.clone();
+    changed.deadline_unix_millis += 1;
+    changed.issued_unix_millis += 1;
+    assert!(adapter.resolve_memory(&record, &changed).await.is_err());
+    assert_eq!(
+        memory.resolutions.lock().unwrap().len(),
+        1,
+        "changed fingerprint must be rejected before RPC"
+    );
+    let next = grant(&actual, 256 * MIB);
+    adapter
+        .apply_memory(&record, &next, "session-1", 2)
+        .await
+        .unwrap();
+    assert_eq!(memory.grows.lock().unwrap().len(), 1);
+}
+#[tokio::test]
+async fn physical_memory_resolution_lost_reply_is_observed_after_journal_reopen() {
+    let memory = MemoryServer {
+        lose_reply: true,
+        ..Default::default()
+    };
+    *memory.stats.lock().unwrap() = Some(physical_stats());
+    let (adapter, harness, record) = memory_fixture(memory.clone()).await;
+    let request = expired_grant(&adapter.observe_memory(&record).await.unwrap(), 256 * MIB);
+    assert!(adapter.resolve_memory(&record, &request).await.is_err());
+    drop(adapter);
+    let adapter = reconnect_with_journal(&harness).await;
+    assert_eq!(
+        adapter.observe_memory(&record).await.unwrap().observation,
+        request.request.unchanged().unwrap()
+    );
+    assert_eq!(memory.resolutions.lock().unwrap().len(), 1);
+    assert!(memory.grows.lock().unwrap().is_empty());
+}
+#[tokio::test]
+async fn physical_memory_resolution_retains_unknown_result_and_rechecks_independent_stats() {
+    for case in 0..7 {
+        let memory = MemoryServer::default();
+        *memory.stats.lock().unwrap() = Some(physical_stats());
+        let (adapter, _harness, record) = memory_fixture(memory.clone()).await;
+        let request = expired_grant(&adapter.observe_memory(&record).await.unwrap(), 256 * MIB);
+        let mut actual = physical_stats();
+        actual.resource_revision = 2;
+        actual.resource_operation_id = request.request.operation_id.clone();
+        let mut response = ResizeResourcesResponse {
+            actual: Some(actual.clone()),
+            complete: false,
+            update_error: String::new(),
+        };
+        match case {
+            0 => response.complete = true,
+            1 => response.actual.as_mut().unwrap().resource_revision = 3,
+            2 => response.actual.as_mut().unwrap().resource_operation_id = "foreign".into(),
+            3 => response.actual.as_mut().unwrap().resource_operation_pending = true,
+            4 => response.actual.as_mut().unwrap().frozen = true,
+            5 => response.actual.as_mut().unwrap().resource_generation = "foreign".into(),
+            _ => {
+                actual.memory_limit_bytes = 256 * MIB;
+                actual.memory_high_bytes = 192 * MIB;
+                *memory.after_reply.lock().unwrap() = Some(actual);
+            }
+        }
+        *memory.reply.lock().unwrap() = Some(response);
+        assert!(
+            adapter.resolve_memory(&record, &request).await.is_err(),
+            "case {case}"
+        );
+        assert!(memory.grows.lock().unwrap().is_empty());
+        assert!(memory.shrinks.lock().unwrap().is_empty());
+    }
+}
+#[tokio::test]
+async fn physical_memory_resolution_never_dispatches_a_live_grant_from_old_authority() {
+    let memory = MemoryServer::default();
+    *memory.stats.lock().unwrap() = Some(physical_stats());
+    let (adapter, _harness, record) = memory_fixture(memory.clone()).await;
+    let mut request = grant(&adapter.observe_memory(&record).await.unwrap(), 256 * MIB);
+    request.node_session_id = "old-session".into();
+    request.coordinator_epoch = 1;
+    assert!(adapter.resolve_memory(&record, &request).await.is_err());
+    assert_eq!(memory.resolutions.lock().unwrap().len(), 1);
+    assert_eq!(
+        memory
+            .stats
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .resource_revision,
+        1
+    );
+    assert!(memory.grows.lock().unwrap().is_empty());
+    assert!(memory.shrinks.lock().unwrap().is_empty());
 }

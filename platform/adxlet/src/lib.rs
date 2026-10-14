@@ -127,6 +127,18 @@ pub trait RuntimeDriver: Send + Sync {
             "conditional memory mutation is unsupported".into(),
         ))
     }
+    /// Resolve a previously authorized command without dispatching resource
+    /// changes. The immutable request may belong to an expired session or epoch.
+    /// Unavailable or incomplete proof retains every reservation.
+    async fn resolve_memory(
+        &self,
+        _record: &EnvironmentRecord,
+        _authorization: &adx_core::memory::MemoryAuthorization,
+    ) -> Result<adx_core::memory::MemorySample> {
+        Err(Error::Unavailable(
+            "memory operation reconciliation is unsupported".into(),
+        ))
+    }
     async fn stats(&self, _runtime_id: &str) -> Result<metrics::RuntimeUsage> {
         Err(Error::Unavailable("runtime usage is unavailable".into()))
     }

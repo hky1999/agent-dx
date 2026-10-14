@@ -79,7 +79,7 @@ impl Header {
     fn validate(&self) -> Result<()> {
         if !matches!(
             (self.schema, self.host_budgets.is_some()),
-            (1, false) | (2, true) | (3, _) | (4, true) | (5, true)
+            (1, false) | (2, true) | (3, _) | (4, true) | (5, true) | (6, true)
         ) || self.shards == 0
             || self.next_node_shard >= self.shards
             || self.epoch == 0

@@ -174,8 +174,10 @@ impl Session {
             }
             let account = env.memory.as_mut().ok_or(Error::Conflict)?;
             if let Some(op) = &account.pending {
-                if *observation == op.authorization.request.completion()? {
-                    let op = account.pending.take().ok_or(Error::Conflict)?;
+                let unchanged = *observation == op.authorization.request.unchanged()?;
+                if *observation == op.authorization.request.completion()? || unchanged {
+                    let mut op = account.pending.take().ok_or(Error::Conflict)?;
+                    op.unchanged = unchanged;
                     account
                         .completed
                         .insert(op.authorization.request.operation_id.clone(), op);
@@ -248,6 +250,7 @@ impl Session {
                         grant.validate()?;
                         let operation = StoredMemoryOperation {
                             request_sha256: fingerprint(&grant.request)?,
+                            unchanged: false,
                             authorization: grant,
                         };
                         env.memory.as_mut().ok_or(Error::Conflict)?.pending = Some(operation);
@@ -280,7 +283,7 @@ impl Session {
                 coordinator_epoch: self.epoch(),
             };
             decision.validate()?;
-            header.schema = header.schema.max(5);
+            header.schema = header.schema.max(6);
             header.advance()?;
             if self
                 .store

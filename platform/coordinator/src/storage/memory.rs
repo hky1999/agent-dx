@@ -21,6 +21,9 @@ use adx_core::Resources;
 pub struct StoredMemoryOperation {
     pub authorization: MemoryAuthorization,
     pub request_sha256: String,
+    /// A closed daemon operation that advanced revision without changing limits.
+    #[serde(default)]
+    pub unchanged: bool,
 }
 
 /// The last settled physical state and every operation belonging to that runtime.
@@ -82,7 +85,8 @@ impl StoredMemory {
         }
         if let Some(operation) = &self.pending {
             operation.validate(environment)?;
-            if operation.authorization.request.source != self.confirmed
+            if operation.unchanged
+                || operation.authorization.request.source != self.confirmed
                 || self
                     .completed
                     .contains_key(&operation.authorization.request.operation_id)
@@ -92,7 +96,11 @@ impl StoredMemory {
         }
         for (id, operation) in &self.completed {
             operation.validate(environment)?;
-            let completion = operation.authorization.request.completion()?;
+            let completion = if operation.unchanged {
+                operation.authorization.request.unchanged()?
+            } else {
+                operation.authorization.request.completion()?
+            };
             if id != &operation.authorization.request.operation_id
                 || completion.identity != self.confirmed.identity
                 || completion.resource_revision > self.confirmed.resource_revision
@@ -231,7 +239,7 @@ impl Session {
             environment.validate()?;
             budget::check_holds(&raw, &header, Some(&environment))?;
             // Older writers must reject dynamic holds instead of dropping them.
-            header.schema = header.schema.max(4);
+            header.schema = header.schema.max(6);
             header.advance()?;
             if self
                 .store
@@ -316,9 +324,11 @@ impl Session {
                 Some(StoredMemoryOperation {
                     authorization: grant.clone(),
                     request_sha256: fingerprint(&request)?,
+                    unchanged: false,
                 });
             environment.validate()?;
             budget::check_admission(&raw, &header, &environment)?;
+            header.schema = header.schema.max(6);
             header.advance()?;
             if self
                 .store
@@ -376,7 +386,7 @@ impl Session {
             check_live(&environment)?;
             let account = environment.memory.as_mut().ok_or(Error::Conflict)?;
             if let Some(done) = account.completed.get(&grant.request.operation_id) {
-                return if done.authorization == grant {
+                return if done.authorization == grant && !done.unchanged {
                     Ok(())
                 } else {
                     Err(Error::Conflict)
@@ -393,6 +403,7 @@ impl Session {
                 .insert(grant.request.operation_id.clone(), pending);
             environment.validate()?;
             budget::check_holds(&raw, &header, Some(&environment))?;
+            header.schema = header.schema.max(6);
             header.advance()?;
             if self
                 .store

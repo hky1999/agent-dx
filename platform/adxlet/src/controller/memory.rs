@@ -32,30 +32,48 @@ impl Controller {
         if decision.observed != sample.observation {
             return Err(Error::Conflict);
         }
-        self.apply_memory_hold(&decision)?;
-        if let Some(grant) = decision.authorization {
+        decision.validate()?;
+        if decision.observed.identity.assignment != self.record.assignment
+            || decision.observed.identity.runtime_id != self.record.runtime.id
+        {
+            return Err(Error::Conflict);
+        }
+        if let Some(grant) = &decision.authorization {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_err(|_| Error::Unavailable("system clock before epoch".into()))?
                 .as_millis();
             let now = u64::try_from(now)
                 .map_err(|_| Error::Unavailable("system clock overflow".into()))?;
-            grant.check_dispatch(now, &decision.node_session_id, decision.coordinator_epoch)?;
-            let actual = self
-                .services
-                .runtime
-                .apply_memory(
-                    &self.record,
-                    &grant,
-                    &decision.node_session_id,
-                    decision.coordinator_epoch,
-                )
-                .await?;
+            let actual = if grant
+                .check_dispatch(now, &decision.node_session_id, decision.coordinator_epoch)
+                .is_ok()
+            {
+                self.apply_memory_hold(&decision)?;
+                self.services
+                    .runtime
+                    .apply_memory(
+                        &self.record,
+                        grant,
+                        &decision.node_session_id,
+                        decision.coordinator_epoch,
+                    )
+                    .await?
+            } else {
+                // Resolution cannot increase physical limits. It must remain
+                // possible when local growth admission is already closed.
+                self.services
+                    .runtime
+                    .resolve_memory(&self.record, grant)
+                    .await?
+            };
             let settled = self.services.sink.reconcile_memory(&actual).await?;
             if settled.observed != actual.observation {
                 return Err(Error::Conflict);
             }
             self.apply_memory_hold(&settled)?;
+        } else {
+            self.apply_memory_hold(&decision)?;
         }
         Ok(())
     }

@@ -120,6 +120,14 @@ impl sandbox_service_server::SandboxService for Server {
     ) -> Result<Response<DeleteCheckpointResponse>, Status> {
         Err(Status::unimplemented("outside this lifecycle test"))
     }
+    async fn resolve_resource_operation(
+        &self,
+        request: Request<ResolveResourceOperationRequest>,
+    ) -> Result<Response<ResizeResourcesResponse>, Status> {
+        self.memory
+            .resolve(request.into_inner())
+            .map_err(|error| *error)
+    }
     async fn resize_resources(
         &self,
         request: Request<ResizeResourcesRequest>,

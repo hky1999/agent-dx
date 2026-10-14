@@ -162,8 +162,153 @@ impl Sandboxd {
         if !matches!(*state, StartState::Started(_)) {
             return Err(Error::Conflict);
         }
-        self.memory_readback(record).await
+        let observed = self.memory_readback(record).await;
+        let dispatch = self
+            .operations
+            .lock()
+            .map_err(unavailable)?
+            .get(&record.runtime.id)
+            .and_then(|entry| entry.memory.clone());
+        if let Some(dispatch) = dispatch {
+            let grant = &dispatch.authorization;
+            let settled = observed.as_ref().is_ok_and(|sample| {
+                grant
+                    .request
+                    .completion()
+                    .is_ok_and(|done| done == sample.observation)
+                    || grant
+                        .request
+                        .unchanged()
+                        .is_ok_and(|done| done == sample.observation)
+            });
+            if !settled && operations::now_millis()? >= grant.deadline_unix_millis {
+                return self.memory_resolution_locked(record, grant).await;
+            }
+        }
+        observed
     }
+
+    pub(super) async fn memory_resolution(
+        &self,
+        record: &EnvironmentRecord,
+        authorization: &MemoryAuthorization,
+    ) -> Result<MemorySample> {
+        check_record(record)?;
+        let state = self.cell(&record.runtime.id).lock_owned().await;
+        if !matches!(*state, StartState::Started(_)) {
+            return Err(Error::Conflict);
+        }
+        self.memory_resolution_locked(record, authorization).await
+    }
+
+    // Caller owns the per-Runtime lifecycle lock. Only the resolution RPC is
+    // sent, even after a session/epoch change; this never renews or applies a grant.
+    async fn memory_resolution_locked(
+        &self,
+        record: &EnvironmentRecord,
+        authorization: &MemoryAuthorization,
+    ) -> Result<MemorySample> {
+        authorization.validate()?;
+        let request = &authorization.request;
+        let source = &request.source;
+        if source.identity.assignment != record.assignment
+            || source.identity.runtime_id != record.runtime.id
+            || source.memory_high_bytes != high(record, source.memory_limit_bytes)?
+            || request.target_high_bytes != high(record, request.target_limit_bytes)?
+        {
+            return Err(Error::Conflict);
+        }
+        let mut entry = self
+            .operations
+            .lock()
+            .map_err(unavailable)?
+            .get(&record.runtime.id)
+            .cloned()
+            .ok_or(Error::Conflict)?;
+        let dispatch = MemoryDispatch {
+            authorization: authorization.clone(),
+            request_sha256: operations::fingerprint(authorization)?,
+        };
+        dispatch.validate(&record.runtime.id, entry.backend.as_ref(), None)?;
+        if entry.memory.as_ref().is_some_and(|old| {
+            (old.authorization.request.operation_id == request.operation_id
+                && old.request_sha256 != dispatch.request_sha256)
+                || (old.authorization.request.operation_id != request.operation_id
+                    && old.authorization.request.source.resource_revision
+                        >= source.resource_revision)
+        }) {
+            return Err(Error::Conflict);
+        }
+        if entry
+            .memory
+            .as_ref()
+            .is_none_or(|old| old.request_sha256 != dispatch.request_sha256)
+        {
+            entry.memory = Some(dispatch);
+            let journal = self
+                .journal
+                .as_ref()
+                .ok_or_else(|| unavailable("memory resolution requires a durable node journal"))?;
+            journal
+                .save(record.runtime.id.clone(), entry.clone())
+                .await?;
+            self.operations
+                .lock()
+                .map_err(unavailable)?
+                .insert(record.runtime.id.clone(), entry);
+        }
+        let expected = proto::ResourceLimits {
+            cpu_quota_usec: i64::try_from(source.cpu_quota_usec).map_err(unavailable)?,
+            cpu_period_usec: source.cpu_period_usec,
+            memory_limit_bytes: source.memory_limit_bytes,
+        };
+        let target = proto::ResourceLimits {
+            memory_limit_bytes: request.target_limit_bytes,
+            ..expected
+        };
+        let response = self
+            .client
+            .clone()
+            .resolve_resource_operation(self.request(proto::ResolveResourceOperationRequest {
+                original: Some(proto::ResizeResourcesRequest {
+                    sandbox_id: source.identity.sandbox_id.clone(),
+                    resource_generation: source.identity.resource_generation.clone(),
+                    expected: Some(expected),
+                    target: Some(target),
+                    deadline_unix_ms:
+                        i64::try_from(authorization.deadline_unix_millis).map_err(unavailable)?,
+                    operation_id: request.operation_id.clone(),
+                    expected_revision: source.resource_revision,
+                }),
+                shrink: request.target_limit_bytes < source.memory_limit_bytes,
+            }))
+            .await
+            .map_err(unavailable)?
+            .into_inner();
+        let physical = BackendIdentity {
+            id: source.identity.sandbox_id.clone(),
+            resource_generation: source.identity.resource_generation.clone(),
+        };
+        let actual = sample(
+            record,
+            &physical,
+            response
+                .actual
+                .ok_or_else(|| unavailable("memory resolution has no physical readback"))?,
+        )?;
+        let unchanged = request.unchanged()?;
+        if (actual.observation != request.completion()? && actual.observation != unchanged)
+            || (response.complete && actual.observation == unchanged)
+        {
+            return Err(Error::Conflict);
+        }
+        let fresh = self.memory_readback(record).await?;
+        if fresh.observation != actual.observation {
+            return Err(Error::Conflict);
+        }
+        Ok(fresh)
+    }
+
     pub(super) async fn memory_mutation(
         &self,
         record: &EnvironmentRecord,

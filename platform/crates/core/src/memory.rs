@@ -119,6 +119,16 @@ impl MemoryObservation {
 }
 
 impl MemoryRequest {
+    /// The original command consumed its revision but left all limits unchanged.
+    /// Only a closed, unfrozen daemon observation at this exact revision and
+    /// operation identity proves this terminal result; elapsed time does not.
+    pub fn unchanged(&self) -> Result<MemoryObservation> {
+        let mut result = self.completion()?;
+        result.memory_limit_bytes = self.source.memory_limit_bytes;
+        result.memory_high_bytes = self.source.memory_high_bytes;
+        Ok(result)
+    }
+
     /// Returns the exact settled observation required to release any reservation.
     /// Invalid source, target, timeout or revision overflow returns Conflict.
     pub fn completion(&self) -> Result<MemoryObservation> {

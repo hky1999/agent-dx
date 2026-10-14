@@ -1294,6 +1294,13 @@ impl RuntimeDriver for Sandboxd {
         self.memory_mutation(record, authorization, node_session_id, coordinator_epoch)
             .await
     }
+    async fn resolve_memory(
+        &self,
+        record: &adx_core::EnvironmentRecord,
+        authorization: &adx_core::memory::MemoryAuthorization,
+    ) -> Result<adx_core::memory::MemorySample> {
+        self.memory_resolution(record, authorization).await
+    }
     async fn execute_authorized(
         &self,
         authorization: &adx_core::execution::ExecutionAuthorization,

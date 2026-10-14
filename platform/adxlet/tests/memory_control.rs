@@ -28,6 +28,7 @@ struct Rig {
     fail_center: AtomicBool,
     wrong_identity: AtomicBool,
     applied: AtomicUsize,
+    resolved: AtomicUsize,
 }
 impl Rig {
     fn sample(&self) -> MemorySample {
@@ -87,6 +88,19 @@ impl RuntimeDriver for Rig {
     async fn observe_memory(&self, _: &EnvironmentRecord) -> Result<MemorySample> {
         Ok(self.sample())
     }
+    async fn resolve_memory(
+        &self,
+        _: &EnvironmentRecord,
+        grant: &MemoryAuthorization,
+    ) -> Result<MemorySample> {
+        assert_eq!(self.sample().observation, grant.request.source);
+        let mut unchanged = grant.request.source.clone();
+        unchanged.resource_revision += 1;
+        unchanged.operation_id = grant.request.operation_id.clone();
+        *self.actual.lock().unwrap() = Some(unchanged);
+        self.resolved.fetch_add(1, Ordering::SeqCst);
+        Ok(self.sample())
+    }
     async fn apply_memory(
         &self,
         _: &EnvironmentRecord,
@@ -142,10 +156,13 @@ impl StateSink for Rig {
             return Err(Error::Unavailable("center unavailable".into()));
         }
         let mut pending = self.grant.lock().unwrap();
-        if pending
-            .as_ref()
-            .is_some_and(|grant| grant.request.completion().unwrap() == sample.observation)
-        {
+        if pending.as_ref().is_some_and(|grant| {
+            let mut unchanged = grant.request.source.clone();
+            unchanged.resource_revision += 1;
+            unchanged.operation_id = grant.request.operation_id.clone();
+            grant.request.completion().unwrap() == sample.observation
+                || unchanged == sample.observation
+        }) {
             *pending = None;
         }
         if pending.is_none() {
@@ -211,6 +228,7 @@ async fn rig() -> (Arc<Rig>, Arc<Adxlet>, adxlet::EnvironmentHandle) {
         fail_center: AtomicBool::new(false),
         wrong_identity: AtomicBool::new(false),
         applied: AtomicUsize::new(0),
+        resolved: AtomicUsize::new(0),
     });
     let node = Arc::new(Adxlet::new(
         "node".into(),
@@ -340,4 +358,62 @@ async fn memory_actor_local_capacity_or_pressure_prevents_dispatch_after_center_
     handle.tick().await.unwrap();
     assert_eq!(rig.applied.load(Ordering::SeqCst), 1);
     handle.delete().await.unwrap();
+}
+
+#[tokio::test]
+async fn memory_actor_resolves_expired_grant_even_when_local_growth_admission_is_closed() {
+    let (rig, node, handle) = rig().await;
+    node.update_capacity(
+        Resources {
+            cpu_millis: 500,
+            memory_bytes: 128 * MIB,
+            disk_bytes: 0,
+        },
+        Duration::from_secs(60),
+    )
+    .unwrap();
+    assert_eq!(handle.tick().await, Err(Error::NoCapacity));
+    {
+        let mut pending = rig.grant.lock().unwrap();
+        let grant = pending.as_mut().unwrap();
+        grant.issued_unix_millis = 1;
+        grant.deadline_unix_millis = 1 + grant.request.timeout_millis;
+    }
+    handle
+        .tick()
+        .await
+        .expect("expiry reconciliation must not require new local growth capacity");
+    assert_eq!(rig.applied.load(Ordering::SeqCst), 0);
+    assert_eq!(rig.resolved.load(Ordering::SeqCst), 1);
+    assert_eq!(node.used().memory_bytes, 128 * MIB);
+    assert!(rig.grant.lock().unwrap().is_none());
+    handle.delete().await.unwrap();
+    assert_eq!(node.used(), Resources::default());
+}
+#[tokio::test]
+async fn memory_actor_resolves_old_epoch_or_session_without_redispatching() {
+    for old_session in [false, true] {
+        let (rig, node, handle) = rig().await;
+        node.set_pressure(true);
+        assert_eq!(handle.tick().await, Err(Error::NoCapacity));
+        node.set_pressure(false);
+        {
+            let mut pending = rig.grant.lock().unwrap();
+            let grant = pending.as_mut().unwrap();
+            if old_session {
+                grant.node_session_id = "old-boot".into();
+            } else {
+                grant.coordinator_epoch = 2;
+            }
+        }
+        handle
+            .tick()
+            .await
+            .expect("an old authorization may only be reconciled");
+        assert_eq!(rig.applied.load(Ordering::SeqCst), 0);
+        assert_eq!(rig.resolved.load(Ordering::SeqCst), 1);
+        assert!(rig.grant.lock().unwrap().is_none());
+        assert_eq!(node.used().memory_bytes, 128 * MIB);
+        handle.delete().await.unwrap();
+    }
 }

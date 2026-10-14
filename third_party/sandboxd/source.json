@@ -6,7 +6,7 @@
     {
       "source": "api/runtime/v1/sandbox-api.proto",
       "vendored": "sandbox-api.proto",
-      "sha256": "6192449a16156a9b584fd443bb30ba2b5247270af127ffa588ea53caa1ba3b82",
+      "sha256": "f521e50f76a088c410d69616c0caa7918653c43cf6a4f9af8067c24461e5f1c4",
       "upstream_sha256": "a0053b7d6b5f9f4ce1e344e96741192a98a11e79d6b1cac4d17fea5a36b716ab"
     },
     {
@@ -17,9 +17,9 @@
   ],
   "scheduler_extensions": {
     "repository": "https://github.com/hky1999/sandboxd.git",
-    "revision": "467daed806349c129a79f10dec43e1b030b43142",
+    "revision": "c072f2ea679fde560c8108d229557a01d8541bad",
     "source": "api/runtime/v1/sandbox-api.proto",
-    "sha256": "1e62015a43ead81d0976a10e9f902ebaf4399dd9c285a15287cdb6f281121219",
+    "sha256": "f521e50f76a088c410d69616c0caa7918653c43cf6a4f9af8067c24461e5f1c4",
     "fields": [
       "CheckpointRequest.checkpoint_id=7",
       "CheckpointRequest.include_filesystem=8",
@@ -29,7 +29,9 @@
       "DeleteIfGenerationRequest.expected_generation=2",
       "DeleteIfGenerationResponse.retired_generation=1",
       "CheckpointIfGenerationRequest.checkpoint=1",
-      "CheckpointIfGenerationRequest.expected_generation=2"
+      "CheckpointIfGenerationRequest.expected_generation=2",
+      "ResolveResourceOperationRequest.original=1",
+      "ResolveResourceOperationRequest.shrink=2"
     ]
   }
 }
