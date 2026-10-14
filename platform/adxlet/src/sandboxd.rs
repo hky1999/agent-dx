@@ -15,6 +15,7 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Request};
 use tower::service_fn;
 
+mod memory;
 mod operations;
 use operations::{OperationIntent, OperationJournal, OperationRecord};
 
@@ -1277,6 +1278,22 @@ fn runtime_control_peer(config: &Config) -> Result<Option<proto::NetworkEndpoint
 
 #[async_trait]
 impl RuntimeDriver for Sandboxd {
+    async fn observe_memory(
+        &self,
+        record: &adx_core::EnvironmentRecord,
+    ) -> Result<adx_core::memory::MemorySample> {
+        self.memory_observation(record).await
+    }
+    async fn apply_memory(
+        &self,
+        record: &adx_core::EnvironmentRecord,
+        authorization: &adx_core::memory::MemoryAuthorization,
+        node_session_id: &str,
+        coordinator_epoch: u64,
+    ) -> Result<adx_core::memory::MemorySample> {
+        self.memory_mutation(record, authorization, node_session_id, coordinator_epoch)
+            .await
+    }
     async fn execute_authorized(
         &self,
         authorization: &adx_core::execution::ExecutionAuthorization,

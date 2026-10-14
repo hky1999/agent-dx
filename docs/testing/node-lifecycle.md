@@ -18,7 +18,7 @@ adxlet 拥有实例串行状态机。Coordinator 提供归属校验、Redis 持�
 
 内部 Environment 协议可显式配置 `sandbox.elastic_memory={"high_per_mille":750}`。此时 `execution_resources()` 的内存为请求值，作为出生额度和缩容下限；CPU 和磁盘仍使用完整上限。仅支持 runsc，请求和允许上限必须为整数 MiB，比例必须大于 0 且小于 1000，出生软限制至少为 4096 字节，CPU 上限至少为 10 毫核；数值超过 sandboxd 精度时拒绝。快照克隆暂不接受该选项。Start 写入 sandboxd 第一版弹性策略标签，CPU 的初值和上限相同，内存分别记录初值和允许上限；不通过修改原始规格记录后续额度。
 
-恢复可能携带已经增长的内存上限，因此中心和节点在恢复前预留完整允许上限，Running 状态本身不能归还差额。Coordinator 从持久内存账户重建确认额度及待执行扩容额度；节点重启只有生命周期记录时保守保留允许上限。完整物理回读、节点内存账户同步和资源操作 RPC 尚未接通，节点保守预留尚不能自动收敛到实际额度。此选项当前没有公开 HTTP／Python SDK 入口，也不启用自动调整；期望的 memory.high 比例需要后续执行链路验证 sandboxd 配置。具体边界见 [宿主准入与执行授权](coordinator-storage.md)。
+恢复可能携带已经增长的内存上限，因此中心和节点在恢复前预留完整允许上限，Running 状态本身不能归还差额。Coordinator 从持久内存账户重建确认额度及待执行扩容额度；节点重启只有生命周期记录时保守保留允许上限。sandboxd 适配层已提供完整物理回读和条件扩缩容方法；中心资源控制 RPC、节点内存账户同步和串行生命周期接线尚未完成，节点保守预留尚不能自动收敛到实际额度。此选项当前没有公开 HTTP／Python SDK 入口，也不启用自动调整；适配层会按期望比例核对实际 memory.high，比例不符时拒绝派发。具体边界见 [宿主准入与执行授权](coordinator-storage.md)。
 
 请求和磁盘上限均为零时仍不设置可写层配额，不能声称所有磁盘使用已经受预算约束。宿主共享预算已经有生产配置入口；独立内存授权的存储实现不等于物理动态资源或安全超卖已经验收。
 
@@ -99,3 +99,36 @@ Rust 用例位于 adxlet 的 `journal.rs`、`resources.rs`、`pause_resume.rs` �
 授权回复未知时，节点停止新准入，心跳循环重新读取 Coordinator 的完整目录。对账排空旧控制器，清理精确的预留目标并发布终态。同一 Assignment 内替换执行只退役旧控制器，不给整个 Assignment 写退役标记。明确的容量拒绝保留源状态供重试。中断目标沿用既有 Failed 对账契约，不在自动对账期间悄悄重新执行。
 
 `RuntimeDriver::execute_authorized` 接收完整授权和可选的已物化恢复输入。sandboxd 适配器在能力查询和请求准备后再次核对原期限，把较早的授权／本机 RPC 截止时间持久保存并传入 `StartOperation`，实际发送前再检查。已准备的替换目标不能经不带授权的普通 Start 入口启动。超时之前尚未派发的本机意图必须先持久封闭，才能按未创建结算；请求已经发出后仍按未知结果对账。
+
+
+## 条件内存操作适配层
+
+`RuntimeDriver::observe_memory` 和 `apply_memory` 默认返回不支持，sandboxd 实现在
+`platform/adxlet/src/sandboxd/memory.rs`。调用方必须先验证持久授权、取得节点额度，
+并提供当前节点会话和 Coordinator epoch；不能把授权自身的字段当成当前权威状态。
+当前尚未从生产控制 RPC 调用这些方法，也没有启用自动策略。
+
+完整观察要求 Running、显式弹性配置、匹配的 Runtime／Assignment／sandbox ID／资源代际，
+以及已知 CPU 配额、memory.current、memory.max、memory.high、资源 revision 和解冻事实。
+冻结或操作未完成、未知字段、无限软限制、策略标签或 CPU 不符均返回错误。
+软限制使用比例向上取整后按 4096 字节向下对齐，内存目标为整数 MiB且位于出生下限与允许上限之间。
+`MemorySample` 单列内核峰值、CPU 累计量和压力事件的可选值；未知不补零，事件也不产生授权。
+
+增长调用 `ResizeResources`，缩小调用 `ShrinkResources`，CPU 配额和周期保持原值。
+两者携带原物理代际、期望 revision、完整源／目标限额、操作 ID 和绝对原期限。
+内存请求期限最多为 60000 毫秒，操作 ID 为最多 128 字节的无空白可打印 ASCII；
+这些边界在核心类型校验，避免先预留再被 daemon 的协议拒绝。
+
+派发与创建、检查点和删除使用同一个 Runtime 锁，并在派发前将完整授权及其 SHA256
+写入节点 SQLite 操作日志。第一次内存派发把 SQLite user_version 升为 2，旧程序拒绝打开；
+后续打开及物理退役不会降级。原创建和退役证据继续保留。
+接受后的内部任务不随外层调用取消，等锁后和发 RPC 前重新核验期限。
+匹配完成的重放只读查询，改变相同操作的指纹会被拒绝。
+
+完成要求 `complete=true`、空 `update_error`、完整回复与精确目标吻合，再以独立 Stats
+确认同一操作、下一 revision 和解冻结果。回复丢失、部分写入、冻结或未知结果保留原授权，
+适配层不归还预算；重启后可以只读观察同一代际供中心结算。终止该物理执行仍走条件删除及原退役证明。
+
+`tests/memory_elasticity/mod.rs` 通过真实 Unix socket 上的模拟 sandboxd 服务验证回读、
+条件请求、未知字段、权限和期限、回复丢失、SQLite 写失败、调用取消、串行删除及重放。
+它不修改宿主 cgroup，不构成 BareMetal1 的实际内存调整或冻结故障验收。

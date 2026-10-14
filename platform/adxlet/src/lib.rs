@@ -103,6 +103,30 @@ pub trait RuntimeDriver: Send + Sync {
             }
         }
     }
+    /// Observe one running elastic execution with complete identity and finite
+    /// controls. Unsupported, unknown or unsettled state returns Unavailable.
+    async fn observe_memory(
+        &self,
+        _record: &EnvironmentRecord,
+    ) -> Result<adx_core::memory::MemorySample> {
+        Err(Error::Unavailable(
+            "conditional memory observation is unsupported".into(),
+        ))
+    }
+    /// Dispatch only after the caller has verified the persisted authorization
+    /// and reserved the local target. Session and epoch must come from the current
+    /// authority, not from the supplied grant. Errors never release its budget.
+    async fn apply_memory(
+        &self,
+        _record: &EnvironmentRecord,
+        _authorization: &adx_core::memory::MemoryAuthorization,
+        _node_session_id: &str,
+        _coordinator_epoch: u64,
+    ) -> Result<adx_core::memory::MemorySample> {
+        Err(Error::Unavailable(
+            "conditional memory mutation is unsupported".into(),
+        ))
+    }
     async fn stats(&self, _runtime_id: &str) -> Result<metrics::RuntimeUsage> {
         Err(Error::Unavailable("runtime usage is unavailable".into()))
     }

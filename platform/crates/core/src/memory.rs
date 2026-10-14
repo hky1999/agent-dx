@@ -127,9 +127,13 @@ impl MemoryRequest {
             || self.target_limit_bytes == self.source.memory_limit_bytes
             || !valid_id(&self.operation_id)
             || self.operation_id.len() > 128
+            || !self
+                .operation_id
+                .bytes()
+                .all(|byte| (0x21..=0x7e).contains(&byte))
             || self.operation_id == self.source.operation_id
             || self.timeout_millis == 0
-            || self.timeout_millis > 3_600_000
+            || self.timeout_millis > 60_000
         {
             return Err(Error::Conflict);
         }
@@ -181,5 +185,82 @@ impl MemoryAuthorization {
             ));
         }
         Ok(())
+    }
+}
+
+/// Complete memory sample for policy evaluation. Optional counters remain unknown
+/// when the backend cannot prove their kernel source; they are never zero-filled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemorySample {
+    pub observation: MemoryObservation,
+    pub usage_bytes: u64,
+    pub peak_bytes: Option<u64>,
+    pub cpu_usage_ns: Option<u64>,
+    pub pressure: Option<MemoryPressure>,
+    pub observed_unix_millis: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryPressure {
+    pub high_events: u64,
+    pub oom_events: u64,
+    pub oom_kill_events: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn request() -> MemoryRequest {
+        MemoryRequest {
+            source: MemoryObservation {
+                identity: MemoryIdentity {
+                    assignment: Assignment {
+                        environment_id: "env".into(),
+                        node_id: "node".into(),
+                        shard_id: 0,
+                        generation: 1,
+                        devices: vec![],
+                    },
+                    runtime_id: "env-1".into(),
+                    sandbox_id: "sandbox".into(),
+                    resource_generation: "generation".into(),
+                },
+                cpu_quota_usec: 50_000,
+                cpu_period_usec: 100_000,
+                memory_limit_bytes: 128 << 20,
+                memory_high_bytes: 96 << 20,
+                resource_revision: 1,
+                operation_id: String::new(),
+                operation_pending: false,
+                frozen: false,
+            },
+            target_limit_bytes: 256 << 20,
+            target_high_bytes: 192 << 20,
+            operation_id: "grow-1".into(),
+            timeout_millis: 60_000,
+        }
+    }
+    #[test]
+    fn memory_request_rejects_daemon_incompatible_deadlines() {
+        let mut r = request();
+        r.completion().unwrap();
+        r.timeout_millis += 1;
+        assert!(
+            r.completion().is_err(),
+            "sandboxd accepts at most a one-minute command deadline"
+        );
+    }
+    #[test]
+    fn memory_request_rejects_daemon_incompatible_operation_ids() {
+        for id in ["grow with space", "grow-操作", "grow-\u{7f}"] {
+            let mut r = request();
+            r.operation_id = id.into();
+            assert!(
+                r.completion().is_err(),
+                "sandboxd requires printable ASCII without whitespace: {id:?}"
+            );
+        }
     }
 }

@@ -53,6 +53,8 @@ pub(super) struct OperationRecord {
     pub action: Option<OperationIntent>,
     pub backend: Option<BackendIdentity>,
     pub retired_generation: Option<String>,
+    #[serde(default)]
+    pub memory: Option<super::memory::MemoryDispatch>,
 }
 impl Default for OperationRecord {
     fn default() -> Self {
@@ -62,6 +64,7 @@ impl Default for OperationRecord {
             action: None,
             backend: None,
             retired_generation: None,
+            memory: None,
         }
     }
 }
@@ -69,6 +72,13 @@ impl OperationRecord {
     fn validate(&self, id: &str) -> Result<()> {
         if id.is_empty() || id.len() > 4096 || id.chars().any(char::is_whitespace) {
             return Err(unavailable("invalid operation runtime identity"));
+        }
+        if let Some(memory) = &self.memory {
+            memory.validate(
+                id,
+                self.backend.as_ref(),
+                self.retired_generation.as_deref(),
+            )?;
         }
         for intent in self.start.iter().chain(self.action.iter()) {
             if uuid::Uuid::parse_str(&intent.id).is_err()
@@ -102,6 +112,7 @@ impl OperationRecord {
                 || self.action.is_some()
                 || self.backend.is_some()
                 || self.retired_generation.is_some()
+                || self.memory.is_some()
             {
                 return Err(unavailable("invalid durable unstarted execution"));
             }
@@ -231,6 +242,11 @@ impl OperationJournal {
             let mut connection = database(&path)?;
             let transaction = connection.transaction().map_err(unavailable)?;
             let payload = serde_json::to_string(&record).map_err(unavailable)?;
+            // Old binaries must refuse a journal containing memory dispatches.
+            // Keep the fence after retirement rather than silently downgrading.
+            if record.memory.is_some() {
+                transaction.execute_batch("PRAGMA user_version=2;").map_err(unavailable)?;
+            }
             let previous: Option<String> = transaction.query_row("SELECT payload FROM operations WHERE runtime_id=?1", [&id], |row| row.get(0)).optional().map_err(unavailable)?;
             if previous.as_ref() == Some(&payload) { return Ok(()); }
             transaction.execute("INSERT INTO operations(runtime_id,payload) VALUES (?1,?2) ON CONFLICT(runtime_id) DO UPDATE SET payload=excluded.payload", params![id, payload]).map_err(unavailable)?;
@@ -268,12 +284,17 @@ fn database(path: &std::path::Path) -> Result<Connection> {
     let version: u32 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(unavailable)?;
-    if version > 1 {
+    if version > 2 {
         return Err(unavailable("unsupported operation journal schema"));
     }
     connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
         CREATE TABLE IF NOT EXISTS operations (runtime_id TEXT PRIMARY KEY NOT NULL, payload TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS operation_history (sequence INTEGER PRIMARY KEY AUTOINCREMENT, runtime_id TEXT NOT NULL, payload TEXT NOT NULL);
-        PRAGMA user_version=1;").map_err(unavailable)?;
+").map_err(unavailable)?;
+    if version == 0 {
+        connection
+            .execute_batch("PRAGMA user_version=1;")
+            .map_err(unavailable)?;
+    }
     Ok(connection)
 }

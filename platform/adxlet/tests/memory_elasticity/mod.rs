@@ -68,3 +68,462 @@ fn elastic_boundary_rejects_soft_limit_below_readback_alignment() {
     spec.sandbox.elastic_memory.as_mut().unwrap().high_per_mille = 1;
     assert!(start_request(&spec, "i-1", 1, &[], &Config::default()).is_err());
 }
+
+use adx_core::memory::{MemoryAuthorization, MemoryRequest};
+#[derive(Clone)]
+pub(super) struct MemoryServer {
+    pub stats: Arc<Mutex<Option<StatsResponse>>>,
+    pub grows: Arc<Mutex<Vec<ResizeResourcesRequest>>>,
+    pub shrinks: Arc<Mutex<Vec<ShrinkResourcesRequest>>>,
+    pub reply: Arc<Mutex<Option<ResizeResourcesResponse>>>,
+    pub after_reply: Arc<Mutex<Option<StatsResponse>>>,
+    pub lose_reply: bool,
+    pub entered: Arc<Semaphore>,
+    pub release: Arc<Semaphore>,
+}
+impl Default for MemoryServer {
+    fn default() -> Self {
+        Self {
+            stats: Arc::default(),
+            grows: Arc::default(),
+            shrinks: Arc::default(),
+            reply: Arc::default(),
+            after_reply: Arc::default(),
+            lose_reply: false,
+            entered: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(1)),
+        }
+    }
+}
+impl MemoryServer {
+    pub async fn apply(
+        &self,
+        target: ResourceLimits,
+        id: String,
+        revision: u64,
+    ) -> Result<Response<ResizeResourcesResponse>, Status> {
+        self.entered.add_permits(1);
+        let _permit = self.release.acquire().await.unwrap();
+        let mut stats = self.stats.lock().unwrap();
+        let actual = stats.as_mut().unwrap();
+        actual.cpu_quota_usec = target.cpu_quota_usec;
+        actual.cpu_period_usec = target.cpu_period_usec;
+        actual.memory_limit_bytes = target.memory_limit_bytes;
+        actual.memory_high_bytes = target.memory_limit_bytes * 3 / 4;
+        actual.resource_operation_id = id;
+        actual.resource_revision = revision + 1;
+        if self.lose_reply {
+            return Err(Status::unavailable("reply lost after write"));
+        }
+        let reply = self
+            .reply
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or(ResizeResourcesResponse {
+                actual: Some(actual.clone()),
+                complete: true,
+                update_error: String::new(),
+            });
+        if let Some(changed) = self.after_reply.lock().unwrap().clone() {
+            *actual = changed;
+        }
+        Ok(Response::new(reply))
+    }
+}
+fn physical_stats() -> StatsResponse {
+    StatsResponse {
+        memory_usage_bytes: 48 * MIB, memory_usage_known: true,
+        memory_limit_bytes: 128 * MIB, memory_limit_known: true,
+        memory_high_bytes: 96 * MIB, memory_high_known: true,
+        cpu_quota_usec: 50_000, cpu_period_usec: 100_000, cpu_limits_known: true,
+        resource_generation: "physical-generation-1".into(),
+        resource_revision: 1, resource_revision_known: true, frozen_known: true,
+        elastic_policy: json!({"version":1,"CPU":{"initial":500,"ceiling":500},"Memory":{"initial":128,"ceiling":512}}).to_string(),
+        ..Default::default()
+    }
+}
+fn running_record() -> EnvironmentRecord {
+    let mut record = prepared_execution_target();
+    record.spec = elastic_spec();
+    record.state = EnvironmentState::Running;
+    record.runtime.id = "i-1".into();
+    record.runtime.ip = Some("10.0.0.2".parse().unwrap());
+    record
+}
+fn grant(sample: &adx_core::memory::MemorySample, target: u64) -> MemoryAuthorization {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    MemoryAuthorization {
+        request: MemoryRequest {
+            source: sample.observation.clone(),
+            target_limit_bytes: target,
+            target_high_bytes: target * 3 / 4,
+            operation_id: format!("memory-{}", sample.observation.resource_revision),
+            timeout_millis: 10_000,
+        },
+        node_session_id: "session-1".into(),
+        coordinator_epoch: 2,
+        issued_unix_millis: now,
+        deadline_unix_millis: now + 10_000,
+    }
+}
+async fn memory_fixture(memory: MemoryServer) -> (Sandboxd, Harness, EnvironmentRecord) {
+    let record = running_record();
+    let (adapter, harness) = connect(Server {
+        memory,
+        ..Default::default()
+    })
+    .await;
+    adapter
+        .start(
+            &record.spec,
+            &record.runtime.id,
+            record.assignment.generation,
+            &[],
+        )
+        .await
+        .unwrap();
+    (adapter, harness, record)
+}
+#[tokio::test]
+async fn physical_memory_grows_and_shrinks_with_exact_identity_revision_and_deadline() {
+    let memory = MemoryServer::default();
+    *memory.stats.lock().unwrap() = Some(physical_stats());
+    let (adapter, _harness, record) = memory_fixture(memory.clone()).await;
+    let birth = adapter.observe_memory(&record).await.unwrap();
+    assert_eq!(birth.observation.memory_limit_bytes, 128 * MIB);
+    assert_eq!(birth.peak_bytes, None);
+    assert_eq!(birth.pressure, None);
+    let grow = grant(&birth, 256 * MIB);
+    let after = adapter
+        .apply_memory(&record, &grow, "session-1", 2)
+        .await
+        .unwrap();
+    assert_eq!(after.observation, grow.request.completion().unwrap());
+    let wire = memory.grows.lock().unwrap()[0].clone();
+    assert_eq!(wire.sandbox_id, "generated-backend-id");
+    assert_eq!(wire.resource_generation, "physical-generation-1");
+    assert_eq!(wire.expected_revision, 1);
+    assert_eq!(wire.operation_id, grow.request.operation_id);
+    assert_eq!(wire.deadline_unix_ms, grow.deadline_unix_millis as i64);
+    assert_eq!(wire.expected.unwrap().memory_limit_bytes, 128 * MIB);
+    assert_eq!(wire.target.unwrap().cpu_quota_usec, 50_000);
+    let shrink = grant(&after, 128 * MIB);
+    assert_eq!(
+        adapter
+            .apply_memory(&record, &shrink, "session-1", 2)
+            .await
+            .unwrap()
+            .observation,
+        shrink.request.completion().unwrap()
+    );
+    assert_eq!(memory.shrinks.lock().unwrap().len(), 1);
+    adapter
+        .apply_memory(&record, &shrink, "session-1", 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        memory.shrinks.lock().unwrap().len(),
+        1,
+        "matching completed replay is read-only"
+    );
+}
+#[tokio::test]
+async fn physical_memory_refuses_unknown_or_foreign_readback() {
+    let memory = MemoryServer::default();
+    *memory.stats.lock().unwrap() = Some(physical_stats());
+    let (adapter, _harness, record) = memory_fixture(memory.clone()).await;
+    adapter.observe_memory(&record).await.unwrap();
+    for case in 0..15 {
+        let mut stats = physical_stats();
+        match case {
+            0 => stats.memory_usage_known = false,
+            1 => stats.memory_limit_known = false,
+            2 => stats.cpu_limits_known = false,
+            3 => stats.resource_revision_known = false,
+            4 => stats.memory_high_known = false,
+            5 => stats.memory_high_unlimited = true,
+            6 => stats.frozen_known = false,
+            7 => stats.frozen = true,
+            8 => stats.resource_operation_pending = true,
+            9 => stats.resource_generation = "foreign".into(),
+            10 => stats.cpu_quota_usec = 60_000,
+            11 => stats.memory_high_bytes = 100 * MIB,
+            12 => stats.elastic_policy = String::new(),
+            13 => stats.resource_revision = 0,
+            _ => stats.elastic_policy = stats.elastic_policy.replace("512", "1024"),
+        }
+        *memory.stats.lock().unwrap() = Some(stats);
+        assert!(
+            adapter.observe_memory(&record).await.is_err(),
+            "case {case}"
+        );
+    }
+}
+#[tokio::test]
+async fn physical_memory_lost_reply_retains_identity_for_read_only_reconciliation() {
+    let memory = MemoryServer {
+        lose_reply: true,
+        ..Default::default()
+    };
+    *memory.stats.lock().unwrap() = Some(physical_stats());
+    let (adapter, harness, record) = memory_fixture(memory.clone()).await;
+    let request = grant(&adapter.observe_memory(&record).await.unwrap(), 256 * MIB);
+    assert!(adapter
+        .apply_memory(&record, &request, "session-1", 2)
+        .await
+        .is_err());
+    drop(adapter);
+    let adapter = reconnect_with_journal(&harness).await;
+    assert_eq!(
+        adapter.observe_memory(&record).await.unwrap().observation,
+        request.request.completion().unwrap()
+    );
+    assert_eq!(memory.grows.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn physical_memory_rejects_invalid_authority_or_bounds_before_dispatch() {
+    let memory = MemoryServer::default();
+    *memory.stats.lock().unwrap() = Some(physical_stats());
+    let (adapter, _harness, record) = memory_fixture(memory.clone()).await;
+    let original = grant(&adapter.observe_memory(&record).await.unwrap(), 256 * MIB);
+    for case in 0..12 {
+        let mut g = original.clone();
+        let mut r = record.clone();
+        let mut session = "session-1";
+        let mut epoch = 2;
+        match case {
+            0 => session = "session-2",
+            1 => epoch = 3,
+            2 => {
+                g.issued_unix_millis = 1;
+                g.deadline_unix_millis = 10_001;
+            }
+            3 => g.request.source.identity.resource_generation = "other".into(),
+            4 => g.request.source.identity.assignment.node_id = "other".into(),
+            5 => g.request.target_high_bytes += 4096,
+            6 => {
+                g.request.target_limit_bytes = 1024 * MIB;
+                g.request.target_high_bytes = 768 * MIB;
+            }
+            7 => {
+                g.request.target_limit_bytes = 64 * MIB;
+                g.request.target_high_bytes = 48 * MIB;
+            }
+            8 => {
+                g.request.timeout_millis = 60_001;
+                g.deadline_unix_millis = g.issued_unix_millis + 60_001;
+            }
+            9 => g.request.operation_id = "unicode-操作".into(),
+            10 => r.spec.sandbox.elastic_memory = None,
+            _ => r.state = EnvironmentState::Paused,
+        }
+        assert!(
+            adapter.apply_memory(&r, &g, session, epoch).await.is_err(),
+            "case {case}"
+        );
+    }
+    assert!(memory.grows.lock().unwrap().is_empty());
+    assert!(memory.shrinks.lock().unwrap().is_empty());
+}
+#[tokio::test]
+async fn physical_memory_requires_complete_reply_and_independent_unfrozen_readback() {
+    for case in 0..9 {
+        let memory = MemoryServer::default();
+        *memory.stats.lock().unwrap() = Some(physical_stats());
+        let (adapter, _harness, record) = memory_fixture(memory.clone()).await;
+        let g = grant(&adapter.observe_memory(&record).await.unwrap(), 256 * MIB);
+        let mut actual = physical_stats();
+        actual.memory_limit_bytes = 256 * MIB;
+        actual.memory_high_bytes = 192 * MIB;
+        actual.resource_revision = 2;
+        actual.resource_operation_id = g.request.operation_id.clone();
+        let mut reply = ResizeResourcesResponse {
+            actual: Some(actual),
+            complete: true,
+            update_error: String::new(),
+        };
+        match case {
+            0 => reply.complete = false,
+            1 => reply.update_error = "partial write".into(),
+            2 => reply.actual = None,
+            3 => reply.actual.as_mut().unwrap().resource_generation = "other".into(),
+            4 => reply.actual.as_mut().unwrap().resource_operation_id = "other".into(),
+            5 => reply.actual.as_mut().unwrap().frozen = true,
+            6 => reply.actual.as_mut().unwrap().resource_operation_pending = true,
+            7 => reply.actual.as_mut().unwrap().resource_revision = 3,
+            _ => reply.actual.as_mut().unwrap().memory_high_known = false,
+        }
+        *memory.reply.lock().unwrap() = Some(reply);
+        assert!(
+            adapter
+                .apply_memory(&record, &g, "session-1", 2)
+                .await
+                .is_err(),
+            "case {case}"
+        );
+        assert_eq!(memory.grows.lock().unwrap().len(), 1);
+    }
+}
+#[tokio::test]
+async fn physical_memory_requires_durable_intent_before_dispatch() {
+    let memory = MemoryServer::default();
+    *memory.stats.lock().unwrap() = Some(physical_stats());
+    let (adapter, harness, record) = memory_fixture(memory.clone()).await;
+    let g = grant(&adapter.observe_memory(&record).await.unwrap(), 256 * MIB);
+    std::fs::remove_file(harness._directory.path().join("operations.sqlite")).unwrap();
+    assert!(adapter
+        .apply_memory(&record, &g, "session-1", 2)
+        .await
+        .is_err());
+    assert!(memory.grows.lock().unwrap().is_empty());
+}
+#[tokio::test]
+async fn physical_memory_cancelled_caller_keeps_lock_and_intent_until_reply() {
+    let memory = MemoryServer {
+        release: Arc::new(Semaphore::new(0)),
+        ..Default::default()
+    };
+    *memory.stats.lock().unwrap() = Some(physical_stats());
+    let (adapter, harness, record) = memory_fixture(memory.clone()).await;
+    let g = grant(&adapter.observe_memory(&record).await.unwrap(), 256 * MIB);
+    let task = {
+        let a = adapter.clone();
+        let r = record.clone();
+        let g = g.clone();
+        tokio::spawn(async move { a.apply_memory(&r, &g, "session-1", 2).await })
+    };
+    tokio::time::timeout(Duration::from_secs(3), memory.entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let database = harness._directory.path().join("operations.sqlite");
+    let db = rusqlite::Connection::open(&database).unwrap();
+    let payload: String = db
+        .query_row(
+            "SELECT payload FROM operations WHERE runtime_id=?1",
+            [&record.runtime.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(
+        payload["memory"]["authorization"],
+        serde_json::to_value(&g).unwrap()
+    );
+    assert_eq!(
+        payload["memory"]["request_sha256"].as_str().unwrap().len(),
+        64
+    );
+    let version: u32 = db
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 2);
+    drop(db);
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    let delete = {
+        let a = adapter.clone();
+        let id = record.runtime.id.clone();
+        tokio::spawn(async move { a.remove(&id).await })
+    };
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert!(!delete.is_finished());
+    memory.release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(3), delete)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    drop(adapter);
+    let adapter = reconnect_with_journal(&harness).await;
+    adapter.remove(&record.runtime.id).await.unwrap();
+    assert_eq!(memory.grows.lock().unwrap().len(), 1);
+}
+#[tokio::test]
+async fn physical_memory_rechecks_deadline_after_waiting_for_serial_lock() {
+    let memory = MemoryServer {
+        release: Arc::new(Semaphore::new(0)),
+        ..Default::default()
+    };
+    *memory.stats.lock().unwrap() = Some(physical_stats());
+    let (adapter, _harness, record) = memory_fixture(memory.clone()).await;
+    let g = grant(&adapter.observe_memory(&record).await.unwrap(), 256 * MIB);
+    let first = {
+        let a = adapter.clone();
+        let r = record.clone();
+        let g = g.clone();
+        tokio::spawn(async move { a.apply_memory(&r, &g, "session-1", 2).await })
+    };
+    tokio::time::timeout(Duration::from_secs(3), memory.entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let mut short = g.clone();
+    short.request.operation_id = "queued-expiry".into();
+    short.request.timeout_millis = 100;
+    short.deadline_unix_millis = short.issued_unix_millis + 100;
+    let second = {
+        let a = adapter.clone();
+        let r = record.clone();
+        tokio::spawn(async move { a.apply_memory(&r, &short, "session-1", 2).await })
+    };
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    memory.release.add_permits(1);
+    first.await.unwrap().unwrap();
+    assert!(second.await.unwrap().is_err());
+    assert_eq!(memory.grows.lock().unwrap().len(), 1);
+}
+#[tokio::test]
+async fn physical_memory_completed_replay_rejects_changed_fingerprint() {
+    let memory = MemoryServer::default();
+    *memory.stats.lock().unwrap() = Some(physical_stats());
+    let (adapter, _harness, record) = memory_fixture(memory.clone()).await;
+    let mut g = grant(&adapter.observe_memory(&record).await.unwrap(), 256 * MIB);
+    adapter
+        .apply_memory(&record, &g, "session-1", 2)
+        .await
+        .unwrap();
+    g.issued_unix_millis += 1;
+    g.deadline_unix_millis += 1;
+    assert!(adapter
+        .apply_memory(&record, &g, "session-1", 2)
+        .await
+        .is_err());
+    assert_eq!(memory.grows.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn physical_memory_success_reply_cannot_replace_independent_readback() {
+    for case in 0..3 {
+        let memory = MemoryServer::default();
+        *memory.stats.lock().unwrap() = Some(physical_stats());
+        let (adapter, _harness, record) = memory_fixture(memory.clone()).await;
+        let g = grant(&adapter.observe_memory(&record).await.unwrap(), 256 * MIB);
+        let mut changed = physical_stats();
+        changed.memory_limit_bytes = 256 * MIB;
+        changed.memory_high_bytes = 192 * MIB;
+        changed.resource_revision = 2;
+        changed.resource_operation_id = g.request.operation_id.clone();
+        match case {
+            0 => changed.frozen = true,
+            1 => changed.resource_operation_id = "foreign".into(),
+            _ => changed.memory_high_known = false,
+        }
+        *memory.after_reply.lock().unwrap() = Some(changed);
+        assert!(
+            adapter
+                .apply_memory(&record, &g, "session-1", 2)
+                .await
+                .is_err(),
+            "case {case}: an apparently complete reply must not settle mismatched current state"
+        );
+        assert_eq!(memory.grows.lock().unwrap().len(), 1);
+    }
+}

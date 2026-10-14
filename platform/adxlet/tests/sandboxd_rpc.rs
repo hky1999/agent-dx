@@ -56,6 +56,7 @@ struct Server {
     start_operations: Arc<Mutex<Vec<StartOperationRequest>>>,
     start_queries: Arc<Mutex<Vec<GetStartOperationRequest>>>,
     start_outcomes: Arc<Mutex<HashMap<String, StartOperationResponse>>>,
+    memory: memory_elasticity::MemoryServer,
 }
 impl Default for Server {
     fn default() -> Self {
@@ -98,6 +99,7 @@ impl Default for Server {
             start_operations: Arc::default(),
             start_queries: Arc::default(),
             start_outcomes: Arc::default(),
+            memory: Default::default(),
         }
     }
 }
@@ -120,15 +122,31 @@ impl sandbox_service_server::SandboxService for Server {
     }
     async fn resize_resources(
         &self,
-        _: Request<ResizeResourcesRequest>,
+        request: Request<ResizeResourcesRequest>,
     ) -> Result<Response<ResizeResourcesResponse>, Status> {
-        Err(Status::unimplemented("outside this lifecycle test"))
+        let request = request.into_inner();
+        self.memory.grows.lock().unwrap().push(request.clone());
+        self.memory
+            .apply(
+                request.target.unwrap(),
+                request.operation_id,
+                request.expected_revision,
+            )
+            .await
     }
     async fn shrink_resources(
         &self,
-        _: Request<ShrinkResourcesRequest>,
+        request: Request<ShrinkResourcesRequest>,
     ) -> Result<Response<ResizeResourcesResponse>, Status> {
-        Err(Status::unimplemented("outside this lifecycle test"))
+        let request = request.into_inner();
+        self.memory.shrinks.lock().unwrap().push(request.clone());
+        self.memory
+            .apply(
+                request.target.unwrap(),
+                request.operation_id,
+                request.expected_revision,
+            )
+            .await
     }
     async fn start_operation(
         &self,
@@ -367,6 +385,9 @@ impl sandbox_service_server::SandboxService for Server {
         request: Request<StatsRequest>,
     ) -> Result<Response<StatsResponse>, Status> {
         assert_eq!(request.into_inner().id, "generated-backend-id");
+        if let Some(stats) = self.memory.stats.lock().unwrap().clone() {
+            return Ok(Response::new(stats));
+        }
         Ok(Response::new(StatsResponse {
             memory_usage_bytes: 123,
             cpu_usage_ns: 456,
