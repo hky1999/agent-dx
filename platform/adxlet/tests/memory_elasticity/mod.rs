@@ -875,3 +875,153 @@ async fn physical_memory_retirement_requires_confirmed_daemon_reply() {
     assert!(memory.grows.lock().unwrap().is_empty());
     assert!(memory.shrinks.lock().unwrap().is_empty());
 }
+
+fn elastic_restore_permission() -> adx_core::execution::ExecutionAuthorization {
+    let mut request = prepared_execution_permission().request;
+    request.source.spec = elastic_spec();
+    request.source.state = EnvironmentState::Paused;
+    request.source.restart_pending = false;
+    request.source.checkpoint = Some(adx_core::RestorePoint {
+        origin: None,
+        id: "elastic-checkpoint".into(),
+        artifact: adx_core::CheckpointArtifact {
+            storage: "shared".into(),
+            location: "/checkpoint".into(),
+            size_bytes: 8,
+        },
+        expires_at_unix_seconds: u64::MAX,
+        source_runtime_id: request.source.runtime.id.clone(),
+    });
+    request.kind = adx_core::execution::ExecutionKind::Resume;
+    request.timeout_millis = 60_000;
+    execution_authority::authorize(&request).unwrap()
+}
+
+fn assert_elastic_restore_request(request: &StartRequest) {
+    assert_eq!(
+        request.resources["Memory"], 512.0,
+        "restore must use the reserved ceiling while loading the checkpoint"
+    );
+    assert_eq!(request.resources["CPU"], 500.0);
+    let policy: serde_json::Value =
+        serde_json::from_str(&request.labels["akernel.scheduler/elastic-resources"]).unwrap();
+    assert_eq!(
+        policy,
+        json!({"version":1,"CPU":{"initial":500,"ceiling":500},"Memory":{"initial":128,"ceiling":512}})
+    );
+    assert!(request.checkpoint_info.is_some());
+}
+
+#[tokio::test]
+async fn elastic_restore_dispatches_reserved_ceiling_and_preserves_original_policy() {
+    let server = Server::default();
+    let (adapter, harness) = connect(server.clone()).await;
+    let specification = elastic_spec();
+    let path = harness._directory.path().join("checkpoint");
+    adapter
+        .restore(&specification, "i-1-r2", 1, &[], &path)
+        .await
+        .unwrap();
+    let starts = server.starts.lock().unwrap();
+    assert_eq!(starts.len(), 1);
+    assert_elastic_restore_request(&starts[0]);
+    assert_eq!(specification.execution_resources().memory_bytes, 128 * MIB);
+    assert_eq!(
+        start_request(&specification, "other-1", 1, &[], &Config::default())
+            .unwrap()
+            .resources["Memory"],
+        128.0
+    );
+}
+
+#[tokio::test]
+async fn elastic_authorized_restore_replays_original_ceiling_after_journal_reopen() {
+    let server = Server::default();
+    let (adapter, harness) = connect(server.clone()).await;
+    let grant = elastic_restore_permission();
+    adapter.prepare_execution(&grant.target).await.unwrap();
+    drop(adapter);
+    let adapter = reconnect_with_journal(&harness).await;
+    let path = harness._directory.path().join("checkpoint");
+    let ip = adapter
+        .execute_authorized(
+            &grant,
+            Some(adxlet::ExecutionRestore {
+                path: &path,
+                origin: None,
+            }),
+        )
+        .await
+        .unwrap();
+    drop(adapter);
+    let adapter = reconnect_with_journal(&harness).await;
+    assert_eq!(
+        adapter
+            .execute_authorized(
+                &grant,
+                Some(adxlet::ExecutionRestore {
+                    path: &path,
+                    origin: None
+                })
+            )
+            .await
+            .unwrap(),
+        ip
+    );
+    let starts = server.starts.lock().unwrap();
+    assert_eq!(
+        starts.len(),
+        1,
+        "journal replay cannot start another physical execution"
+    );
+    assert_elastic_restore_request(&starts[0]);
+    assert_eq!(
+        grant.target.spec.execution_resources().memory_bytes,
+        128 * MIB
+    );
+    assert_eq!(
+        grant.target.spec.execution_ceiling().memory_bytes,
+        512 * MIB
+    );
+}
+
+#[tokio::test]
+async fn elastic_expired_restore_permission_cannot_dispatch_ceiling() {
+    let server = Server::default();
+    let (adapter, harness) = connect(server.clone()).await;
+    let mut grant = elastic_restore_permission();
+    adapter.prepare_execution(&grant.target).await.unwrap();
+    grant.issued_unix_millis -= 120_000;
+    grant.deadline_unix_millis -= 120_000;
+    let path = harness._directory.path().join("checkpoint");
+    assert!(adapter
+        .execute_authorized(
+            &grant,
+            Some(adxlet::ExecutionRestore {
+                path: &path,
+                origin: None
+            })
+        )
+        .await
+        .is_err());
+    assert!(server.starts.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn fixed_restore_keeps_its_original_requested_bound() {
+    let server = Server::default();
+    let (adapter, harness) = connect(server.clone()).await;
+    let specification = spec();
+    let expected = start_request(&specification, "i-1-r2", 1, &[], &Config::default()).unwrap();
+    let path = harness._directory.path().join("checkpoint");
+    adapter
+        .restore(&specification, "i-1-r2", 1, &[], &path)
+        .await
+        .unwrap();
+    let starts = server.starts.lock().unwrap();
+    assert_eq!(starts.len(), 1);
+    assert_eq!(starts[0].resources, expected.resources);
+    assert!(!starts[0]
+        .labels
+        .contains_key("akernel.scheduler/elastic-resources"));
+}

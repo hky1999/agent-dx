@@ -325,6 +325,15 @@ impl Sandboxd {
         let mut request = self
             .execution_request(spec, runtime_id, generation, devices)
             .await?;
+        if spec.sandbox.elastic_memory.is_some() {
+            // Recovery already holds this ceiling in the shared durable budget.
+            // Keep the original initial/ceiling policy and prepared fingerprint;
+            // only the effective restore limit uses the reserved headroom.
+            request.get_mut().resources.insert(
+                "Memory".into(),
+                spec.execution_ceiling().memory_bytes as f64 / 1_048_576.0,
+            );
+        }
         if let Some(origin) = origin {
             let context = adx_core::runtime::RuntimeRestore {
                 target: adx_core::runtime::RuntimeIdentity {
