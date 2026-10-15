@@ -138,6 +138,7 @@ impl StoredEnvironment {
     }
 }
 
+// Availability gates new admission; settlement still requires the current routable owner.
 fn check_session(
     raw: &BTreeMap<String, String>,
     assignment: &Assignment,
@@ -154,8 +155,7 @@ fn check_session(
             .session
             .as_ref()
             .is_none_or(|s| s.id != session || !s.routable)
-        || !node.node.available
-        || (admitting && node.scheduling_paused)
+        || (admitting && (!node.node.available || node.scheduling_paused))
     {
         return Err(Error::Conflict);
     }

@@ -1218,3 +1218,6 @@ async fn memory_failed_partial_execution_keeps_hold_across_restart_until_exact_r
         assert_eq!(reopened.get("neighbor").await.unwrap(), before);
     }
 }
+
+#[path = "memory/unavailable.rs"]
+mod unavailable;

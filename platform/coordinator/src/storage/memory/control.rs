@@ -223,7 +223,7 @@ impl Session {
                 }
                 account.window.last_unix_millis = sample.observed_unix_millis;
             }
-            if new_sample && !node.scheduling_paused {
+            if new_sample && node.node.available && !node.scheduling_paused {
                 if let Some(p) = policy {
                     if let Some(target) = p.target(&env, &sample, now)? {
                         let request = MemoryRequest {

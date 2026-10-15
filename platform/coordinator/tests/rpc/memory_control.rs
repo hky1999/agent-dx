@@ -225,6 +225,20 @@ async fn memory_rpc_authenticates_owner_reserves_settles_and_retires_without_sta
         sink.reconcile_memory(&sample).await.unwrap().authorization,
         Some(grant.clone())
     );
+    // Closing admission preserves the current owner and its original pending grant.
+    report.heartbeat_sequence += 1;
+    report.accepting_allocations = false;
+    owner.register_node(report.clone()).await.unwrap();
+    assert!(
+        !session.snapshot().await.unwrap().nodes["node"]
+            .node
+            .available
+    );
+    sample.observed_unix_millis = now();
+    assert_eq!(
+        sink.reconcile_memory(&sample).await.unwrap().authorization,
+        Some(grant.clone())
+    );
     sample.observation = grant.request.completion().unwrap();
     sample.usage_bytes = 32 * MIB;
     sample.observed_unix_millis = now();
@@ -244,6 +258,35 @@ async fn memory_rpc_authenticates_owner_reserves_settles_and_retires_without_sta
             .confirmed,
         sample.observation
     );
+    assert!(
+        !session.snapshot().await.unwrap().nodes["node"]
+            .node
+            .available
+    );
+    let mut closed_request = pb::ReconcileMemoryRequest {
+        sample: Some(sample.clone().try_into().unwrap()),
+        node_session_id: "retired".into(),
+    };
+    assert_eq!(
+        owner
+            .reconcile_memory(closed_request.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    closed_request.node_session_id = report.session_id.clone();
+    assert_eq!(
+        client
+            .reconcile_memory(closed_request)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    report.heartbeat_sequence += 1;
+    report.accepting_allocations = true;
+    owner.register_node(report.clone()).await.unwrap();
     let mut lifecycle =
         pb::node_service_client::NodeServiceClient::new(channel(node_address, "apiserver").await);
     let delete = pb::DeleteEnvironmentRequest {
