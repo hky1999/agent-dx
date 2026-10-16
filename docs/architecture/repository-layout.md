@@ -135,7 +135,7 @@ Proxy 首次启动关闭 Environment 准入，adxlet 完成权威对账与全量
 
 正常结果经 Coordinator 写 Redis；SQLite 只在提交不可用时保存待补交结果。Journaled 不发布 Ingress 路由。节点重启而 Coordinator 不可用时等待对账，不从不完整日志重建目录。快照制品走独立的本地/S3 存储抽象。Redis 使用 `environment:<environment_id>`，SQLite journal 使用 `environment` 字段；Coordinator 启动时仅将已删除且不占资源的旧 `capsule:*` 记录原子迁移为 `environment:*`。其他旧控制状态和节点 SQLite journal 不能据此视为兼容，升级前需要单独评估和迁移。详见 [持久化契约](../testing/coordinator-storage.md)和[节点契约](../testing/node-lifecycle.md)。
 
-宿主持久预算还提供独立内存授权的存储基础：需求和允许上限保持在 EnvironmentSpec，确认额度及扩缩容预留保存在同一个 Environment 的 memory 字段。创建、恢复与内存授权共用控制头 CAS，初始化后使用 schema 4。内部协议可显式声明弹性出生额度和不可变上限；恢复前保守预留上限，调度重建使用持久内存账户。sandboxd 适配层的完整资源回读与条件内存派发已接入中心 RPC、节点串行操作与额度同步；中心自动策略默认关闭，公开创建入口和物理闭环仍待完成，详见[内存额度契约](../testing/coordinator-storage.md#内存额度的持久授权基础)。
+宿主持久预算还提供独立内存授权的存储基础：需求和允许上限保持在 EnvironmentSpec，确认额度及扩缩容预留保存在同一个 Environment 的 memory 字段。创建、恢复与内存授权共用控制头CAS；宿主预算使用schema 7，并在返回读写结果前通过同一连接的有界标记及WAITAOF确认本地AOF同步。原授权的只读重放、连接重建和结算同样必须确认；较早预算格式在确认后的启动时升级，旧写入者不能降级写入。内部协议可显式声明弹性出生额度和不可变上限；恢复前保守预留上限，调度重建使用持久内存账户。sandboxd 适配层的完整资源回读与条件内存派发已接入中心 RPC、节点串行操作与额度同步；中心自动策略默认关闭，公开创建入口已支持显式弹性配置；源码能力与各部署的物理验收分别记录，详见[内存额度契约](../testing/coordinator-storage.md#内存额度的持久授权基础)。
 
 ## 构建、部署和验收
 

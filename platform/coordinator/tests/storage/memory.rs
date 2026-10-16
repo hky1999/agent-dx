@@ -11,8 +11,20 @@ async fn fixture() -> (common::Redis, Session, EnvironmentRecord, MemoryObservat
 async fn fixture_with_elastic(
     elastic: bool,
 ) -> (common::Redis, Session, EnvironmentRecord, MemoryObservation) {
+    fixture_with_timeout(elastic, std::time::Duration::from_millis(300)).await
+}
+
+async fn fixture_with_timeout(
+    elastic: bool,
+    timeout: std::time::Duration,
+) -> (common::Redis, Session, EnvironmentRecord, MemoryObservation) {
     let rig = common::Redis::new().await;
-    let session = rig.store().await.begin(1).await.unwrap();
+    let session = adx_coordinator::storage::RedisStore::connect(&rig.url, "test", timeout)
+        .await
+        .unwrap()
+        .begin(1)
+        .await
+        .unwrap();
     let mut n = node("first");
     n.memory_control_version = 1;
     n.capacity = Resources {
@@ -1221,3 +1233,382 @@ async fn memory_failed_partial_execution_keeps_hold_across_restart_until_exact_r
 
 #[path = "memory/unavailable.rs"]
 mod unavailable;
+
+async fn persistence_setting(rig: &common::Redis, name: &str, value: &str) {
+    let mut connection = redis::Client::open(rig.url.as_str())
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let result: String = redis::cmd("CONFIG")
+        .arg("SET")
+        .arg(name)
+        .arg(value)
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(result, "OK");
+}
+
+async fn raw_control(rig: &common::Redis) -> BTreeMap<String, String> {
+    let mut connection = redis::Client::open(rig.url.as_str())
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    redis::cmd("HGETALL")
+        .arg("adx:{test}:control:v1")
+        .query_async(&mut connection)
+        .await
+        .unwrap()
+}
+
+async fn persistence_fixture(
+    timeout: std::time::Duration,
+) -> (common::Redis, Session, MemoryObservation) {
+    let (rig, session, _, observation) = fixture_with_timeout(false, timeout).await;
+    session
+        .initialize_memory(observation.clone(), "boot-first")
+        .await
+        .unwrap();
+    let shrink = session
+        .authorize_memory(
+            request(&observation, "persistence-prepare", 128),
+            "boot-first",
+            1000,
+        )
+        .await
+        .unwrap();
+    let confirmed = completed(&shrink);
+    session
+        .complete_memory(shrink, confirmed.clone(), "boot-first")
+        .await
+        .unwrap();
+    (rig, session, confirmed)
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn memory_persistence_unconfirmed_fsync_cannot_authorize_new_growth() {
+    let (rig, session, source) = persistence_fixture(std::time::Duration::from_millis(300)).await;
+    let before = raw_control(&rig).await;
+    persistence_setting(&rig, "appendfsync", "no").await;
+    let result = session
+        .authorize_memory(
+            request(&source, "unconfirmed-growth", 192),
+            "boot-first",
+            2000,
+        )
+        .await;
+    assert!(
+        matches!(result, Err(Error::Unavailable(_))),
+        "unconfirmed persistence must not issue a new physical authorization"
+    );
+    assert_eq!(
+        raw_control(&rig).await,
+        before,
+        "rejected growth must retain the original account and header"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn memory_persistence_original_grant_replay_cannot_bypass_confirmation() {
+    let (rig, session, source) = persistence_fixture(std::time::Duration::from_millis(300)).await;
+    let grant = session
+        .authorize_memory(
+            request(&source, "persistence-original-grant", 192),
+            "boot-first",
+            2000,
+        )
+        .await
+        .unwrap();
+    let before = raw_control(&rig).await;
+    persistence_setting(&rig, "appendfsync", "no").await;
+    let replay = session
+        .authorize_memory(grant.request.clone(), "boot-first", 9000)
+        .await;
+    assert!(
+        matches!(replay, Err(Error::Unavailable(_))),
+        "read-only grant replay must also obtain persistence confirmation"
+    );
+    assert_eq!(raw_control(&rig).await, before);
+    persistence_setting(&rig, "appendfsync", "always").await;
+    assert_eq!(
+        session
+            .authorize_memory(grant.request.clone(), "boot-first", 9000)
+            .await
+            .unwrap(),
+        grant
+    );
+    assert_eq!(
+        held(&session).await,
+        192 * MIB,
+        "confirmation recovery retains the same grant and one hold"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn memory_persistence_shrink_settlement_waits_for_confirmation() {
+    let (rig, session, _, source) = fixture().await;
+    session
+        .initialize_memory(source.clone(), "boot-first")
+        .await
+        .unwrap();
+    let grant = session
+        .authorize_memory(
+            request(&source, "unconfirmed-shrink", 128),
+            "boot-first",
+            1000,
+        )
+        .await
+        .unwrap();
+    let observation = completed(&grant);
+    let before = raw_control(&rig).await;
+    persistence_setting(&rig, "appendfsync", "no").await;
+    let result = session
+        .complete_memory(grant.clone(), observation.clone(), "boot-first")
+        .await;
+    assert!(
+        matches!(result, Err(Error::Unavailable(_))),
+        "unconfirmed shrink must not acknowledge a budget refund"
+    );
+    assert_eq!(
+        raw_control(&rig).await,
+        before,
+        "the original pending reservation must remain unchanged"
+    );
+    persistence_setting(&rig, "appendfsync", "always").await;
+    assert_eq!(held(&session).await, 256 * MIB);
+    session
+        .complete_memory(grant.clone(), observation.clone(), "boot-first")
+        .await
+        .unwrap();
+    session
+        .complete_memory(grant, observation, "boot-first")
+        .await
+        .unwrap();
+    assert_eq!(held(&session).await, 128 * MIB);
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn memory_persistence_disabled_aof_cannot_authorize_growth() {
+    let (rig, session, source) = persistence_fixture(std::time::Duration::from_millis(300)).await;
+    let before = raw_control(&rig).await;
+    persistence_setting(&rig, "appendonly", "no").await;
+    let result = session
+        .authorize_memory(
+            request(&source, "disabled-aof-growth", 192),
+            "boot-first",
+            2000,
+        )
+        .await;
+    assert!(
+        matches!(result, Err(Error::Unavailable(_))),
+        "volatile Redis storage must not authorize physical growth"
+    );
+    assert_eq!(raw_control(&rig).await, before);
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn memory_persistence_everysec_confirmation_and_restart_preserve_one_account() {
+    let (mut rig, session, source) = persistence_fixture(std::time::Duration::from_secs(5)).await;
+    persistence_setting(&rig, "appendfsync", "everysec").await;
+    // The policy alone is not a rejection: a completed fsync can confirm the operation.
+    persistence_setting(&rig, "no-appendfsync-on-rewrite", "yes").await;
+    let grant = session
+        .authorize_memory(
+            request(&source, "everysec-confirmed-growth", 192),
+            "boot-first",
+            2000,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        session
+            .authorize_memory(grant.request.clone(), "boot-first", 9000)
+            .await
+            .unwrap(),
+        grant
+    );
+    session
+        .complete_memory(grant.clone(), completed(&grant), "boot-first")
+        .await
+        .unwrap();
+    let before = raw_control(&rig).await;
+    let mut connection = redis::Client::open(rig.url.as_str())
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let keys: Vec<String> = redis::cmd("KEYS")
+        .arg("adx:{test}:control:v1*")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(
+        keys.len(),
+        2,
+        "one bounded persistence marker is retained alongside the control hash"
+    );
+    rig.crash();
+    rig.start().await;
+    let recovered = rig.store().await.begin(1).await.unwrap();
+    assert_eq!(
+        raw_control(&rig).await["environment:a"],
+        before["environment:a"]
+    );
+    assert_eq!(held(&recovered).await, 192 * MIB);
+    // A process restart test is not a host power-loss test.
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn memory_persistence_existing_budget_requires_confirmation_before_new_epoch() {
+    let (rig, _, _) = persistence_fixture(std::time::Duration::from_millis(300)).await;
+    let before = raw_control(&rig).await;
+    persistence_setting(&rig, "appendfsync", "no").await;
+    let store = rig.store().await;
+    assert!(
+        matches!(store.begin(1).await, Err(Error::Unavailable(_))),
+        "a fresh connection must discover and confirm the persisted budget before advancing epoch"
+    );
+    assert_eq!(raw_control(&rig).await, before);
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn memory_persistence_installing_budget_requires_confirmation_before_write() {
+    let rig = common::Redis::new().await;
+    let session = rig.store().await.begin(1).await.unwrap();
+    let before = raw_control(&rig).await;
+    persistence_setting(&rig, "appendfsync", "no").await;
+    let result = session
+        .configure_host_budgets(BTreeMap::from([(
+            "host".into(),
+            HostBudget {
+                capacity: Resources {
+                    cpu_millis: 1000,
+                    memory_bytes: 512 * MIB,
+                    disk_bytes: 0,
+                },
+                nodes: ["first".into()].into(),
+            },
+        )]))
+        .await;
+    assert!(
+        matches!(result, Err(Error::Unavailable(_))),
+        "budget installation must not acknowledge unconfirmed state"
+    );
+    assert_eq!(raw_control(&rig).await, before);
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn memory_persistence_unconfigured_namespace_keeps_operator_policy() {
+    let rig = common::Redis::new().await;
+    persistence_setting(&rig, "appendonly", "no").await;
+    let session = rig.store().await.begin(1).await.unwrap();
+    assert!(session.host_budgets().await.unwrap().is_empty());
+    let mut connection = redis::Client::open(rig.url.as_str())
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let keys: Vec<String> = redis::cmd("KEYS")
+        .arg("adx:{test}:control:v1*")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(keys, ["adx:{test}:control:v1"]);
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn memory_persistence_retirement_does_not_refund_without_confirmation() {
+    let (rig, session, mut record, source) = fixture().await;
+    session
+        .initialize_memory(source, "boot-first")
+        .await
+        .unwrap();
+    record.revision += 1;
+    record.state = EnvironmentState::Failed;
+    record.resources_held = false;
+    record.runtime.ip = None;
+    let before = raw_control(&rig).await;
+    persistence_setting(&rig, "appendfsync", "no").await;
+    assert!(
+        matches!(
+            session.commit(record.clone()).await,
+            Err(Error::Unavailable(_))
+        ),
+        "retirement must not acknowledge an unconfirmed refund"
+    );
+    assert_eq!(raw_control(&rig).await, before);
+    persistence_setting(&rig, "appendfsync", "always").await;
+    assert_eq!(held(&session).await, 256 * MIB);
+    session.commit(record.clone()).await.unwrap();
+    session.commit(record).await.unwrap();
+    assert_eq!(held(&session).await, 0);
+}
+
+#[path = "../common/persistence_proxy.rs"]
+mod persistence_proxy;
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn memory_persistence_applied_write_without_confirmation_remains_one_unknown_hold() {
+    let (rig, _original_session, source) =
+        persistence_fixture(std::time::Duration::from_millis(300)).await;
+    let proxy = persistence_proxy::FsyncFaultProxy::new(&rig.url, "post-write-unknown");
+    let session = adx_coordinator::storage::RedisStore::connect(
+        &proxy.url,
+        "test",
+        std::time::Duration::from_millis(300),
+    )
+    .await
+    .unwrap()
+    .begin(1)
+    .await
+    .unwrap();
+    let original = raw_control(&rig).await;
+    let request = request(&source, "post-write-unknown", 192);
+    // The proxy disables fsync only after successful reads, immediately before
+    // forwarding this operation's real control CAS to the dedicated Redis.
+    let result = session
+        .authorize_memory(request.clone(), "boot-first", 2000)
+        .await;
+    assert!(
+        proxy.injected(),
+        "the fault must be at the actual CAS boundary"
+    );
+    assert!(
+        matches!(result, Err(Error::Unavailable(_))),
+        "an applied CAS without fsync confirmation must not authorize physical execution"
+    );
+    let unknown = raw_control(&rig).await;
+    assert_ne!(
+        unknown["environment:a"], original["environment:a"],
+        "the original CAS really applied before confirmation failed"
+    );
+    let environment: adx_coordinator::storage::StoredEnvironment =
+        serde_json::from_str(&unknown["environment:a"]).unwrap();
+    let account = environment.memory.unwrap();
+    assert_eq!(account.confirmed.memory_limit_bytes, 128 * MIB);
+    let grant = account.pending.unwrap().authorization;
+    assert_eq!(grant.request, request);
+    assert_eq!(grant.request.target_limit_bytes, 192 * MIB);
+    persistence_setting(&rig, "appendfsync", "always").await;
+    assert_eq!(
+        session
+            .authorize_memory(request, "boot-first", 9000)
+            .await
+            .unwrap(),
+        grant,
+        "reconciliation confirms the original applied grant without extending its deadline"
+    );
+    assert_eq!(held(&session).await, 192 * MIB);
+}

@@ -68,7 +68,7 @@ sandboxd 始终由部署环境独立托管，角色枚举不允许 supervisor �
 }
 ```
 
-CLI 创建配置指定的数据目录，生成 `appendonly yes` 的 Redis 配置；`appendfsync` 可选 `always`、`everysec`、`no`。部署者应确保公共 `redis_url` 与实际 Redis 入口一致。当前托管 Redis 示例用于本机受保护入口；外部 Redis 的网络和访问配置由部署环境负责。包中固定 Redis 7.2.5，携带许可证和来源信息。
+CLI 创建配置指定的数据目录，生成 `appendonly yes` 的 Redis 配置；`appendfsync` 可选 `always`、`everysec`、`no`。部署者应确保公共 `redis_url` 与实际 Redis 入口一致。当前托管 Redis 示例用于本机受保护入口；外部 Redis 的网络和访问配置由部署环境负责。包中固定 Redis 7.2.5，携带许可证和来源信息。启用Coordinator宿主预算时要求AOF和WAITAOF本地同步确认，控制连接还须具有SET及WAITAOF权限；建议使用always以控制确认延迟。everysec仍可配置，但确认必须在原存储期限内完成；no不能作为可靠预算部署配置。未配置宿主预算的命名空间保持原刷盘行为，详见[持久性契约](coordinator-storage.md#故障与持久性)。
 
 ## 出包
 

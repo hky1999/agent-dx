@@ -112,6 +112,7 @@ impl Session {
         budgets: BTreeMap<String, HostBudget>,
     ) -> Result<()> {
         validate_budgets(&budgets)?;
+        self.store.require_durable_budget();
         for _ in 0..ATTEMPTS {
             let raw = self.store.raw().await?;
             let mut header = self.header(&raw.get(HEADER).cloned())?;
@@ -123,9 +124,8 @@ impl Session {
                 };
             }
             statuses(&raw, &budgets, None)?;
-            // Schema 1 binaries must reject this namespace rather than silently
-            // deserialize away the host budget on their next header write.
-            header.schema = header.schema.max(2);
+            // Older writers must reject the durable-acknowledgement contract.
+            header.schema = header.schema.max(7);
             header.host_budgets = Some(budgets.clone());
             header.advance()?;
             if self

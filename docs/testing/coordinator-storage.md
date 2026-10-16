@@ -1,6 +1,6 @@
 # Coordinator Redis 持久化与恢复
 
-2026-09-17 核对。Coordinator 存储、RPC、Node StateSink 和 Ingress 路由订阅均已接通；普通生命周期状态决策仍在 adxlet。下文末尾保留 2026-09-14 存储组件测试记录。
+当前源码描述已包含宿主预算的逐次本地AOF确认；Coordinator存储、RPC、Node StateSink和Ingress路由订阅已接通，普通生命周期状态决策仍在adxlet。测试与具体部署的验证范围分别记录，下文末尾保留2026-09-14存储组件测试记录。
 
 ## 模块与边界
 
@@ -24,6 +24,8 @@
 | `header` | schema、域数量、Coordinator epoch、generation 下限、全局发布 revision、节点分域轮转位置，以及可选的可信宿主预算与节点归属 |
 | `node:<node_id>` | 节点资源和设备、固定 shard_id、adxlet 地址、Relay 地址 |
 | `environment:<environment_id>` | 活跃 Environment 的原始 EnvironmentSpec、精确 Assignment、最后一次已提交的节点结果；删除成功后原子移除 |
+
+启用宿主预算后，主目录后缀 `:durability` 是一个覆盖写入的UUID确认标记；每个命名空间只保留一个标记，不保存另一份额度或操作账本。
 
 其他现有键：主目录后缀 `:snapshots` 保存快照目录，`:credentials` 保存凭证摘要，`:revoked-credentials` 保存吊销标记；`adx:{namespace}:coordinator:v1` 保存带 TTL 的 Coordinator 发现信息。它们不等同于持久化路由事件队列。
 
@@ -52,17 +54,17 @@
 
 `storage/budget.rs` 提供 `Session::configure_host_budgets` 和 `Session::host_budgets`。每个宿主配置一份 CPU、内存、磁盘容量及明确的节点集合；节点通告、心跳、标签和在线状态不能改写这份容量。一个节点只能属于一个宿主。配置与归属记录共用控制头的原子提交；既有占用超额或没有可信归属时不安装配置，重复配置必须完全相同。
 
-安装后控制头至少为 schema 2；首次执行授权升级为 schema 3，旧版本写入者必须拒绝它不认识的格式，不能忽略待执行字段后继续写入。Coordinator 重启即使未再次传入配置也保留原预算，旧 epoch 不能写入。当前没有在线修改或删除预算的入口，不能靠重启清空或扩大容量。
+安装宿主预算后控制头使用 schema 7，表示预算操作必须取得本地AOF同步确认；已有较早预算格式在新Coordinator取得持久确认并增加epoch时升级。执行授权和内存字段仍保留，旧写入者必须拒绝schema 7，不能降级为未确认的写入。Coordinator 重启即使未再次传入配置也保留原预算，旧 epoch 不能写入。当前没有在线修改或删除预算的入口，不能靠重启清空或扩大容量。
 
 预留、单次及批量本地声明、确认未执行后的重分配、故障恢复预留与结果提交均在同一控制头 CAS 下核对宿主占用。批量请求包括批次外的既有占用和本批次已接受的预留，同 ID 重试不再扣一份。所有加法使用检查溢出的 u64，Lua 只比较和保存字节。一次重分配在同一提交中替换原归属；未知创建及待恢复操作仍占用，失联不能使宿主容量重新可用。中心调度遇到宿主容量不足时，只撤销该请求未提交的临时分配，并将 NoCapacity 返回给这个排队尝试的全部等待者。明确拒绝的新建请求从队列和临时规格中移除，后台恢复扫描及容量释放不能使它重新出现；调用方可以在退避后以相同 ID 显式发起新的尝试。同一轮中其他已取得持久预留或仍能容纳的请求继续处理，不继承另一请求的容量错误。已有持久源记录的故障恢复仍等待下一次恢复扫描。
 
-`host_budgets()` 返回持久容量、占用、剩余额度与成员节点；剩余额度不等于在线节点一定可以执行。未初始化内存账户时，占用依据 EnvironmentSpec 的请求与执行 limit 的逐项最大值；存储层内存账户的独立额度规则见下文，生产派发尚未接入。
+`host_budgets()` 返回持久容量、占用、剩余额度与成员节点；剩余额度不等于在线节点一定可以执行。未初始化内存账户时，占用依据 EnvironmentSpec 的请求与执行 limit 的逐项最大值；存储层内存账户的独立额度规则见下文，公开入口与生产派发接线见[自动内存控制](../deployment/memory-control.md)。
 
 Coordinator 服务配置接受可选 `host_budgets`，键为物理宿主 ID，值包含 `capacity` 和 `nodes`。容量字段为 `cpu_millis`、`memory_bytes`、`disk_bytes`；CPU 和内存必须为正数。服务在建立 Session 后、开放 RPC 和发布发现信息前安装配置。省略字段只保留已有状态；重复内容必须完全一致；空映射、重复节点归属、既有占用超额及变更已安装配置均拒绝启动。示例见 [coordinator.json](../../build/config/examples/coordinator.json)，部署者必须按实际预留和节点身份替换示例值，不能从节点标签或瞬时空闲量推算可信容量。
 
 WatchNodes 同一次持久读取发布 `host_budget_configured`、宿主容量、持有额度、剩余额度和完整节点归属，即使当前没有在线节点也保留这些字段。读失败会结束流并撤销 API Server 缓存；缓存自身也有到期时间。API Server 校验配置标志、归属唯一性、完整字段、`held + available = capacity` 和汇总溢出，再发布公开视图。未知状态返回不可用，不补成零占用。待替换执行的本地声明重放与普通查询都使用当前目标记录，不能返回已退役源执行的释放状态。
 
-公开恢复、自动重启、重新加载、故障恢复和暂停失败回滚通过下述执行授权接线。生产路径仍不包含动态资源派发、恢复峰值策略或自动内存调整；同宿主多个实际节点和目标环境持久故障必须另行验收。平台专用启动模板是否启用此配置也要按具体部署记录核对。
+公开恢复、自动重启、重新加载、故障恢复和暂停失败回滚通过下述执行授权接线。生产路径已经接通条件资源派发与显式启用的自动内存调整，恢复仍保守预留允许上限；独立恢复峰值策略、同宿主多个实际节点及目标环境持久故障的验收分别记录。平台专用启动模板是否启用此配置也要按具体部署记录核对。
 
 `tests/storage/host_budget.rs` 定义真实 Redis 用例，覆盖共享宿主、竞争及批量请求、批次外占用、失联与 Redis 重启、配置版本隔离、整数溢出、目标恢复预算和结果重获占用。运行结果及物理覆盖分别记录，测试通过不代表部署已启用。
 
@@ -74,7 +76,7 @@ WatchNodes 同一次持久读取发布 `host_budget_configured`、宿主容量�
 
 授权与占用通过同一 Header CAS 原子提交。完全相同的待执行请求只回读原授权；过期回复仍可用于核对和清理，节点必须在物理派发前检查截止时间。期限到达、回复丢失或旧结果重放均不归还额度。旧 epoch、错误会话、变更的完整请求和未经授权的 Runtime 替换被拒绝。
 
-只有目标 Runtime 的较新匹配结果可以结束待执行状态。失败仍持有物理资源时继续占用；确认目标退役后的结果才归还。失联和节点重启对账携带目标 Starting／Resuming 记录，失效时保存目标 Failed，而不是仅清理此前已暂停的源执行。集群存储升级到 schema 3 后，旧程序无法安全降级写入。
+只有目标 Runtime 的较新匹配结果可以结束待执行状态。失败仍持有物理资源时继续占用；确认目标退役后的结果才归还。失联和节点重启对账携带目标 Starting／Resuming 记录，失效时保存目标 Failed，而不是仅清理此前已暂停的源执行。执行授权字段从schema 3引入；启用宿主预算的当前格式为schema 7，旧程序不能降级写入。
 
 `tests/storage/host_budget.rs` 定义原缺口及授权、竞争、过期、回复重放、Redis 重启、会话与代次拒绝、目标清理和跨节点预留去重用例。`tests/rpc/host_budget.rs` 在 RuntimeDriver 的实际调用边界读取真实 Redis，检查授权已存在；这里的 RuntimeDriver 是测试替身，完整物理验收另行登记。
 
@@ -89,7 +91,7 @@ WatchNodes 同一次持久读取发布 `host_budget_configured`、宿主容量�
 
 每次授权保存完整源观察、目标 max/high、操作编号、原始期限、节点会话、Coordinator epoch 和完整请求 SHA256。扩容先取得目标额度；缩容保持旧额度，只有精确匹配的完成观察才能归还差额。资源 generation、revision、Assignment、Runtime 和操作编号分别核对；部分结果、冻结状态、过期或失联都不能归还预算。CPU 和磁盘继续保持原执行额度。
 
-这些写入复用创建与恢复的同一宿主预算和 Header CAS，不增加第二份可独立发放容量的账本。首次初始化升级到 schema 4，后续执行授权不会把格式降回 schema 3。原始 EnvironmentSpec 不变；确认额度和待执行额度保存在独立的 memory 字段中。
+这些写入复用创建与恢复的同一宿主预算和 Header CAS，不增加第二份可独立发放容量的账本。内存账户字段从schema 4引入；当前宿主预算使用schema 7，内存及执行授权都不会降低格式版本。原始 EnvironmentSpec 不变；确认额度和待执行额度保存在独立的 memory 字段中。
 
 重复请求回读原授权，截止时间不延长；重启后的 Coordinator 可以读取并结算原授权。派发前必须核对当前节点会话、当前 Coordinator epoch 和原始时间窗口，旧授权的回读不等于再次执行许可。完成记录按操作编号保留到该物理 Runtime 退役，旧缩容结果不能清除新的扩容预留。已有生命周期提交确认相同 Runtime 和 Assignment 已退役时，才清除该内存账户及未知操作。当前没有单独的超时取消或部分结果修复入口。
 
@@ -108,7 +110,13 @@ WatchNodes 同一次持久读取发布 `host_budget_configured`、宿主容量�
 | 未分配的内存等待队列 | 不恢复，由客户端重试 |
 | 本地降级日志 | 由 adxlet 的 SQLite 降级包装实现；底层 Redis/RPC 返回 Unavailable 本身不等于 Journaled |
 
-客户端提交成功的持久性遵从 Redis 部署的 AOF 配置。库不执行 CONFIG SET，也不擅自改变已选的可配置刷盘策略。集成测试使用 `appendonly yes`、`appendfsync always` 验证进程 SIGKILL 后恢复；这不证明 everysec/no 配置下断电零丢失，也不覆盖 Redis 数据盘丢失或恢复旧备份后的代次回退。[Redis 持久化说明](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/)
+未配置宿主预算的命名空间保持原刷盘策略，提交成功的持久性遵从Redis部署配置。安装或读取到宿主预算后，`RedisStore` 在返回控制读写结果前，在同一个 `MultiplexedConnection` 上执行原命令、覆盖写入固定确认标记、再执行 `WAITAOF 1 0 <有限毫秒数>`；必须得到本地确认数1。查询返回的原授权也经过确认，不能依赖旧连接的历史写入offset，或新连接的零offset。一次查询中不重新连接，不在Lua或事务中等待，不在传输层重放原命令。该要求在连接重建和store克隆之间保持，新的store从原控制头识别已有预算。
+
+标记不改变控制头或容量，只让本次读到的控制状态处于同一连接的新写入之前；确认覆盖该前缀。失败、超时、禁用AOF、命令权限不足、不支持WAITAOF、返回确认数0或无效回复均返回Unavailable。已应用的写入仍可能结果未知，调用方只能使用原身份及条件状态机对账；结算没有确认时不能把成功回复发布给节点。首次安装预算先确认现有状态，读取已有预算后的启动先确认再增加epoch。库不执行CONFIG SET。
+
+宿主预算要求Redis 7.2及以上、启用AOF，并允许控制连接使用SET及WAITAOF。有限等待使用单次存储超时的一半，最少1毫秒、最多60000毫秒；连接、原命令、标记和确认总计仍受原存储超时约束。客户端的连接与响应超时显式使用同一个配置值，避免固定依赖中的默认500毫秒响应期限提前截断同步等待；这不延长原RPC或资源授权期限。everysec可以成功取得确认，也可能因期限不足而返回Unavailable；`appendfsync no`通常不能及时确认新写入，禁止将它视为可用的预算配置。预算部署建议使用always以控制同步延迟，不能为通过验收盲目延长资源授权期限。同步确认新增写入和等待成本，完整吞吐仍需独立验证。[WAITAOF语义](https://redis.io/docs/latest/commands/waitaof/)
+
+`tests/storage/memory.rs` 的持久性用例使用独立真实Redis，覆盖未同步的新授权、原授权重放、缩容与退役结算、已有预算的新连接、预算安装、everysec确认及进程重启，还有未配置预算命名空间的原策略。物理观察由测试构造，进程SIGKILL不等于主机掉电验收。本地AOF确认不提供高可用选主，不覆盖磁盘丢失、旧备份回退、任意文件系统或硬件违背同步承诺；主机故障边界和目标环境物理验收另行记录。[Redis持久化说明](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/)
 
 ## 本地验证入口
 
@@ -146,6 +154,6 @@ cargo clippy --locked -p adx-coordinator -p adx-core -p adx-scheduling --all-tar
 
 
 `Session::reconcile_memory` 在同一宿主预算比较更新中完成初始化、精确结果结算、
-持续低用量窗口更新及新授权预留。新窗口使用 schema 5，旧写入者不能忽略该状态。
+持续低用量窗口更新及新授权预留。窗口字段从schema 5引入，当前宿主预算使用schema 7，旧写入者不能忽略该状态或绕过持久确认。
 当前会话可以结算原会话的精确物理结果，但不能重用旧授权执行。
 节点能力和自动策略要求见[自动内存控制](../deployment/memory-control.md)。

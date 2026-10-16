@@ -21,7 +21,14 @@ use adx_core::{
 use redis::{aio::MultiplexedConnection, FromRedisValue};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use tokio::{
     sync::{broadcast, Mutex},
     time::timeout,
@@ -73,13 +80,16 @@ struct Header {
 }
 impl Header {
     fn advance(&mut self) -> Result<()> {
+        if self.host_budgets.is_some() {
+            self.schema = self.schema.max(7);
+        }
         self.revision = self.revision.checked_add(1).ok_or(Error::Conflict)?;
         Ok(())
     }
     fn validate(&self) -> Result<()> {
         if !matches!(
             (self.schema, self.host_budgets.is_some()),
-            (1, false) | (2, true) | (3, _) | (4, true) | (5, true) | (6, true)
+            (1, false) | (2, true) | (3, _) | (4, true) | (5, true) | (6, true) | (7, true)
         ) || self.shards == 0
             || self.next_node_shard >= self.shards
             || self.epoch == 0
@@ -442,6 +452,7 @@ struct Connection {
     current: Mutex<Option<MultiplexedConnection>>,
     timeout: Duration,
     committed_changes: broadcast::Sender<ControlChange>,
+    durable_budget: AtomicBool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -483,43 +494,137 @@ impl RedisStore {
                 current: Mutex::new(None),
                 timeout: duration,
                 committed_changes,
+                durable_budget: AtomicBool::new(false),
             }),
             key: format!("adx:{{{namespace}}}:control:v1"),
         };
         let _: String = store.query(redis::cmd("PING")).await?;
         Ok(store)
     }
+    fn require_durable_budget(&self) {
+        // Published host budgets cannot be removed. Keep this requirement after
+        // reconnects and share it with every clone of this namespace's store.
+        self.connection
+            .durable_budget
+            .store(true, Ordering::Release);
+    }
+
+    fn budget_configured(header: Option<&str>) -> Result<bool> {
+        let Some(value) = header else {
+            return Ok(false);
+        };
+        let header: Header = decode(value)?;
+        header.validate()?;
+        Ok(header.host_budgets.is_some())
+    }
+
+    fn redis_unavailable() -> Error {
+        // Neither a Redis error payload nor the connection string is safe to log.
+        Error::Unavailable("Redis operation or persistence confirmation unavailable".into())
+    }
+
+    async fn confirm_budget(&self, conn: &mut MultiplexedConnection) -> Result<()> {
+        // A replay may have performed no write, and a new connection has no write
+        // offset. Write a bounded marker after the data operation on this exact
+        // connection so WAITAOF covers the observed control state as well.
+        let written: String = redis::cmd("SET")
+            .arg(format!("{}:durability", self.key))
+            .arg(uuid::Uuid::new_v4().to_string())
+            .query_async(conn)
+            .await
+            .map_err(|_| Self::redis_unavailable())?;
+        if written != "OK" {
+            return Err(Self::redis_unavailable());
+        }
+        // Never send Redis's unbounded timeout of zero. The outer timeout still
+        // bounds connection acquisition, the data operation, marker and fsync.
+        let wait_millis = u64::try_from((self.connection.timeout.as_millis() / 2).clamp(1, 60_000))
+            .map_err(|_| Self::redis_unavailable())?;
+        let (local, _replicas): (u64, u64) = redis::cmd("WAITAOF")
+            .arg(1)
+            .arg(0)
+            .arg(wait_millis)
+            .query_async(conn)
+            .await
+            .map_err(|_| Self::redis_unavailable())?;
+        if local != 1 {
+            return Err(Self::redis_unavailable());
+        }
+        Ok(())
+    }
+
     async fn query<T: FromRedisValue>(&self, cmd: redis::Cmd) -> Result<T> {
+        self.query_with_budget(cmd, |_| Ok(false)).await
+    }
+
+    async fn query_with_budget<T: FromRedisValue>(
+        &self,
+        cmd: redis::Cmd,
+        has_budget: impl FnOnce(&T) -> Result<bool>,
+    ) -> Result<T> {
         let operation = async {
             let mut guard = self.connection.current.lock().await;
             if guard.is_none() {
                 *guard = Some(
                     self.connection
                         .client
-                        .get_multiplexed_async_connection()
-                        .await?,
+                        .get_multiplexed_async_connection_with_config(
+                            &redis::AsyncConnectionConfig::new()
+                                .set_connection_timeout(Some(self.connection.timeout))
+                                .set_response_timeout(Some(self.connection.timeout)),
+                        )
+                        .await
+                        .map_err(|_| Self::redis_unavailable())?,
                 );
             }
             let mut conn = guard.as_ref().expect("connection initialized").clone();
             drop(guard);
-            cmd.query_async(&mut conn).await
-        };
-        match timeout(self.connection.timeout, operation).await {
-            Ok(Ok(value)) => Ok(value),
-            _ => {
-                *self.connection.current.lock().await = None;
-                // A timeout may follow an applied write. Never replay it blindly:
-                // the caller retries the same identity/result through CAS.
-                Err(Error::Unavailable(
-                    "Redis operation unavailable or timed out".into(),
-                ))
+            let value = cmd
+                .query_async::<T>(&mut conn)
+                .await
+                .map_err(|_| Self::redis_unavailable())?;
+            if has_budget(&value)? {
+                self.require_durable_budget();
             }
+            if self.connection.durable_budget.load(Ordering::Acquire) {
+                self.confirm_budget(&mut conn).await?;
+            }
+            Ok(value)
+        };
+        let result = match timeout(self.connection.timeout, operation).await {
+            Ok(result) => result,
+            Err(_) => Err(Self::redis_unavailable()),
+        };
+        if result.is_err() {
+            *self.connection.current.lock().await = None;
+            // An applied write or fsync acknowledgement may have lost its reply.
+            // Retry the same identity through the state machine, never here.
         }
+        result
+    }
+
+    async fn control_fields(&self, fields: &[String]) -> Result<Vec<Option<String>>> {
+        let header_index = fields.iter().position(|field| field == HEADER);
+        let mut cmd = redis::cmd("HMGET");
+        cmd.arg(&self.key).arg(fields);
+        let values = self
+            .query_with_budget(cmd, |values: &Vec<Option<String>>| {
+                Self::budget_configured(
+                    header_index
+                        .and_then(|index| values.get(index))
+                        .and_then(Option::as_deref),
+                )
+            })
+            .await?;
+        if values.len() != fields.len() {
+            return Err(Error::Unavailable(
+                "Redis returned an unexpected control field count".into(),
+            ));
+        }
+        Ok(values)
     }
     async fn fields<const N: usize>(&self, fields: [String; N]) -> Result<[Option<String>; N]> {
-        let mut cmd = redis::cmd("HMGET");
-        cmd.arg(&self.key).arg(&fields);
-        let values: Vec<Option<String>> = self.query(cmd).await?;
+        let values = self.control_fields(&fields).await?;
         values.try_into().map_err(|_| {
             Error::Unavailable("Redis returned an unexpected control field count".into())
         })
@@ -529,14 +634,10 @@ impl RedisStore {
     /// If configuration is installed after a narrow read, that read's header CAS
     /// fails, and the next attempt necessarily reads the complete budget view.
     async fn allocation_view(&self, fields: &[String]) -> Result<BTreeMap<String, String>> {
-        let mut command = redis::cmd("HMGET");
-        command.arg(&self.key).arg(fields);
-        let values: Vec<Option<String>> = self.query(command).await?;
-        if values.len() != fields.len() {
-            return Err(Error::Unavailable(
-                "Redis returned an unexpected control field count".into(),
-            ));
+        if self.connection.durable_budget.load(Ordering::Acquire) {
+            return self.raw().await;
         }
+        let values = self.control_fields(fields).await?;
         let raw: BTreeMap<_, _> = fields
             .iter()
             .cloned()
@@ -554,7 +655,10 @@ impl RedisStore {
     async fn raw(&self) -> Result<BTreeMap<String, String>> {
         let mut cmd = redis::cmd("HGETALL");
         cmd.arg(&self.key);
-        self.query(cmd).await
+        self.query_with_budget(cmd, |raw: &BTreeMap<String, String>| {
+            Self::budget_configured(raw.get(HEADER).map(String::as_str))
+        })
+        .await
     }
     async fn cas(
         &self,
@@ -562,6 +666,9 @@ impl RedisStore {
         header: &Header,
         field: Option<(&str, String)>,
     ) -> Result<bool> {
+        if header.host_budgets.is_some() {
+            self.require_durable_budget();
+        }
         let changed = field
             .as_ref()
             .map(|(name, _)| vec![(*name).to_owned()])

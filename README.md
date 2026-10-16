@@ -132,7 +132,7 @@ The image must be supported by the configured sandboxd and [ADX Runtime Environm
 | Worker host | `node` | adxlet + Relay by default |
 | Ingress host | `ingress-api` | API Server + Ingress by default |
 
-Every host has its own `/opt/adx/config/deployment.yaml`. Cluster members share the Redis URL, namespace, and mTLS trust. Every worker has a unique `node_id` and reachable control and proxy addresses. Start Redis → Coordinator → workers → API Server. Set `proxy_mode: standalone` or `ingress_mode: standalone` only when those components need separate processes.
+Every host has its own `/opt/adx/config/deployment.yaml`. Cluster members share the Redis URL, namespace, and mTLS trust. Every worker has a unique `node_id` and reachable control and proxy addresses. Start Redis → Coordinator → workers → API Server. Configured host budgets require Redis 7.2+, AOF, and per-operation local fsync acknowledgement with SET and WAITAOF; schema 7 prevents older writers from bypassing this requirement. See the [persistence contract](docs/testing/coordinator-storage.md#故障与持久性). Set `proxy_mode: standalone` or `ingress_mode: standalone` only when those components need separate processes.
 
 YAML string values support `${VAR}` and `${VAR:-default}`. Use `adxctl config dump` to inspect the fully resolved profile and host overrides. Complete fields and certificates are documented in the [`adxctl` reference](docs/deployment/adxctl.md), [standalone guide](docs/deployment/standalone.md), and [configuration examples](build/config/examples/README.md).
 

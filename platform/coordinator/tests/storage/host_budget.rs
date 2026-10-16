@@ -378,8 +378,8 @@ async fn host_budget_upgrade_checks_existing_holds_and_fences_old_schema() {
         .unwrap();
     let header: serde_json::Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(
-        header["schema"], 2,
-        "schema 1 writers must reject this namespace"
+        header["schema"], 7,
+        "writers without persistence confirmation must reject this namespace"
     );
     let restarted = rig.store().await.begin(1).await.unwrap();
     assert_eq!(
@@ -671,7 +671,7 @@ async fn execution_authorization_reserves_before_result_and_replays_exactly() {
         .unwrap();
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&raw).unwrap()["schema"],
-        3
+        7
     );
     let result = completed_execution(&grant);
     session.commit(result.clone()).await.unwrap();
