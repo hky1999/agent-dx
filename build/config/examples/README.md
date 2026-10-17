@@ -45,7 +45,7 @@ confirmed unowned or left by uncommitted starts. An unavailable Coordinator neve
 means an empty catalog. Explicit CLI stop performs local Environment cleanup before service shutdown.
 
 
-Coordinator 配置 `advertised_address` 发布可续期的 Redis 地址，默认 TTL 15 秒。Node 与 Sandbox API 示例通过相同 Redis namespace 发现它；也可改用显式 `coordinator_address`，不能同时配置两种方式。Coordinator 心跳超时默认 30 秒，Node 报告间隔应显著小于该值。Node 重启先注册为对账中，完成权威目录恢复后才开放新分配。完整契约见 [发现与恢复](../../../docs/testing/recovery-discovery.md)。
+Coordinator 配置 `advertised_address` 发布可续期的 Redis 地址，默认 TTL 15 秒。Node 与 Sandbox API 示例通过相同 Redis namespace 发现它；也可改用显式 `coordinator_address`，不能同时配置两种方式。Coordinator 心跳超时默认30秒，Node报告间隔应显著小于该值。原期限内收到但因中心存储等待尚未接受的新心跳，可以触发原服务会话核对；核对受现有 `rpc_timeout_seconds` 限制，不增加配置项或延长心跳超时。成功仍须完成对账，不能直接开放新分配。Node重启先注册为对账中，完成权威目录恢复后才开放新分配。完整契约见 [发现与恢复](../../../docs/testing/recovery-discovery.md)。
 
 Ingress 的 `ingress-control.json` 与 Coordinator 使用相同 Redis namespace；Coordinator `tls.peers` 必须登记 Ingress 证书。默认共进程部署在 Adxlet 的 `env` 中设置 `ADX_DATA_PLANE_RELAY_ACTIVITY_UDS_DIR=/opt/adx/run/node`，其 `proxy_socket` 相应为 `/opt/adx/run/node/route.sock`。代理首次启动与重新同步期间关闭数据准入，完成 Adxlet 全量绑定同步后开放。详见 [路由发布与本机同步](../../../docs/testing/route-publication.md)。
 

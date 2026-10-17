@@ -1,4 +1,6 @@
 mod common;
+#[path = "rpc/heartbeat_liveness.rs"]
+mod heartbeat_liveness;
 #[path = "rpc/host_budget.rs"]
 mod host_budget;
 #[path = "rpc/host_budget_configuration.rs"]

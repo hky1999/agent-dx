@@ -3,6 +3,7 @@ use adx_transport::rpc::RpcClient;
 mod claims;
 mod cloning;
 mod collection;
+mod liveness;
 mod metrics;
 mod recovery;
 mod snapshots;
@@ -28,6 +29,7 @@ struct LiveNode {
     session: String,
     sequence: u64,
     last_seen: tokio::time::Instant,
+    last_reachable: tokio::time::Instant,
     inspected: bool,
     report: pb::RegisterNodeRequest,
 }
@@ -99,6 +101,14 @@ impl State {
                 .recovering
                 .get(id)
                 .is_some_and(|since| since.elapsed() >= timeout)
+    }
+    fn owner_overdue(&self, id: &str, timeout: Duration) -> bool {
+        self.live.get(id).is_some_and(|live| {
+            !live.expired && live.last_seen.max(live.last_reachable).elapsed() >= timeout
+        }) || self
+            .recovering
+            .get(id)
+            .is_some_and(|since| since.elapsed() >= timeout)
     }
     fn healthy(&self) -> Result<()> {
         if self.needs_recovery {
@@ -244,7 +254,9 @@ impl State {
     }
 }
 struct Inner {
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
+    owner_expiry: Mutex<()>,
+    heartbeat_arrivals: liveness::HeartbeatArrivals,
     claim_sender: mpsc::Sender<PendingClaim>,
     changed: Notify,
     peers: Peers,
@@ -399,10 +411,11 @@ impl CoordinatorRpc {
         // recovered nodes one bounded registration grace, with routes kept closed.
         let now = tokio::time::Instant::now();
         let recovering = saved.nodes.keys().map(|id| (id.clone(), now)).collect();
+        let heartbeat_arrivals = liveness::HeartbeatArrivals::restored(&saved.nodes);
         let (claim_sender, claim_requests) = mpsc::channel(CLAIM_BATCH_CAPACITY);
         tokio::spawn(run_claim_batches(session.clone(), claim_requests));
         Ok(Self(Arc::new(Inner {
-            state: Mutex::new(State {
+            state: Arc::new(Mutex::new(State {
                 session,
                 scheduler,
                 specs,
@@ -426,7 +439,9 @@ impl CoordinatorRpc {
                 recovering,
                 retired_sessions: BTreeSet::new(),
                 scheduling_attempts: BTreeMap::new(),
-            }),
+            })),
+            owner_expiry: Mutex::new(()),
+            heartbeat_arrivals,
             claim_sender,
             changed: Notify::new(),
             peers,
@@ -438,13 +453,11 @@ impl CoordinatorRpc {
     }
     /// Invalidate expired executions and their routes before admitting a returning node.
     pub async fn expire_nodes(&self) -> Result<usize> {
-        let mut state = self.0.state.lock().await;
-        state.recover_authoritative_state().await?;
-        state.healthy()?;
+        let mut state = self.state_for_owner_expiry().await?;
         let ids: Vec<_> = state
             .nodes
             .keys()
-            .filter(|id| state.overdue(id, self.0.heartbeat_timeout))
+            .filter(|id| state.owner_overdue(id, self.0.heartbeat_timeout))
             .cloned()
             .collect();
         for id in &ids {
@@ -475,19 +488,7 @@ impl CoordinatorRpc {
             }
             live.session.clone()
         };
-        let endpoint = self
-            .0
-            .node_tls
-            .endpoint(&r.node_address)
-            .ok()?
-            .connect_timeout(self.0.timeout)
-            .timeout(self.0.timeout);
-        let channel = endpoint.connect().await.ok()?;
-        let actual = pb::node_service_client::NodeServiceClient::new(self.0.node_tls.wrap(channel))
-            .get_session(pb::GetNodeSessionRequest {})
-            .await
-            .ok()?
-            .into_inner();
+        let actual = self.node_session_at(&r.node_address).await?;
         (actual.node_id == r.node_id && actual.session_id == r.session_id).then_some(predecessor)
     }
 
@@ -754,11 +755,9 @@ impl CoordinatorRpc {
         record: EnvironmentRecord,
         session_id: String,
     ) -> Result<EnvironmentRecord> {
-        let mut state = self.0.state.lock().await;
-        state.recover_authoritative_state().await?;
-        state.healthy()?;
+        let mut state = self.state_for_owner_expiry().await?;
         let id = &record.assignment.node_id;
-        if state.overdue(id, self.0.heartbeat_timeout) {
+        if state.owner_overdue(id, self.0.heartbeat_timeout) {
             let result = state.invalidate_node(id).await;
             self.0.changed.notify_waiters();
             result?;
@@ -1197,19 +1196,23 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
             Endpoint::from_shared(format!("https://{address}"))
                 .map_err(|_| Status::invalid_argument("invalid advertised address"))?;
         }
+        // Record receipt before any scheduler/storage wait. This is not a
+        // committed heartbeat and never authorizes scheduling or resource changes.
+        self.0
+            .heartbeat_arrivals
+            .observe(&r, tokio::time::Instant::now())
+            .await;
         let service = self.clone();
         tokio::spawn(async move {
             let predecessor = service.replacement_predecessor(&r).await;
-            let mut state = service.0.state.lock().await;
-            state.recover_authoritative_state().await.map_err(status)?;
-            state.healthy().map_err(status)?;
+            let mut state = service.state_for_owner_expiry().await.map_err(status)?;
             if state
                 .retired_sessions
                 .contains(&(r.node_id.clone(), r.session_id.clone()))
             {
                 return Err(Status::failed_precondition("retired node session"));
             }
-            if state.overdue(&r.node_id, service.0.heartbeat_timeout) {
+            if state.owner_overdue(&r.node_id, service.0.heartbeat_timeout) {
                 let result = state.invalidate_node(&r.node_id).await;
                 service.0.changed.notify_waiters();
                 result.map_err(status)?;
@@ -1288,13 +1291,16 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                         .insert((r.node_id.clone(), old.session));
                 }
             }
+            service.0.heartbeat_arrivals.registered(&r).await;
+            let now = tokio::time::Instant::now();
             state.live.insert(
                 r.node_id.clone(),
                 LiveNode {
                     expired: false,
                     session: r.session_id.clone(),
                     sequence: r.heartbeat_sequence,
-                    last_seen: tokio::time::Instant::now(),
+                    last_seen: now,
+                    last_reachable: now,
                     inspected,
                     report: r,
                 },
