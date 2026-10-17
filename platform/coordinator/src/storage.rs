@@ -449,10 +449,34 @@ fn next_result(old: &StoredEnvironment, r: &EnvironmentRecord) -> Result<bool> {
 
 struct Connection {
     client: redis::Client,
-    current: Mutex<Option<MultiplexedConnection>>,
+    current: Mutex<Option<Arc<CachedConnection>>>,
     timeout: Duration,
     committed_changes: broadcast::Sender<ControlChange>,
     durable_budget: AtomicBool,
+}
+
+/// One transport shared by concurrent operations. Failure belongs to this
+/// exact stream, independently of the cache entry that may already replace it.
+struct CachedConnection {
+    stream: MultiplexedConnection,
+    failed: AtomicBool,
+}
+
+impl Connection {
+    fn invalidate(&self, borrowed: &Arc<CachedConnection>) {
+        borrowed.failed.store(true, Ordering::Release);
+        // Never wait for cleanup after the operation deadline. If another
+        // acquisition holds the lock, it will reject the failed cached stream.
+        let Ok(mut current) = self.current.try_lock() else {
+            return;
+        };
+        if current
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(active, borrowed))
+        {
+            *current = None;
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -562,22 +586,37 @@ impl RedisStore {
         cmd: redis::Cmd,
         has_budget: impl FnOnce(&T) -> Result<bool>,
     ) -> Result<T> {
+        let mut borrowed = None;
         let operation = async {
             let mut guard = self.connection.current.lock().await;
-            if guard.is_none() {
-                *guard = Some(
-                    self.connection
-                        .client
-                        .get_multiplexed_async_connection_with_config(
-                            &redis::AsyncConnectionConfig::new()
-                                .set_connection_timeout(Some(self.connection.timeout))
-                                .set_response_timeout(Some(self.connection.timeout)),
-                        )
-                        .await
-                        .map_err(|_| Self::redis_unavailable())?,
-                );
+            if guard
+                .as_ref()
+                .is_some_and(|cached| cached.failed.load(Ordering::Acquire))
+            {
+                *guard = None;
             }
-            let mut conn = guard.as_ref().expect("connection initialized").clone();
+            if guard.is_none() {
+                let stream = self
+                    .connection
+                    .client
+                    .get_multiplexed_async_connection_with_config(
+                        &redis::AsyncConnectionConfig::new()
+                            .set_connection_timeout(Some(self.connection.timeout))
+                            .set_response_timeout(Some(self.connection.timeout)),
+                    )
+                    .await
+                    .map_err(|_| Self::redis_unavailable())?;
+                *guard = Some(Arc::new(CachedConnection {
+                    stream,
+                    failed: AtomicBool::new(false),
+                }));
+            }
+            let cached = guard
+                .as_ref()
+                .cloned()
+                .ok_or_else(Self::redis_unavailable)?;
+            let mut conn = cached.stream.clone();
+            borrowed = Some(cached);
             drop(guard);
             let value = cmd
                 .query_async::<T>(&mut conn)
@@ -595,8 +634,8 @@ impl RedisStore {
             Ok(result) => result,
             Err(_) => Err(Self::redis_unavailable()),
         };
-        if result.is_err() {
-            *self.connection.current.lock().await = None;
+        if let Some(borrowed) = borrowed.filter(|_| result.is_err()) {
+            self.connection.invalidate(&borrowed);
             // An applied write or fsync acknowledgement may have lost its reply.
             // Retry the same identity through the state machine, never here.
         }
@@ -1437,3 +1476,7 @@ impl Session {
         ))
     }
 }
+
+#[cfg(test)]
+#[path = "storage/connection_tests.rs"]
+mod connection_tests;

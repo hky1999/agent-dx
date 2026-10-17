@@ -1,5 +1,8 @@
 //! Global and embedded ShardScheduler scheduling.
 
+#[cfg(test)]
+extern crate self as adx_coordinator;
+
 pub use adx_core::snapshots;
 pub mod auth;
 mod journal;
