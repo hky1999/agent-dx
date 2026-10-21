@@ -1,5 +1,7 @@
-from .probes import ReadinessProbe, HealthcheckProbe
+from .probes import HealthcheckProbe, ReadinessProbe
+from .shared_volume_mounts import SharedVolumeMount
 from .types import (
+    CheckpointStorage,
     CommandInfo,
     CommandResult,
     CommandStatus,
@@ -8,28 +10,29 @@ from .types import (
     DNSPolicy,
     DNSRule,
     EntryInfo,
+    EnvironmentFailure,
+    EnvironmentInfo,
+    IdleAction,
     Mount,
     NetworkPolicy,
     NetworkRule,
     NodeInfo,
+    PausePolicy,
     PauseResult,
     PortForwarding,
     PortRange,
-    S3Config,
-    EnvironmentInfo,
-    EnvironmentFailure,
-    SnapshotInfo,
-    ResumeResult,
     RestartPolicy,
-    PausePolicy,
+    ResumeResult,
     RetentionPolicy,
-    IdleAction,
-    CheckpointStorage,
+    S3Config,
+    SnapshotInfo,
     TrafficPolicy,
 )
 
 SDK_CAPABILITIES = frozenset(
     {
+        "shared-volume-management-v1",
+        "shared-volume-mount-contract-v1",
         "local-close",
         "explicit-connection-config",
         "tunnel-proxy-port",
@@ -39,6 +42,8 @@ SDK_CAPABILITIES = frozenset(
 )
 
 __all__ = [
+    "SharedVolumeMount",
+    "SharedVolumes",
     # current API
     "Environment",
     "ReadinessProbe",
@@ -94,6 +99,7 @@ __all__ = [
 # Heavy modules are lazy-loaded so lightweight entry points (the adx-environment CLI)
 # don't pay for the httpx/websockets import up front.
 _lazy_imports = {
+    "SharedVolumes": ".shared_volumes",
     "Environment": ".environment_api",
     "EnvironmentError": "._transport",
     "Shell": ".shell",

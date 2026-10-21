@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package adx.control.v1;
+
+// Shared by permission management and execution without a proto import cycle.
+// Keep these values and their fully qualified names wire-compatible.
+enum SharedVolumeAccess {
+  SHARED_VOLUME_ACCESS_UNSPECIFIED = 0;
+  SHARED_VOLUME_ACCESS_READ_ONLY = 1;
+  SHARED_VOLUME_ACCESS_READ_WRITE = 2;
+}
+
+message SharedVolumeMount {
+  string volume_id = 1;
+  string subpath = 2;
+  string target = 3;
+  SharedVolumeAccess access = 4;
+}

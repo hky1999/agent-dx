@@ -1,3 +1,5 @@
+#[path = "storage/checkpoint_readers.rs"]
+mod checkpoint_readers;
 #[path = "storage/claims.rs"]
 mod claims;
 mod common;
@@ -46,6 +48,9 @@ fn node(id: &str) -> Node {
 }
 fn running(spec: EnvironmentSpec, assignment: Assignment) -> EnvironmentRecord {
     EnvironmentRecord {
+        // This fixture models a new execution with a complete, empty inventory.
+        // Historical omissions are tested separately and must remain unknown.
+        checkpoint_readers: adx_core::CheckpointReaders::known_empty(),
         failure: None,
         restart_attempts: 0,
         restart_pending: false,
@@ -66,6 +71,61 @@ async fn register(s: &adx_coordinator::storage::Session, id: &str) -> StoredNode
     s.register(node(id), "127.0.0.1:9000".into(), "127.0.0.1:9001".into())
         .await
         .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn historical_unknown_readers_survive_delete_and_restart_and_block_name_reuse() {
+    let rig = common::Redis::new().await;
+    let db = rig.store().await;
+    let session = db.begin(1).await.unwrap();
+    register(&session, "node").await;
+    let assignment = Assignment {
+        environment_id: "unknown-readers".into(),
+        node_id: "node".into(),
+        shard_id: 0,
+        generation: 1,
+        devices: vec![],
+    };
+    session
+        .reserve(spec("unknown-readers"), assignment.clone())
+        .await
+        .unwrap();
+    let mut historical =
+        serde_json::to_value(running(spec("unknown-readers"), assignment.clone())).unwrap();
+    historical
+        .as_object_mut()
+        .unwrap()
+        .remove("checkpoint_readers");
+    let mut record: EnvironmentRecord = serde_json::from_value(historical).unwrap();
+    assert!(record.checkpoint_readers.is_unknown_empty());
+    session.commit(record.clone()).await.unwrap();
+    record.state = EnvironmentState::Deleted;
+    record.resources_held = false;
+    record.runtime.ip = None;
+    record.revision += 1;
+    session.commit(record.clone()).await.unwrap();
+    assert_eq!(
+        session.get("unknown-readers").await.unwrap().result,
+        Some(record.clone())
+    );
+    let restarted = db.begin(1).await.unwrap();
+    assert_eq!(
+        restarted.get("unknown-readers").await.unwrap().result,
+        Some(record)
+    );
+    assert!(matches!(
+        restarted
+            .reserve(
+                spec("unknown-readers"),
+                Assignment {
+                    generation: 2,
+                    ..assignment
+                },
+            )
+            .await,
+        Err(Error::Conflict)
+    ));
 }
 
 #[tokio::test]

@@ -1,6 +1,9 @@
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 
+/// Bound the number of independently authorized live directories per execution.
+pub const MAX_SHARED_VOLUME_MOUNTS: usize = 32;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct S3Source {
     pub endpoint: String,
@@ -279,6 +282,10 @@ pub struct ExecutionOptions {
     pub rootfs: Option<Rootfs>,
     #[serde(default)]
     pub mounts: Vec<Mount>,
+    /// Application data shared with other executions, never a private rootfs.
+    /// Omit the empty field to preserve historical serialized spec identities.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_volumes: Vec<crate::shared_volumes::SharedVolumeMount>,
     pub network: Option<NetworkPolicy>,
     #[serde(default)]
     pub data_plane: DataPlanePolicy,
@@ -326,6 +333,7 @@ impl ExecutionOptions {
         for mount in &self.mounts {
             mount.validate()?;
         }
+        self.validate_shared_volumes()?;
         if let Some(network) = &self.network {
             network.validate()?;
         }
@@ -353,6 +361,62 @@ impl ExecutionOptions {
         }
         Ok(())
     }
+
+    /// Check shape and target ambiguity, not authorization or runtime liveness.
+    /// Runtime adapters must also reserve the exact execution before any I/O.
+    pub fn validate_shared_volumes(&self) -> Result<()> {
+        if self.shared_volumes.len() > MAX_SHARED_VOLUME_MOUNTS {
+            return Err(Error::Invalid("too many shared volume mounts".into()));
+        }
+        if self.shared_volumes.is_empty() {
+            return Ok(());
+        }
+        for mount in &self.mounts {
+            mount.validate()?;
+        }
+        for (index, mount) in self.shared_volumes.iter().enumerate() {
+            mount.validate()?;
+            // One attachment per volume and execution is the authority contract.
+            if self.shared_volumes[..index].iter().any(|previous| {
+                previous.volume_id == mount.volume_id
+                    || mount_targets_overlap(&previous.target, &mount.target)
+            }) || self
+                .mounts
+                .iter()
+                .any(|ordinary| mount_targets_overlap(&ordinary.target, &mount.target))
+            {
+                return Err(Error::Invalid(
+                    "duplicate shared volume or overlapping mount targets".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn mount_targets_overlap(left: &str, right: &str) -> bool {
+    // Ordinary historical mounts allow repeated slashes and "." components.
+    // Compare their lexical destinations rather than accepting an alias bypass.
+    let normalize = |value: &str| {
+        format!(
+            "/{}",
+            value
+                .split('/')
+                .filter(|part| { !part.is_empty() && *part != "." })
+                .collect::<Vec<_>>()
+                .join("/")
+        )
+    };
+    let left = normalize(left);
+    let right = normalize(right);
+    let beneath = |child: &str, parent: &str| {
+        parent == "/"
+            || child == parent
+            || child
+                .strip_prefix(parent)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    };
+    beneath(&left, &right) || beneath(&right, &left)
 }
 
 /// Validate a constructor cwd without accessing the coordinator host filesystem.

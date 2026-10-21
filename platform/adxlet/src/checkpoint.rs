@@ -5,6 +5,8 @@ use adx_core::{CheckpointArtifact, EnvironmentRecord, Error, Result};
 use async_trait::async_trait;
 pub use object::ObjectCheckpointStore;
 pub use orphans::RemoteGcConfig;
+mod shared_fs;
+pub use shared_fs::SharedFsCheckpointStore;
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -192,6 +194,17 @@ pub trait CheckpointStore: Send + Sync {
     }
     /// Private local staging, visible to the execution backend on this node.
     async fn allocate(&self) -> Result<PathBuf>;
+    /// Allocate staging appropriate for the publication policy: shared-policy
+    /// captures may stage on the shared backend so publication does not copy,
+    /// while local staging keeps node-private durability semantics. Stores
+    /// that do not distinguish keep the plain local allocation.
+    async fn allocate_for_policy(
+        &self,
+        policy: adx_core::lifecycle::CheckpointStorage,
+    ) -> Result<PathBuf> {
+        self.validate_policy(policy)?;
+        self.allocate().await
+    }
     /// Discard a local staging directory after its execution has stopped.
     async fn discard_staged(&self, staged: &Path) -> Result<()>;
     /// Preserve a complete local recovery point for running capture or upload rollback.
@@ -247,13 +260,13 @@ pub trait CheckpointStore: Send + Sync {
 /// A restore may keep memory mapped files open after its RPC has returned.
 pub struct MaterializedCheckpoint {
     path: PathBuf,
-    _pin: Option<Arc<()>>,
+    _pin: Option<Arc<dyn Send + Sync>>,
 }
 impl MaterializedCheckpoint {
     fn local(path: PathBuf) -> Self {
         Self { path, _pin: None }
     }
-    fn pinned(path: PathBuf, pin: Arc<()>) -> Self {
+    fn pinned(path: PathBuf, pin: Arc<dyn Send + Sync>) -> Self {
         Self {
             path,
             _pin: Some(pin),
@@ -422,6 +435,26 @@ pub enum StorageConfig {
     Local {
         root: PathBuf,
     },
+    /// Mounted shared filesystem (JuiceFS). `root` must already be mounted
+    /// and holds both shared-policy staging and published immutable
+    /// checkpoints; `local_root` preserves node-local recovery points and
+    /// their no-forced-writeback contract. A0 disables remote reclamation.
+    SharedFs {
+        root: PathBuf,
+        local_root: PathBuf,
+        /// Optional volume identity from the deployment profile: when set,
+        /// the store verifies the mounted volume UUID at startup and refuses
+        /// to serve a foreign or stale mount. JuiceFS reports the UUID in
+        /// the hidden `<mount-root>/.config` JSON file under `Format.UUID`.
+        #[serde(default)]
+        volume_uuid: Option<String>,
+        /// Optional mount root of the shared volume. When set together with
+        /// `volume_uuid`, identity is read from `<mount_root>/.config` and
+        /// `root` must lie inside `mount_root`. Without it the store walks
+        /// up from `root` to the nearest directory carrying `.config`.
+        #[serde(default)]
+        mount_root: Option<PathBuf>,
+    },
     S3 {
         alias: String,
         bucket: String,
@@ -454,6 +487,28 @@ impl StorageConfig {
     ) -> Result<Arc<dyn CheckpointStore>> {
         match self {
             Self::Local { root } => Ok(Arc::new(LocalCheckpointStore::new(root)?)),
+            Self::SharedFs {
+                root,
+                local_root,
+                volume_uuid,
+                mount_root,
+            } => {
+                if let Some((_, _, gc)) = &owner {
+                    gc.validate()?;
+                    if gc.enabled {
+                        return Err(Error::Invalid(
+                            "shared_fs remote GC stays disabled until reader protection lands"
+                                .into(),
+                        ));
+                    }
+                }
+                Ok(Arc::new(SharedFsCheckpointStore::with_mount(
+                    root,
+                    local_root,
+                    volume_uuid.as_deref(),
+                    mount_root.as_deref(),
+                )?))
+            }
             Self::S3 {
                 alias,
                 bucket,

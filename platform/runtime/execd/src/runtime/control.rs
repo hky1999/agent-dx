@@ -5,11 +5,33 @@ use std::{
     io,
     pin::Pin,
     sync::{Arc, Mutex, OnceLock},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::watch;
 
 pub type Handoff = Pin<Box<dyn Future<Output = io::Result<HandoffOutcome>> + Send>>;
+
+#[derive(Clone)]
+struct PrepareTrace {
+    operation_id: String,
+    identity: RuntimeIdentity,
+    started: Instant,
+}
+
+impl PrepareTrace {
+    fn stage(&self, stage: &str) {
+        execd_info!(
+            "[execd-checkpoint] stage={} operation_id={:?} environment_id={:?} runtime_id={:?} generation={} elapsed_ms={:.3}",
+            stage,
+            self.operation_id,
+            self.identity.environment_id,
+            self.identity.runtime_id,
+            self.identity.ownership_generation,
+            self.started.elapsed().as_secs_f64() * 1000.0,
+        );
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum HandoffOutcome {
     Resume,
@@ -266,6 +288,12 @@ impl Controller {
             return Err(Error::Invalid("operation id required".into()));
         }
         let operation_id = request.operation_id.clone();
+        let trace = PrepareTrace {
+            operation_id: operation_id.clone(),
+            identity: request.identity.clone(),
+            started: Instant::now(),
+        };
+        trace.stage("prepare_received");
         let mut changes = self.subscribe();
         {
             let mut state = self.state.lock().unwrap();
@@ -317,13 +345,15 @@ impl Controller {
                 if !prepared {
                     state.reader_running = true;
                     let controller = self.clone();
+                    let trace = trace.clone();
                     // The accepted operation survives cancellation of the HTTP request.
                     tokio::spawn(async move {
-                        controller.read_handoff().await;
+                        controller.read_handoff(trace).await;
                     });
                 }
             }
         }
+        trace.stage("prepare_accepted");
         loop {
             let status = self.status();
             if status
@@ -334,6 +364,7 @@ impl Controller {
                 return Err(Error::Conflict);
             }
             if status.phase != RuntimePhase::Preparing {
+                trace.stage("prepare_finished");
                 return Ok(status);
             }
             changes
@@ -342,12 +373,22 @@ impl Controller {
                 .map_err(|_| Error::Unavailable("control stopped".into()))?;
         }
     }
-    async fn read_handoff(self: Arc<Self>) {
+    async fn read_handoff(self: Arc<Self>, trace: PrepareTrace) {
+        trace.stage("handoff_task_started");
         let hooks = self.hooks.clone();
-        let opened = tokio::task::spawn_blocking(move || hooks.open()).await;
+        let open_trace = trace.clone();
+        let opened = tokio::task::spawn_blocking(move || {
+            open_trace.stage("handoff_open_started");
+            let result = hooks.open();
+            open_trace.stage("handoff_open_finished");
+            result
+        })
+        .await;
+        trace.stage("handoff_open_joined");
         let reader = match opened {
             Ok(Ok(reader)) => reader,
             error => {
+                trace.stage("handoff_open_failed");
                 let mut state = self.state.lock().unwrap();
                 state.reader_running = false;
                 state.status.phase = RuntimePhase::Running;
@@ -364,13 +405,19 @@ impl Controller {
                 return;
             }
         };
-        {
+        let prepared = {
             let mut state = self.state.lock().unwrap();
             if state.status.phase == RuntimePhase::Preparing {
                 state.status.phase = RuntimePhase::Prepared;
                 state.status.checkpoint.as_mut().unwrap().phase = CheckpointPhase::Prepared;
                 self.publish(&mut state);
+                true
+            } else {
+                false
             }
+        };
+        if prepared {
+            trace.stage("prepared_published");
         }
         let outcome = reader.await;
         let previous = {

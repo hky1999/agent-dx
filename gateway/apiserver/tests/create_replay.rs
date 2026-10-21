@@ -95,6 +95,8 @@ assignment: Some(pb::Assignment { environment_id: spec.id.clone(), node_id: "nod
     register_node(RegisterNodeRequest) -> RegisterNodeResponse,
     inspect_node(InspectNodeRequest) -> InspectNodeResponse,
     commit_environment(CommitEnvironmentRequest) -> CommitEnvironmentResponse,
+    reserve_checkpoint_reader(ReserveCheckpointReaderRequest) -> ReserveCheckpointReaderResponse,
+    release_checkpoint_reader(ReleaseCheckpointReaderRequest) -> ReleaseCheckpointReaderResponse,
     ensure_running(EnsureRunningRequest) -> GetEnvironmentResponse,
     retire_dormant(GetEnvironmentRequest) -> EnvironmentResult,
 ]);

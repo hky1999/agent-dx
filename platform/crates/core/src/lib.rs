@@ -1,8 +1,12 @@
 //! Environment, runtime, and resource contracts shared by the control plane.
 
 pub mod checkpoint;
+mod checkpoint_readers;
+pub use checkpoint_readers::{CheckpointReader, CheckpointReaderRetirement, CheckpointReaders};
 pub mod lifecycle;
 pub mod runtime_profile;
+pub mod shared_volume_attachments;
+pub mod shared_volumes;
 pub mod snapshots;
 pub use checkpoint::{
     valid_runtime_id, CheckpointArtifact, CompletedOperation, LifecycleKind, RestorePoint,
@@ -271,6 +275,9 @@ pub enum RuntimeFailureReason {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvironmentRecord {
+    /// Execution reads are separate from the latest recovery point.
+    #[serde(default, skip_serializing_if = "CheckpointReaders::is_unknown_empty")]
+    pub checkpoint_readers: CheckpointReaders,
     #[serde(default)]
     pub failure: Option<RuntimeFailure>,
     #[serde(default)]

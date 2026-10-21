@@ -1,12 +1,17 @@
 //! Single-Coordinator Redis persistence. Lua only compares opaque bytes and performs
 //! atomic hash writes; JSON and u64 counters are validated in Rust, never Lua doubles.
+mod checkpoint_readers;
 mod claims;
 pub use claims::{ClaimOutcome, LocalClaim};
+#[cfg(test)]
+mod checkpoint_reader_tests;
 mod collection;
 mod credentials;
 mod failure;
 mod recovery;
 mod resume;
+mod shared_volumes;
+pub use shared_volumes::StoredSharedVolume;
 mod snapshots;
 use crate::Node;
 use adx_core::{
@@ -118,6 +123,11 @@ pub struct ResumeIntent {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredEnvironment {
+    /// Coordinator-owned dependencies, separate from node lifecycle revisions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reader_reservations: Vec<adx_core::CheckpointReader>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reader_retirements: Vec<adx_core::CheckpointReaderRetirement>,
     #[serde(default)]
     pub resume: Option<ResumeIntent>,
     /// Durable age of a terminal failure; retries and Coordinator restarts do not reset it.
@@ -154,9 +164,11 @@ impl DeletedReceipt {
 }
 impl StoredEnvironment {
     pub fn failed_collectable(&self, now: u64, retention_seconds: u64) -> bool {
-        self.result
-            .as_ref()
-            .is_some_and(|r| r.state == EnvironmentState::Failed && !r.restart_pending)
+        self.reader_reservations.is_empty()
+            && self
+                .result
+                .as_ref()
+                .is_some_and(|r| r.state == EnvironmentState::Failed && !r.restart_pending)
             && !self.recovery.as_ref().is_some_and(|r| r.pending)
             && self.recovery_point(now).is_none()
             && self
@@ -175,11 +187,17 @@ impl StoredEnvironment {
         }
     }
     pub fn resources_held(&self) -> bool {
-        (!self.invalidated && self.recovery.as_ref().is_some_and(|r| r.pending))
+        (!self.invalidated
+            && (self.recovery.as_ref().is_some_and(|r| r.pending)
+                || self.reader_reservations.iter().any(|reader| {
+                    reader.node_id == self.assignment.node_id
+                        && reader.identity.ownership_generation == self.assignment.generation
+                })))
             || self.result.as_ref().is_none_or(|r| r.resources_held)
     }
     pub(crate) fn effective_record(&self) -> EnvironmentRecord {
-        self.result.clone().unwrap_or_else(|| EnvironmentRecord {
+        let mut record = self.result.clone().unwrap_or_else(|| EnvironmentRecord {
+            checkpoint_readers: Default::default(),
             failure: None,
             restart_attempts: 0,
             restart_pending: false,
@@ -194,7 +212,17 @@ impl StoredEnvironment {
             resources_held: true,
             checkpoint: None,
             last_operation: None,
-        })
+        });
+        record
+            .checkpoint_readers
+            .readers
+            .retain(|reader| !self.reader_retired(reader));
+        for reader in &self.reader_reservations {
+            if !record.checkpoint_readers.readers.contains(reader) {
+                record.checkpoint_readers.readers.push(reader.clone());
+            }
+        }
+        record
     }
     fn validate(&self) -> Result<()> {
         self.spec.validate()?;
@@ -202,6 +230,7 @@ impl StoredEnvironment {
             return Err(Error::Conflict);
         }
         validate_device_assignment(&self.spec.scheduling.devices, &self.assignment.devices)?;
+        self.validate_reader_dependencies()?;
         if let Some(r) = &self.result {
             validate_result(r)?;
             if r.spec != self.spec || r.assignment != self.assignment {
@@ -295,6 +324,7 @@ fn decode<T: for<'a> Deserialize<'a>>(v: &str) -> Result<T> {
     serde_json::from_str(v).map_err(|_| Error::Unavailable("corrupt control record".into()))
 }
 fn validate_result(r: &EnvironmentRecord) -> Result<()> {
+    r.validate_checkpoint_readers()?;
     if r.restart_attempts
         > r.spec
             .lifecycle
@@ -365,6 +395,14 @@ fn validate_result(r: &EnvironmentRecord) -> Result<()> {
     }
 }
 fn next_result(old: &StoredEnvironment, r: &EnvironmentRecord) -> Result<bool> {
+    if r.checkpoint_readers
+        .readers
+        .iter()
+        .any(|reader| old.reader_retired(reader))
+        || (r.state == EnvironmentState::Deleted && !old.reader_reservations.is_empty())
+    {
+        return Err(Error::Conflict);
+    }
     let mut expected_spec = old.spec.clone();
     expected_spec.execution.network = r.spec.execution.network.clone();
     if expected_spec != r.spec || old.assignment != r.assignment {
@@ -392,6 +430,14 @@ fn next_result(old: &StoredEnvironment, r: &EnvironmentRecord) -> Result<bool> {
         return Err(Error::Conflict);
     }
     if let Some(previous) = &old.result {
+        for reader in &previous.checkpoint_readers.readers {
+            if !old.reader_retired(reader) && !r.checkpoint_readers.readers.contains(reader) {
+                return Err(Error::Conflict);
+            }
+        }
+        if !previous.checkpoint_readers.complete && r.checkpoint_readers.complete {
+            return Err(Error::Conflict);
+        }
         if previous == r {
             return Ok(false);
         }
@@ -652,7 +698,9 @@ impl RedisStore {
                 {
                     let record: StoredEnvironment = decode(value)?;
                     if record.result.as_ref().is_some_and(|result| {
-                        result.state == EnvironmentState::Deleted && !result.resources_held
+                        result.state == EnvironmentState::Deleted
+                            && !result.resources_held
+                            && result.checkpoint_readers.reclaimable()
                     }) {
                         normalized.remove(field);
                         retired.push(field.clone());
@@ -1052,6 +1100,8 @@ impl Session {
             }
         }
         let record = StoredEnvironment {
+            reader_reservations: Vec::new(),
+            reader_retirements: Vec::new(),
             resume: None,
             failed_since_unix_seconds: None,
             recovery: None,
@@ -1208,6 +1258,11 @@ impl Session {
                 return Err(Error::NotFound);
             };
             let mut stored_environment: StoredEnvironment = decode(environment_value)?;
+            if result.state == EnvironmentState::Deleted
+                && !stored_environment.reader_reservations.is_empty()
+            {
+                return Err(Error::Conflict);
+            }
             if !(next_result(&stored_environment, &result)?
                 || result.state == EnvironmentState::Running && stored_environment.resume.is_some())
             {
@@ -1232,7 +1287,9 @@ impl Session {
             let expected_header = header_value
                 .as_deref()
                 .expect("validated control header is present");
-            let applied = if result.state == EnvironmentState::Deleted {
+            let applied = if result.state == EnvironmentState::Deleted
+                && result.checkpoint_readers.reclaimable()
+            {
                 self.store
                     .retire_environment(
                         expected_header,

@@ -8,6 +8,22 @@ use sha2::{Digest, Sha256};
 
 impl Controller {
     pub(super) async fn snapshot(&mut self, request: SnapshotRequest) -> Result<SnapshotResult> {
+        let started = std::time::Instant::now();
+        let result = self.snapshot_inner(request).await;
+        if let Err(error) = &result {
+            adx_observability::warn!(
+                event = "environment_snapshot_failed",
+                environment_id = %self.record.spec.id,
+                runtime_id = %self.record.runtime.id,
+                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                error = ?error,
+                "environment snapshot failed"
+            );
+        }
+        result
+    }
+
+    async fn snapshot_inner(&mut self, request: SnapshotRequest) -> Result<SnapshotResult> {
         // The operation ID is scoped to tenant and Environment. Names are deliberately
         // excluded so retries with changed arguments conflict instead of creating twice.
         let key = serde_json::to_vec(&(

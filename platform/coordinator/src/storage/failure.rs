@@ -28,6 +28,7 @@ impl Session {
                     .result
                     .clone()
                     .unwrap_or_else(|| EnvironmentRecord {
+                        checkpoint_readers: Default::default(),
                         failure: None,
                         spec: environment.spec.clone(),
                         assignment: environment.assignment.clone(),

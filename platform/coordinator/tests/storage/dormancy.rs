@@ -349,3 +349,96 @@ async fn failure_recovery_intermediate_pause_does_not_become_user_dormancy() {
     );
     assert!(interrupted.recovery_point(1).is_some());
 }
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn rejected_resume_completion_is_fenced_and_preserves_checkpoint() {
+    let (rig, session, mut record) = paused_fixture().await;
+    record.checkpoint_readers.complete = true;
+    record.checkpoint_readers.readers.clear();
+    record.revision += 1;
+    session.commit(record.clone()).await.unwrap();
+    let expected_revision = record.revision;
+    let intent = session
+        .request_resume("sleep", 1)
+        .await
+        .unwrap()
+        .resume
+        .unwrap();
+    assert_eq!(
+        session
+            .finish_rejected_resume(&record.assignment, &intent.operation_id, expected_revision)
+            .await,
+        Err(Error::Conflict),
+        "an old paused record is not evidence of this attempt's rollback"
+    );
+    record.revision += 2;
+    session.commit(record.clone()).await.unwrap();
+    let mut wrong_owner = record.assignment.clone();
+    wrong_owner.node_id = "target".into();
+    assert_eq!(
+        session
+            .finish_rejected_resume(&wrong_owner, &intent.operation_id, expected_revision)
+            .await,
+        Err(Error::Conflict)
+    );
+    assert_eq!(
+        session
+            .finish_rejected_resume(&record.assignment, "wrong-wake", expected_revision)
+            .await,
+        Err(Error::Conflict)
+    );
+    let settled = session
+        .finish_rejected_resume(&record.assignment, &intent.operation_id, expected_revision)
+        .await
+        .unwrap();
+    assert!(settled.resume.is_none());
+    assert_eq!(settled.result.as_ref().unwrap(), &record);
+    assert_eq!(
+        session
+            .finish_rejected_resume(&record.assignment, &intent.operation_id, expected_revision)
+            .await
+            .unwrap(),
+        settled
+    );
+    let restarted = rig.store().await.begin(1).await.unwrap();
+    assert_eq!(restarted.get("sleep").await.unwrap(), settled);
+    let fresh = restarted.request_resume("sleep", 1).await.unwrap();
+    assert_ne!(
+        fresh.resume.as_ref().unwrap().operation_id,
+        intent.operation_id
+    );
+    assert_eq!(
+        restarted
+            .finish_rejected_resume(&record.assignment, &intent.operation_id, expected_revision)
+            .await,
+        Err(Error::Conflict)
+    );
+    assert_eq!(restarted.get("sleep").await.unwrap(), fresh);
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn rejected_resume_completion_keeps_unknown_reader_dependencies() {
+    let (_rig, session, mut record) = paused_fixture().await;
+    let intent = session
+        .request_resume("sleep", 1)
+        .await
+        .unwrap()
+        .resume
+        .unwrap();
+    let expected_revision = record.revision;
+    record.revision += 2;
+    record.checkpoint_readers.complete = false;
+    record.checkpoint_readers.readers.clear();
+    session.commit(record.clone()).await.unwrap();
+    assert_eq!(
+        session
+            .finish_rejected_resume(&record.assignment, &intent.operation_id, expected_revision)
+            .await,
+        Err(Error::Conflict)
+    );
+    let retained = session.get("sleep").await.unwrap();
+    assert_eq!(retained.resume.unwrap(), intent);
+    assert_eq!(retained.result.unwrap(), record);
+}

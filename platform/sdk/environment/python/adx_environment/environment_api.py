@@ -16,29 +16,33 @@ from urllib.parse import urlparse
 from ._transport import EnvironmentClient, EnvironmentError
 from .commands import Commands
 from .filesystem import Filesystem
+from .probes import HealthcheckProbe, ReadinessProbe
 from .pty import Pty
 from .scheduling import encode_affinities, instance_labels
+from .shared_volume_mounts import (
+    SharedVolumeMount,
+    normalize_shared_mounts,
+    require_mount_contract,
+)
 from .shell import Shells
 from .types import (
     ADX_GET_DEFAULT_TIMEOUT,
     ConnectionConfig,
     DataPlaneSecurityPolicy,
+    EnvironmentFailure,
+    EnvironmentInfo,
+    IdleAction,
     Mount,
     NetworkPolicy,
+    PausePolicy,
     PauseResult,
     PortForwarding,
     RestartPolicy,
-    PausePolicy,
-    RetentionPolicy,
-    IdleAction,
     ResumeResult,
+    RetentionPolicy,
     S3Config,
-    EnvironmentInfo,
-    EnvironmentFailure,
     SnapshotInfo,
 )
-
-from .probes import ReadinessProbe, HealthcheckProbe
 
 logger = logging.getLogger(__name__)
 
@@ -59,33 +63,51 @@ def _get_create_timeout(timeout: Optional[int]) -> int:
         try:
             value = int(raw)
         except ValueError as exc:
-            raise ValueError("ADX_ENVIRONMENT_CREATE_TIMEOUT must be an integer number of seconds") from exc
+            raise ValueError(
+                "ADX_ENVIRONMENT_CREATE_TIMEOUT must be an integer number of seconds"
+            ) from exc
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError("create_timeout must be a positive integer")
     return value
 
 
-def _resolve_create_timeouts(create_timeout: Optional[int], schedule_timeout: Optional[int], init_timeout: int = _INIT_CALL_TIMEOUT) -> tuple[int, int]:
-    if isinstance(init_timeout, bool) or not isinstance(init_timeout, int) or not 1 <= init_timeout <= 86400:
+def _resolve_create_timeouts(
+    create_timeout: Optional[int],
+    schedule_timeout: Optional[int],
+    init_timeout: int = _INIT_CALL_TIMEOUT,
+) -> tuple[int, int]:
+    if (
+        isinstance(init_timeout, bool)
+        or not isinstance(init_timeout, int)
+        or not 1 <= init_timeout <= 86400
+    ):
         raise ValueError("init_timeout must be an integer between 1 and 86400")
     reserve = init_timeout + CREATE_TIMEOUT_BUFFER
     schedule_timeout_invalid = schedule_timeout is not None and (
-        isinstance(schedule_timeout, bool) or not isinstance(schedule_timeout, int) or schedule_timeout <= 0
+        isinstance(schedule_timeout, bool)
+        or not isinstance(schedule_timeout, int)
+        or schedule_timeout <= 0
     )
     if schedule_timeout_invalid:
         raise ValueError("schedule_timeout must be a positive integer")
 
-    resolved_schedule = DEFAULT_SCHEDULE_TIMEOUT if schedule_timeout is None else schedule_timeout
+    resolved_schedule = (
+        DEFAULT_SCHEDULE_TIMEOUT if schedule_timeout is None else schedule_timeout
+    )
     if create_timeout is None and "ADX_ENVIRONMENT_CREATE_TIMEOUT" not in os.environ:
         resolved_create = resolved_schedule + reserve
     else:
         resolved_create = _get_create_timeout(create_timeout)
 
     if resolved_schedule > resolved_create:
-        raise ValueError("schedule_timeout must be less than or equal to create_timeout")
+        raise ValueError(
+            "schedule_timeout must be less than or equal to create_timeout"
+        )
     remaining_create_budget = resolved_create - resolved_schedule
     if remaining_create_budget < CREATE_TIMEOUT_BUFFER:
-        raise ValueError(f"create_timeout - schedule_timeout must be at least {CREATE_TIMEOUT_BUFFER}")
+        raise ValueError(
+            f"create_timeout - schedule_timeout must be at least {CREATE_TIMEOUT_BUFFER}"
+        )
     if remaining_create_budget < reserve:
         resolved_create = resolved_schedule + reserve
     return resolved_create, resolved_schedule
@@ -99,7 +121,9 @@ def _get_tunnel_connect_timeout(timeout: Optional[float]) -> float:
         try:
             value = float(raw)
         except ValueError as e:
-            raise ValueError("ADX_TUNNEL_CONNECT_TIMEOUT must be a number of seconds") from e
+            raise ValueError(
+                "ADX_TUNNEL_CONNECT_TIMEOUT must be a number of seconds"
+            ) from e
     if value <= 0:
         raise ValueError("tunnel_connect_timeout must be greater than 0")
     return value
@@ -137,7 +161,11 @@ def _gateway_address(connection: Optional[ConnectionConfig]) -> str:
 
 def _gateway_uses_tls(connection: Optional[ConnectionConfig]) -> bool:
     if connection is not None:
-        return connection.gateway_use_tls if connection.gateway_address is not None else connection.use_tls
+        return (
+            connection.gateway_use_tls
+            if connection.gateway_address is not None
+            else connection.use_tls
+        )
     gateway = os.environ.get("ADX_GATEWAY_ADDRESS", "").strip()
     flag = "ADX_GATEWAY_TLS" if gateway else "ADX_TLS"
     default = "0" if gateway else "1"
@@ -198,8 +226,14 @@ class Environment:
         Snapshot. Explicit resource fields must be compatible with its runtime;
         the current Firecracker backend requires the original resource geometry.
         """
-        value = snapshot_id.snapshot_id if isinstance(snapshot_id, SnapshotInfo) else snapshot_id
-        explicit_resource_fields = frozenset(kwargs).intersection(_SNAPSHOT_RESOURCE_FIELDS)
+        value = (
+            snapshot_id.snapshot_id
+            if isinstance(snapshot_id, SnapshotInfo)
+            else snapshot_id
+        )
+        explicit_resource_fields = frozenset(kwargs).intersection(
+            _SNAPSHOT_RESOURCE_FIELDS
+        )
         return cls(
             snapshot_id=value,
             _snapshot_resource_fields=explicit_resource_fields,
@@ -210,7 +244,11 @@ class Environment:
     def _snapshot_info(payload: Mapping[str, Any]) -> SnapshotInfo:
         snapshot_id = str(payload.get("snapshotId") or "")
         names = payload.get("names") or []
-        if not snapshot_id or not isinstance(names, list) or not all(isinstance(name, str) for name in names):
+        if (
+            not snapshot_id
+            or not isinstance(names, list)
+            or not all(isinstance(name, str) for name in names)
+        ):
             raise EnvironmentError("invalid reusable Snapshot response")
         return SnapshotInfo(snapshot_id=snapshot_id, names=tuple(names))
 
@@ -244,10 +282,16 @@ class Environment:
         client.delete_snapshot(snapshot_id)
 
     @classmethod
-    def get_snapshot(cls, snapshot_id: str, *, connection: Optional[ConnectionConfig] = None) -> SnapshotInfo:
+    def get_snapshot(
+        cls, snapshot_id: str, *, connection: Optional[ConnectionConfig] = None
+    ) -> SnapshotInfo:
         if not isinstance(snapshot_id, str) or not snapshot_id.strip():
             raise ValueError("snapshot_id must be a non-empty string")
-        client = EnvironmentClient(connection=connection) if connection is not None else EnvironmentClient()
+        client = (
+            EnvironmentClient(connection=connection)
+            if connection is not None
+            else EnvironmentClient()
+        )
         try:
             return cls._get_snapshot(client, snapshot_id.strip())
         finally:
@@ -271,7 +315,11 @@ class Environment:
                 raise TypeError("page_size must be an integer or None")
             if page_size <= 0:
                 raise ValueError("page_size must be greater than 0")
-        client = EnvironmentClient(connection=connection) if connection is not None else EnvironmentClient()
+        client = (
+            EnvironmentClient(connection=connection)
+            if connection is not None
+            else EnvironmentClient()
+        )
         try:
             return cls._list_snapshots(
                 client,
@@ -283,10 +331,16 @@ class Environment:
             client.close()
 
     @classmethod
-    def delete_snapshot(cls, snapshot_id: str, *, connection: Optional[ConnectionConfig] = None) -> None:
+    def delete_snapshot(
+        cls, snapshot_id: str, *, connection: Optional[ConnectionConfig] = None
+    ) -> None:
         if not isinstance(snapshot_id, str) or not snapshot_id.strip():
             raise ValueError("snapshot_id must be a non-empty string")
-        client = EnvironmentClient(connection=connection) if connection is not None else EnvironmentClient()
+        client = (
+            EnvironmentClient(connection=connection)
+            if connection is not None
+            else EnvironmentClient()
+        )
         try:
             cls._delete_snapshot(client, snapshot_id.strip())
         finally:
@@ -334,6 +388,7 @@ class Environment:
         create_timeout: Optional[int] = None,
         connection: Optional[ConnectionConfig] = None,
         extra_config: Optional[Dict[str, Any]] = None,
+        shared_volumes: Optional[List[SharedVolumeMount]] = None,
         _snapshot_resource_fields: Optional[frozenset[str]] = None,
     ):
         """Create a new environment.
@@ -410,7 +465,11 @@ class Environment:
         """
         if not isinstance(idle_action, IdleAction):
             raise TypeError("idle_action must be an IdleAction")
-        if idle_action == IdleAction.PAUSE and (isinstance(idle_timeout, bool) or not isinstance(idle_timeout, int) or idle_timeout <= 0):
+        if idle_action == IdleAction.PAUSE and (
+            isinstance(idle_timeout, bool)
+            or not isinstance(idle_timeout, int)
+            or idle_timeout <= 0
+        ):
             raise ValueError("idle pause requires a positive idle_timeout")
         if pause_policy is not None and not isinstance(pause_policy, PausePolicy):
             raise TypeError("pause_policy must be a PausePolicy")
@@ -422,7 +481,9 @@ class Environment:
             raise ValueError("image and rootfs are mutually exclusive")
         if rootfs_readonly is not None and not isinstance(rootfs_readonly, bool):
             raise TypeError("rootfs_readonly must be a boolean or None")
-        if snapshot_id is not None and (not isinstance(snapshot_id, str) or not snapshot_id.strip()):
+        if snapshot_id is not None and (
+            not isinstance(snapshot_id, str) or not snapshot_id.strip()
+        ):
             raise ValueError("snapshot_id must be a non-empty string")
         if not isinstance(failover, bool):
             raise TypeError("failover must be a boolean")
@@ -432,17 +493,25 @@ class Environment:
             raise ValueError("inherit_entrypoint requires an image rootfs")
         if inherit_entrypoint and snapshot_id is not None:
             raise ValueError("inherit_entrypoint cannot be combined with snapshot_id")
-        for value, expected, label in ((readiness_probe, ReadinessProbe, "readiness_probe"), (healthcheck_probe, HealthcheckProbe, "healthcheck_probe")):
+        for value, expected, label in (
+            (readiness_probe, ReadinessProbe, "readiness_probe"),
+            (healthcheck_probe, HealthcheckProbe, "healthcheck_probe"),
+        ):
             if value is not None and type(value) is not expected:
                 raise TypeError(f"{label} must be a {expected.__name__} or None")
-        if (readiness_probe is not None or healthcheck_probe is not None) and not inherit_entrypoint:
+        if (
+            readiness_probe is not None or healthcheck_probe is not None
+        ) and not inherit_entrypoint:
             raise ValueError("workload probes require inherit_entrypoint=True")
         _resolve_create_timeouts(create_timeout, schedule_timeout, init_timeout)
         if snapshot_id is not None and rootfs_readonly is not None:
             raise ValueError("rootfs_readonly cannot be combined with snapshot_id")
         if env is not None and (
             not isinstance(env, Mapping)
-            or not all(isinstance(key, str) and isinstance(value, str) for key, value in env.items())
+            or not all(
+                isinstance(key, str) and isinstance(value, str)
+                for key, value in env.items()
+            )
         ):
             raise TypeError("env must map strings to strings")
         if name is not None and (not isinstance(name, str) or not name.strip()):
@@ -470,13 +539,19 @@ class Environment:
         if storage_limit_mb < 0:
             raise ValueError("storage_limit_mb must be 0 or greater")
         if storage_mb is not None and 0 < storage_limit_mb < storage_mb:
-            raise ValueError("storage_limit_mb must be greater than or equal to storage_mb")
+            raise ValueError(
+                "storage_limit_mb must be greater than or equal to storage_mb"
+            )
         if network is not None and not isinstance(network, NetworkPolicy):
             raise TypeError("network must be a NetworkPolicy or None")
         if connection is not None and not isinstance(connection, ConnectionConfig):
             raise TypeError("connection must be a ConnectionConfig or None")
-        if data_plane_security is not None and not isinstance(data_plane_security, DataPlaneSecurityPolicy):
-            raise TypeError("data_plane_security must be a DataPlaneSecurityPolicy or None")
+        if data_plane_security is not None and not isinstance(
+            data_plane_security, DataPlaneSecurityPolicy
+        ):
+            raise TypeError(
+                "data_plane_security must be a DataPlaneSecurityPolicy or None"
+            )
         if mounts is None:
             mount_list: List[Mount] = []
         else:
@@ -485,7 +560,12 @@ class Environment:
             mount_list = list(mounts)
             if not all(isinstance(mount, Mount) for mount in mount_list):
                 raise TypeError("mounts must contain only Mount objects")
-        if upstream is not None and (not isinstance(upstream, str) or not upstream.strip()):
+        shared_mount_list = normalize_shared_mounts(
+            shared_volumes, [mount.target for mount in mount_list]
+        )
+        if upstream is not None and (
+            not isinstance(upstream, str) or not upstream.strip()
+        ):
             raise ValueError("upstream must be a non-empty address")
         if isinstance(proxy_port, bool) or not isinstance(proxy_port, int):
             raise TypeError("proxy_port must be an integer")
@@ -497,7 +577,9 @@ class Environment:
         pf_ports: List[str] = []
         if port_forwardings:
             if isinstance(port_forwardings, (str, bytes)):
-                raise TypeError("port_forwardings must contain integers or PortForwarding objects")
+                raise TypeError(
+                    "port_forwardings must contain integers or PortForwarding objects"
+                )
             ports: List[int] = []
             for forwarding in port_forwardings:
                 if isinstance(forwarding, PortForwarding):
@@ -505,7 +587,9 @@ class Environment:
                 else:
                     port = forwarding
                 if isinstance(port, bool) or not isinstance(port, int):
-                    raise TypeError("forwarded port must be an integer or PortForwarding object")
+                    raise TypeError(
+                        "forwarded port must be an integer or PortForwarding object"
+                    )
                 if not 1 <= port <= 65535:
                     raise ValueError("forwarded port must be between 1 and 65535")
                 ports.append(port)
@@ -517,7 +601,9 @@ class Environment:
             conflicts = self._forwarded_ports.intersection({proxy_port - 1, proxy_port})
             if conflicts:
                 rendered = ", ".join(str(port) for port in sorted(conflicts))
-                raise ValueError(f"reverse tunnel ports conflict with port_forwardings: {rendered}")
+                raise ValueError(
+                    f"reverse tunnel ports conflict with port_forwardings: {rendered}"
+                )
 
         # ── reverse tunnel ────────────────────────────────────────────────
         self._tunnel_client = None
@@ -526,7 +612,9 @@ class Environment:
         self._upstream = upstream
 
         # ── build create body ─────────────────────────────────────────────
-        resolved_create_timeout, resolved_schedule_timeout = _resolve_create_timeouts(create_timeout, schedule_timeout, init_timeout)
+        resolved_create_timeout, resolved_schedule_timeout = _resolve_create_timeouts(
+            create_timeout, schedule_timeout, init_timeout
+        )
         body: Dict[str, Any] = {
             "namespace": "default",
             "snapshotId": snapshot_id.strip() if snapshot_id is not None else None,
@@ -600,6 +688,8 @@ class Environment:
             body["labels"] = instance_labels(labels)
         if mount_list:
             body["mounts"] = [mount.to_dict() for mount in mount_list]
+        if shared_mount_list:
+            body["sharedVolumes"] = [mount.to_dict() for mount in shared_mount_list]
         if network is not None and not network.is_empty:
             body["network"] = network.to_dict()
         if data_plane_security is not None and data_plane_security.to_dict():
@@ -626,7 +716,11 @@ class Environment:
         # Frontend owns EXECD_HTTP_PORT=50090 and its environment network mapping for
         # /direct. SDK callers should not expose that internal control port.
         if connection is None:
-            self._client = EnvironmentClient(connection=connection) if connection is not None else EnvironmentClient()
+            self._client = (
+                EnvironmentClient(connection=connection)
+                if connection is not None
+                else EnvironmentClient()
+            )
         else:
             self._client = EnvironmentClient(connection=connection)
         self._connection = connection
@@ -640,7 +734,9 @@ class Environment:
             create_info = self._create(body)
             environment_id = create_info.get("environmentId")
             if not isinstance(environment_id, str) or not environment_id:
-                raise RuntimeError(f"create response missing environment id: {create_info}")
+                raise RuntimeError(
+                    f"create response missing environment id: {create_info}"
+                )
             self._sid = environment_id
 
             # ── reverse tunnel: connect after environment is running ──────────
@@ -652,7 +748,9 @@ class Environment:
                 tunnel_info = create_info.get("tunnel") or {}
                 if not isinstance(tunnel_info, dict):
                     tunnel_info = {}
-                self._tunnel_url = tunnel_info.get("proxyUrl") or f"http://127.0.0.1:{proxy_port}"
+                self._tunnel_url = (
+                    tunnel_info.get("proxyUrl") or f"http://127.0.0.1:{proxy_port}"
+                )
                 tunnel_url = tunnel_info.get("url") or tunnel_info.get("path")
                 safe_id = self._client._safe_id(self._sid)
                 tls = _gateway_uses_tls(self._connection)
@@ -669,7 +767,9 @@ class Environment:
                 # Only carry the JWT over a TLS tunnel. Plaintext mode is for
                 # auth-disabled local/dev frontends.
                 tunnel_token = self._client.token if tls else None
-                self._tunnel_client = TunnelClient(upstream, token=tunnel_token, environment_id=self._sid)
+                self._tunnel_client = TunnelClient(
+                    upstream, token=tunnel_token, environment_id=self._sid
+                )
                 logger.info(
                     "Starting TunnelClient: environment_id=%s name=%s url=%s timeout=%.1fs",
                     safe_id,
@@ -745,11 +845,17 @@ class Environment:
         if connection is not None and not isinstance(connection, ConnectionConfig):
             raise TypeError("connection must be a ConnectionConfig or None")
 
-        client = EnvironmentClient() if connection is None else EnvironmentClient(connection=connection)
+        client = (
+            EnvironmentClient()
+            if connection is None
+            else EnvironmentClient(connection=connection)
+        )
         try:
             info = client.environment_info(environment_id)
             if str(info.get("status", "")).lower() != "running":
-                raise RuntimeError(f"environment {environment_id} is not running: {info.get('status', 'unknown')}")
+                raise RuntimeError(
+                    f"environment {environment_id} is not running: {info.get('status', 'unknown')}"
+                )
             environment = cls.__new__(cls)
             environment._sid = environment_id
             environment._client = client
@@ -809,7 +915,9 @@ class Environment:
         selected from the environment's resolved gateway connection settings.
         """
         if port not in self._forwarded_ports:
-            raise ValueError(f"Port {port} is not in forwarded ports: {self._forwarded_ports}")
+            raise ValueError(
+                f"Port {port} is not in forwarded ports: {self._forwarded_ports}"
+            )
         connection = getattr(self, "_connection", None)
         gateway = _gateway_address(connection)
         safe_id = self._client._safe_id(self._sid)
@@ -851,10 +959,14 @@ class Environment:
             RuntimeError: if no reverse tunnel was configured.
         """
         if self._upstream is None:
-            raise RuntimeError("No upstream configured. Pass upstream= to Environment().")
+            raise RuntimeError(
+                "No upstream configured. Pass upstream= to Environment()."
+            )
         return self._tunnel_url
 
     def _create(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        if body.get("sharedVolumes"):
+            require_mount_contract(self._client)
         create_info = getattr(self._client, "create_info", None)
         if callable(create_info):
             return create_info(body)
@@ -870,7 +982,9 @@ class Environment:
         available through :attr:`entrypoint_exit_info`.
         """
         if not self._inherit_entrypoint:
-            raise RuntimeError("inherit_entrypoint was not enabled for this environment")
+            raise RuntimeError(
+                "inherit_entrypoint was not enabled for this environment"
+            )
         if self._closed:
             raise RuntimeError("environment is closed")
 
@@ -889,10 +1003,14 @@ class Environment:
                 self._entrypoint_exit_info = dict(result)
                 exit_code = result.get("shell_exit_code", result.get("exit_code"))
                 if isinstance(exit_code, bool) or not isinstance(exit_code, int):
-                    raise EnvironmentError(f"entrypoint exit response missing exit code: {result}")
+                    raise EnvironmentError(
+                        f"entrypoint exit response missing exit code: {result}"
+                    )
                 return exit_code
             if status == "error":
-                raise EnvironmentError(str(result.get("message") or "entrypoint polling failed"))
+                raise EnvironmentError(
+                    str(result.get("message") or "entrypoint polling failed")
+                )
             raise EnvironmentError(f"invalid entrypoint poll response: {result}")
 
     @property
@@ -921,7 +1039,9 @@ class Environment:
             cpu=info.get("required_cpu", self._cpu),
             memory=info.get("required_mem", self._memory),
             image=info.get("image", self._image),
-            failure=EnvironmentFailure(**info["failure"]) if info.get("failure") else None,
+            failure=EnvironmentFailure(**info["failure"])
+            if info.get("failure")
+            else None,
         )
 
     def create_snapshot(
@@ -976,13 +1096,19 @@ class Environment:
             raise ValueError("timeout_seconds must be between 1 and 3600")
         if self._closed:
             raise RuntimeError("environment is closed")
-        result = self._client.pause(self._sid, retention.to_dict() if retention is not None else None, timeout_seconds=timeout_seconds)
+        result = self._client.pause(
+            self._sid,
+            retention.to_dict() if retention is not None else None,
+            timeout_seconds=timeout_seconds,
+        )
         pause = PauseResult(
             environment_id=str(result.get("environmentId") or ""),
             snapshot_id=str(result.get("snapshotId") or ""),
             size=int(result.get("size") or 0),
             state=str(result.get("state") or ""),
-            expires_at=int(result["expiresAt"]) if result.get("expiresAt") is not None else None,
+            expires_at=int(result["expiresAt"])
+            if result.get("expiresAt") is not None
+            else None,
         )
         pause_result_invalid = (
             pause.environment_id != self._sid
@@ -993,7 +1119,9 @@ class Environment:
             or (pause.expires_at is not None and pause.expires_at <= 0)
         )
         if pause_result_invalid:
-            raise EnvironmentError("pause response is not an authoritative PAUSED result")
+            raise EnvironmentError(
+                "pause response is not an authoritative PAUSED result"
+            )
         return pause
 
     def resume(self) -> ResumeResult:
@@ -1019,7 +1147,9 @@ class Environment:
             or not resume.function_proxy_id
         )
         if resume_result_invalid:
-            raise EnvironmentError("resume response is not an authoritative RUNNING result")
+            raise EnvironmentError(
+                "resume response is not an authoritative RUNNING result"
+            )
         return resume
 
     def reload(self) -> bool:

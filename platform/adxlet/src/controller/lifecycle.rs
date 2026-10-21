@@ -1,7 +1,7 @@
 use super::*;
 use crate::checkpoint::{now, validate_operation};
 use adx_core::{CompletedOperation, LifecycleKind, RestorePoint};
-use std::{path::Path, time::Duration};
+use std::time::Duration;
 
 impl Controller {
     pub(super) async fn auto_pause(
@@ -190,7 +190,7 @@ impl Controller {
             .runtime
             .checkpoint_supported(&self.record.spec.runtime_class)
             .await?;
-        let staged = services.store.allocate().await?;
+        let staged = services.store.allocate_for_policy(storage).await?;
         // Preparation errors can be ambiguous: abort is valid only before the backend call.
         let preparation = match &self.auto_pause_guard {
             Some((stamp, _)) => {
@@ -296,10 +296,18 @@ impl Controller {
             services.store.discard_staged(&staged).await?;
             return Err(error);
         }
-        // Checkpoint success confirms the artifact, not completion of the backend's
-        // asynchronous exit notification. Idempotent remove is the stop barrier.
-        // Source deletion must be confirmed before releasing local resources.
-        if let Err(error) = self.services.runtime.remove(&self.record.runtime.id).await {
+        // Preserve runtime state until a reader-bound stop receipt has been
+        // obtained and persisted. Legacy Delete may erase that proof's anchor.
+        let stopped = async {
+            crate::shared_volumes::retire(&self.services, &self.record).await?;
+            if self.record.current_checkpoint_reader_entry().is_some() {
+                self.release_checkpoint_reader().await
+            } else {
+                self.services.runtime.remove(&self.record.runtime.id).await
+            }
+        }
+        .await;
+        if let Err(error) = stopped {
             self.transition(Event::Fail)?;
             self.sync().await?;
             return Err(error);
@@ -334,17 +342,7 @@ impl Controller {
                     source_runtime_id: self.record.runtime.id.clone(),
                 });
                 self.transition(Event::Checkpointed)?;
-                let artifact = &self
-                    .record
-                    .checkpoint
-                    .as_ref()
-                    .ok_or(Error::Conflict)?
-                    .artifact;
-                let path = services.store.materialize(artifact).await?;
-                let rollback = self.restore_execution(&path).await;
-                if self.held {
-                    self.recovery_files = Some(path);
-                }
+                let rollback = self.restore_execution().await;
                 if rollback.is_err() && self.record.state != EnvironmentState::Failed {
                     self.transition(Event::Fail)?;
                 }
@@ -372,7 +370,7 @@ impl Controller {
         );
         self.sync().await
     }
-    async fn restore_execution(&mut self, path: &Path) -> Result<()> {
+    async fn restore_execution(&mut self) -> Result<()> {
         let next_revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
         let runtime_id = format!(
             "{}-{}-r{}",
@@ -384,6 +382,7 @@ impl Controller {
             .expect("shared state lock poisoned")
             .reserve(&runtime_id, &self.record.spec, &self.record.assignment)?;
         self.record.runtime.id = runtime_id;
+        let checkpoint = self.record.checkpoint.clone().ok_or(Error::Conflict)?;
         self.held = true;
         self.record.resources_held = true;
         self.transition(Event::Resume)?;
@@ -393,8 +392,40 @@ impl Controller {
         } else {
             self.services.operation_timeout
         };
+        let restore_started = std::time::Instant::now();
+        let mut restore_stage = "runtime_expectation";
         let attempt = tokio::time::timeout(initialization_timeout, async {
+            restore_stage = "shared_volume_reservation";
+            crate::shared_volumes::reserve(&self.services, &self.record).await?;
+            restore_stage = "reader_reservation";
+            // Volume admission can reject before any checkpoint read is reserved.
+            // Do not make cleanup release a reader the authority never saw. Once
+            // reader reservation is attempted, retain the local dependency even
+            // if its acknowledgement is lost.
+            self.record.register_checkpoint_reader(checkpoint)?;
+            self.services
+                .sink
+                .reserve_checkpoint_reader(&self.record)
+                .await?;
+            restore_stage = "checkpoint_materialization";
+            let artifact = &self
+                .record
+                .checkpoint
+                .as_ref()
+                .ok_or(Error::Conflict)?
+                .artifact;
+            let path = self
+                .services
+                .checkpoint
+                .as_ref()
+                .ok_or(Error::Conflict)?
+                .store
+                .materialize(artifact)
+                .await?;
+            self.recovery_files = Some(path);
+            restore_stage = "runtime_expectation";
             self.services.readiness.expect_runtime(&self.record)?;
+            restore_stage = "runtime_restore";
             self.record.runtime.ip = Some(
                 self.services
                     .runtime
@@ -403,7 +434,7 @@ impl Controller {
                         &self.record.runtime.id,
                         self.record.assignment.generation,
                         &self.record.assignment.devices,
-                        path,
+                        self.recovery_files.as_ref().ok_or(Error::Conflict)?,
                         self.record
                             .checkpoint
                             .as_ref()
@@ -411,7 +442,9 @@ impl Controller {
                     )
                     .await?,
             );
+            restore_stage = "runtime_readiness";
             self.services.readiness.wait_ready(&self.record).await?;
+            restore_stage = "route_activation";
             self.services.routes.activate(&self.record).await
         })
         .await
@@ -421,13 +454,30 @@ impl Controller {
             ))
         });
         if let Err(error) = attempt {
+            adx_observability::warn!(
+                event = "environment_restore_failed",
+                environment_id = %self.record.spec.id,
+                runtime_id = %self.record.runtime.id,
+                stage = restore_stage,
+                elapsed_ms = restore_started.elapsed().as_secs_f64() * 1000.0,
+                error = ?error,
+                "environment restore failed"
+            );
             if let Error::ProbeFailed(failure) = &error {
                 self.record.failure = Some(failure.clone().into());
             }
             match self.cleanup().await {
                 Ok(()) => {
                     self.record.runtime.ip = None;
-                    self.transition(Event::Rollback)?;
+                    // A permanent validation error cannot improve by assigning
+                    // another execution ID. Settle it only AFTER reader-bound
+                    // cleanup; unknown cleanup above/below still retains proof
+                    // anchors, files and capacity through the existing failure path.
+                    if matches!(error, Error::Invalid(_)) {
+                        self.transition(Event::Fail)?;
+                    } else {
+                        self.transition(Event::Rollback)?;
+                    }
                 }
                 Err(cleanup) => {
                     self.transition(Event::Fail)?;
@@ -453,15 +503,21 @@ impl Controller {
             return result;
         }
         if let Err(error) = &result {
-            // Paused plus no local reservation proves this attempt did not leave
-            // an execution. A Running result whose publication failed is retried
-            // through the operation record, never by starting another runtime.
-            if self.record.state == EnvironmentState::Paused
-                && !self.held
+            // Positive cleanup can leave Paused (retryable) or Failed (permanent
+            // validation refusal). Recovery publishes the terminal record in
+            // either case; it must not turn a settled failure into an RPC error.
+            // Uncertain cleanup still retains the reservation and cannot enter
+            // this branch. A Running result is replayed, never re-executed.
+            if matches!(
+                self.record.state,
+                EnvironmentState::Paused | EnvironmentState::Failed
+            ) && !self.held
                 && !self.record.resources_held
             {
                 eprintln!("checkpoint recovery failed: {error}");
-                self.transition(Event::Fail)?;
+                if self.record.state != EnvironmentState::Failed {
+                    self.transition(Event::Fail)?;
+                }
                 return self.sync().await;
             }
         }
@@ -482,12 +538,7 @@ impl Controller {
         if cp.expired(now()?) {
             return Err(Error::Invalid("checkpoint expired".into()));
         }
-        let services = self.services.checkpoint.clone().ok_or(Error::Conflict)?;
-        let path = services.store.materialize(&cp.artifact).await?;
-        let restored = self.restore_execution(&path).await;
-        if self.held {
-            self.recovery_files = Some(path);
-        }
+        let restored = self.restore_execution().await;
         if let Err(error) = restored {
             if let Err(commit) = self.sync().await {
                 return Err(Error::Unavailable(format!(

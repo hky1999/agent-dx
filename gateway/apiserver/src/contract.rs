@@ -4,6 +4,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use tonic::Status;
+mod shared_volume_mounts;
 
 #[derive(Default, Deserialize)]
 #[serde(default)]
@@ -51,6 +52,8 @@ struct Create {
     xpu: String,
     ports: Vec<String>,
     mounts: Vec<Value>,
+    #[serde(rename = "sharedVolumes", alias = "shared_volumes")]
+    shared_volumes: Vec<shared_volume_mounts::Mount>,
     extra_config: HashMap<String, Value>,
     network: Value,
     #[serde(rename = "dataPlane")]
@@ -767,6 +770,11 @@ pub fn create_spec_with_environment(
         cwd: r.cwd,
         rootfs,
         mounts,
+        shared_volumes: r
+            .shared_volumes
+            .into_iter()
+            .map(|mount| mount.encode())
+            .collect::<Result<Vec<_>, _>>()?,
         network,
         data_plane,
         ports,
@@ -794,6 +802,18 @@ pub fn create_spec_with_environment(
         })
         .map_err(|error| invalid(&error.to_string()))?;
     let mut policy = policy;
+    if !environment.shared_volumes.is_empty() {
+        if policy.required_node.is_empty() {
+            policy.required_node.push(pb::LabelSelector::default());
+        }
+        for selector in &mut policy.required_node {
+            selector.expressions.push(pb::LabelRequirement {
+                key: "ADX_SHARED_VOLUME_STORAGE".into(),
+                op: pb::SelectorOp::Exists as i32,
+                values: vec![],
+            });
+        }
+    }
     if r.pause
         .as_ref()
         .is_some_and(|p| p.storage == adx_core::lifecycle::CheckpointStorage::Shared)

@@ -153,6 +153,8 @@ impl Session {
             };
             let generation = header.generation.checked_add(1).ok_or(Error::Conflict)?;
             let record = StoredEnvironment {
+                reader_reservations: Vec::new(),
+                reader_retirements: Vec::new(),
                 resume: None,
                 failed_since_unix_seconds: None,
                 recovery: None,
@@ -300,6 +302,8 @@ impl Session {
                     header.generation = generation;
                     header.advance()?;
                     let record = StoredEnvironment {
+                        reader_reservations: Vec::new(),
+                        reader_retirements: Vec::new(),
                         resume: None,
                         failed_since_unix_seconds: None,
                         recovery: None,

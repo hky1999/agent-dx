@@ -79,6 +79,7 @@ fn start(address: &str) -> Process {
 }
 fn record() -> EnvironmentRecord {
     EnvironmentRecord {
+        checkpoint_readers: Default::default(),
         failure: None,
         spec: EnvironmentSpec {
             id: "i".into(),

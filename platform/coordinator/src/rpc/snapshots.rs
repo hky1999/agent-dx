@@ -40,8 +40,13 @@ impl CoordinatorRpc {
             }
             let snapshots = state.session.retained_snapshots().await?;
             let mut candidates = Vec::new();
+            let readers_complete = state.environments.values().all(|i| {
+                i.result
+                    .as_ref()
+                    .is_some_and(|r| r.checkpoint_readers.complete)
+            });
             for snapshot in &snapshots {
-                if !snapshot.collectable() {
+                if !readers_complete || !snapshot.collectable() {
                     continue;
                 }
                 // Refuse corrupted/aliased ownership instead of deleting another
@@ -54,10 +59,8 @@ impl CoordinatorRpc {
                     .iter()
                     .any(|s| s.id != snapshot.id && same(&s.artifact))
                     || state.environments.values().any(|i| {
-                        i.result
-                            .as_ref()
-                            .and_then(|r| r.checkpoint.as_ref())
-                            .is_some_and(|c| same(&c.artifact))
+                        i.retained_checkpoint_points()
+                            .any(|point| same(&point.artifact))
                     })
                 {
                     continue;

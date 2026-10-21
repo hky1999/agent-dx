@@ -25,6 +25,7 @@ fn environment_options_roundtrip_preserves_backend_contract() {
             options: vec!["ro".into()],
             source: model::StorageSource::Image("registry.example/tools:v1".into()),
         }],
+        shared_volumes: vec![],
         network: Some(model::NetworkPolicy {
             traffic: Some(model::TrafficPolicy {
                 ingress_default_action: model::NetworkAction::Deny,
@@ -110,6 +111,7 @@ fn record_roundtrip_preserves_identity_state_and_ownership() {
     execution: Default::default(),
     };
     let r = EnvironmentRecord {
+        checkpoint_readers: Default::default(),
         restart_attempts: 0,
         restart_pending: false,
         spec,

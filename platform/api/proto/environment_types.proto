@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package adx.control.v1;
 
+import "shared_volume_types.proto";
+
 message Resources {
   uint64 cpu_millis = 1;
   uint64 memory_bytes = 2;
@@ -112,6 +114,8 @@ message ExecutionOptions {
   uint64 init_timeout_seconds = 12;
   // Execd creates this constructor directory before reporting Ready.
   optional string cwd = 13;
+  // Typed references only; node-owned host paths are never caller input.
+  repeated SharedVolumeMount shared_volumes = 14;
 }
 
 enum IdleAction { IDLE_ACTION_DELETE = 0; IDLE_ACTION_PAUSE = 1; }
@@ -164,7 +168,12 @@ message EnvironmentRecord {
   uint32 restart_attempts = 10;
   bool restart_pending = 11;
   RuntimeFailure failure = 12;
+  CheckpointReaders checkpoint_readers = 13;
 }
+
+// Missing historical reader metadata is incomplete, not an empty set.
+message CheckpointReader { string node_id = 1; RuntimeIdentity identity = 2; RestorePoint checkpoint = 3; }
+message CheckpointReaders { bool complete = 1; repeated CheckpointReader readers = 2; }
 
 message RuntimeFailure {
   ProbeFailure probe_failure = 4;

@@ -15,6 +15,12 @@ use std::{
 
 #[derive(Default)]
 struct Backend {
+    fail_shared_volume_reservation: Mutex<bool>,
+    strict_reader_release: Mutex<bool>,
+    reader_reservations: Mutex<BTreeMap<String, adx_core::CheckpointReader>>,
+    fail_reader_reservation: Mutex<bool>,
+    fail_reader_retirement: Mutex<bool>,
+    fail_reader_release: Mutex<bool>,
     prepare_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
     prepare_entered: tokio::sync::Notify,
     checkpoint_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
@@ -25,6 +31,7 @@ struct Backend {
     events: Mutex<Vec<String>>,
     unavailable_commit: Mutex<bool>,
     fail_restore: Mutex<bool>,
+    fail_restore_invalid: Mutex<bool>,
     fail_start: Mutex<bool>,
     activity: Mutex<Option<(u64, u64)>>,
     fail_prepare: Mutex<bool>,
@@ -44,6 +51,43 @@ impl Backend {
 }
 #[async_trait]
 impl RuntimeDriver for Backend {
+    async fn retire_shared_volume_attachments(
+        &self,
+        attachments: &[adx_core::shared_volume_attachments::SharedVolumeAttachment],
+    ) -> Result<Vec<adx_core::shared_volume_attachments::SharedVolumeAttachmentRetirement>> {
+        let mut receipts = Vec::new();
+        for attachment in attachments {
+            self.remove(&attachment.identity.runtime_id).await?;
+            receipts.push(
+                adx_core::shared_volume_attachments::SharedVolumeAttachmentRetirement {
+                    attachment: attachment.clone(),
+                    backend_receipt: format!(
+                        "fake-volume-settled:{}:{}",
+                        attachment.identity.ownership_generation, attachment.identity.runtime_id
+                    ),
+                },
+            );
+        }
+        Ok(receipts)
+    }
+    async fn retire_checkpoint_reader(
+        &self,
+        reader: &adx_core::CheckpointReader,
+    ) -> Result<adx_core::CheckpointReaderRetirement> {
+        if *self.fail_reader_retirement.lock().unwrap() {
+            return Err(Error::Unavailable(
+                "backend has no durable stop receipt".into(),
+            ));
+        }
+        self.remove(&reader.identity.runtime_id).await?;
+        Ok(adx_core::CheckpointReaderRetirement {
+            reader: reader.clone(),
+            backend_receipt: format!(
+                "fake-settled:{}:{}",
+                reader.identity.ownership_generation, reader.identity.runtime_id
+            ),
+        })
+    }
     async fn inventory(&self) -> Result<Vec<adxlet::RuntimeObservation>> {
         Ok(self
             .running
@@ -141,6 +185,11 @@ impl RuntimeDriver for Backend {
         path: &Path,
     ) -> Result<std::net::IpAddr> {
         self.event("restore");
+        if *self.fail_restore_invalid.lock().unwrap() {
+            return Err(Error::Invalid(
+                "checkpoint content root is not verifiable".into(),
+            ));
+        }
         if *self.fail_restore.lock().unwrap() {
             return Err(Error::Unavailable("restore failed".into()));
         }
@@ -250,6 +299,54 @@ impl Routes for Backend {
 }
 #[async_trait]
 impl StateSink for Backend {
+    async fn reserve_shared_volumes(&self, _: &EnvironmentRecord) -> Result<()> {
+        self.event("volume-reservation");
+        if *self.fail_shared_volume_reservation.lock().unwrap() {
+            return Err(Error::NotFound);
+        }
+        Ok(())
+    }
+    async fn release_shared_volumes(
+        &self,
+        receipts: &[adx_core::shared_volume_attachments::SharedVolumeAttachmentRetirement],
+    ) -> Result<()> {
+        for receipt in receipts {
+            receipt.validate()?;
+        }
+        Ok(())
+    }
+    async fn reserve_checkpoint_reader(&self, record: &EnvironmentRecord) -> Result<()> {
+        assert!(record.current_checkpoint_reader_entry().is_some());
+        if *self.fail_reader_reservation.lock().unwrap() {
+            return Err(Error::Unavailable(
+                "reader reservation authority unavailable".into(),
+            ));
+        }
+        let reader = record.current_checkpoint_reader_entry().unwrap().clone();
+        self.reader_reservations
+            .lock()
+            .unwrap()
+            .insert(reader.identity.runtime_id.clone(), reader);
+        self.event("reader-reserved");
+        Ok(())
+    }
+    async fn release_checkpoint_reader(
+        &self,
+        retirement: &adx_core::CheckpointReaderRetirement,
+    ) -> Result<()> {
+        retirement.validate()?;
+        if *self.fail_reader_release.lock().unwrap() {
+            return Err(Error::Unavailable("reader release reply lost".into()));
+        }
+        let mut readers = self.reader_reservations.lock().unwrap();
+        if *self.strict_reader_release.lock().unwrap()
+            && readers.get(&retirement.reader.identity.runtime_id) != Some(&retirement.reader)
+        {
+            return Err(Error::Conflict);
+        }
+        readers.remove(&retirement.reader.identity.runtime_id);
+        Ok(())
+    }
     async fn commit(&self, r: &EnvironmentRecord) -> Result<Durability> {
         self.event(&format!("commit:{:?}", r.state));
         if *self.unavailable_commit.lock().unwrap() {
@@ -387,12 +484,15 @@ async fn restarted_node_prunes_only_after_authoritative_reconciliation() {
     .unwrap();
     *backend.unavailable_commit.lock().unwrap() = true;
     assert!(restored
-        .reconcile(vec![paused.record.clone()])
+        .reconcile_retained(vec![paused.record.clone()], vec![], vec![])
         .await
         .is_err());
     assert!(orphan.exists());
     *backend.unavailable_commit.lock().unwrap() = false;
-    restored.reconcile(vec![paused.record]).await.unwrap();
+    restored
+        .reconcile_retained(vec![paused.record], vec![], vec![])
+        .await
+        .unwrap();
     assert!(!orphan.exists());
     assert!(Path::new(&retained).exists());
     assert!(foreign.exists());
@@ -433,7 +533,13 @@ async fn pause_resume_preserves_environment_changes_execution_and_fences_delayed
     assert_eq!(node.used(), spec.resources);
     assert_eq!(
         &backend.events.lock().unwrap()[5..],
-        ["restore", "ready", "activate", "commit:Running"]
+        [
+            "reader-reserved",
+            "restore",
+            "ready",
+            "activate",
+            "commit:Running"
+        ]
     );
     assert_eq!(
         h.resume(resume(paused.record.revision)).await.unwrap(),
@@ -490,6 +596,136 @@ async fn failed_restore_keeps_restore_point_and_releases_confirmed_absent_execut
     assert_eq!(after.record.state, EnvironmentState::Paused);
     assert_eq!(after.record.checkpoint, paused.record.checkpoint);
     assert_eq!(node.used(), Resources::default());
+}
+
+#[tokio::test]
+async fn denied_shared_volume_restore_releases_capacity_and_can_retry_after_regrant() {
+    let (_temp, backend, node, mut spec, assignment) = fixture();
+    let node = node.with_shared_volume_lifecycle(true).unwrap();
+    spec.execution
+        .shared_volumes
+        .push(adx_core::shared_volumes::SharedVolumeMount {
+            volume_id: adx_core::shared_volumes::SharedVolumeId::parse(
+                uuid::Uuid::new_v4().to_string(),
+            )
+            .unwrap(),
+            subpath: Default::default(),
+            target: "/shared".into(),
+            access: adx_core::shared_volumes::SharedVolumeAccess::ReadOnly,
+        });
+    *backend.strict_reader_release.lock().unwrap() = true;
+    let handle = node.environment(spec, assignment).unwrap();
+    let created = handle.create().await.unwrap();
+    let paused = handle.pause(pause(created.record.revision)).await.unwrap();
+    let checkpoint = paused.record.checkpoint.clone();
+    let artifact = checkpoint.as_ref().unwrap().artifact.location.clone();
+    backend.events.lock().unwrap().clear();
+    *backend.fail_shared_volume_reservation.lock().unwrap() = true;
+
+    assert_eq!(
+        handle
+            .resume(resume(paused.record.revision))
+            .await
+            .unwrap_err(),
+        Error::NotFound
+    );
+    let denied = handle.sync().await.unwrap().record;
+    assert_eq!(denied.state, EnvironmentState::Paused);
+    assert_eq!(denied.checkpoint, checkpoint);
+    assert!(denied.checkpoint_readers.reclaimable());
+    assert!(!denied.resources_held);
+    assert_eq!(node.used(), Resources::default());
+    assert!(backend.reader_reservations.lock().unwrap().is_empty());
+    assert!(backend.running.lock().unwrap().is_empty());
+    assert!(Path::new(&artifact).exists());
+    assert!(!backend
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| { event == "reader-reserved" || event == "restore" }));
+
+    *backend.fail_shared_volume_reservation.lock().unwrap() = false;
+    backend.events.lock().unwrap().clear();
+    let running = handle
+        .resume(ResumeRequest {
+            operation_id: "resume-after-regrant".into(),
+            expected_revision: denied.revision,
+        })
+        .await
+        .unwrap();
+    assert_eq!(running.record.state, EnvironmentState::Running);
+    assert_eq!(running.record.checkpoint, checkpoint);
+    assert_eq!(running.record.checkpoint_readers.readers.len(), 1);
+    assert_eq!(backend.reader_reservations.lock().unwrap().len(), 1);
+    let events = backend.events.lock().unwrap().clone();
+    let volume = events
+        .iter()
+        .position(|event| event == "volume-reservation")
+        .unwrap();
+    let reader = events
+        .iter()
+        .position(|event| event == "reader-reserved")
+        .unwrap();
+    let restore = events.iter().position(|event| event == "restore").unwrap();
+    assert!(volume < reader && reader < restore);
+
+    handle.delete().await.unwrap();
+    assert_eq!(node.used(), Resources::default());
+    assert!(backend.reader_reservations.lock().unwrap().is_empty());
+    assert!(backend.running.lock().unwrap().is_empty());
+    assert!(!Path::new(&artifact).exists());
+}
+
+#[tokio::test]
+async fn denied_shared_volume_restore_keeps_capacity_when_stop_is_uncertain() {
+    let (_temp, backend, node, mut spec, assignment) = fixture();
+    let node = node.with_shared_volume_lifecycle(true).unwrap();
+    spec.execution
+        .shared_volumes
+        .push(adx_core::shared_volumes::SharedVolumeMount {
+            volume_id: adx_core::shared_volumes::SharedVolumeId::parse(
+                uuid::Uuid::new_v4().to_string(),
+            )
+            .unwrap(),
+            subpath: Default::default(),
+            target: "/shared".into(),
+            access: adx_core::shared_volumes::SharedVolumeAccess::ReadOnly,
+        });
+    let resources = spec.resources;
+    *backend.strict_reader_release.lock().unwrap() = true;
+    let handle = node.environment(spec, assignment).unwrap();
+    let created = handle.create().await.unwrap();
+    let paused = handle.pause(pause(created.record.revision)).await.unwrap();
+    let checkpoint = paused.record.checkpoint.clone();
+    let artifact = checkpoint.as_ref().unwrap().artifact.location.clone();
+    backend.events.lock().unwrap().clear();
+    *backend.fail_shared_volume_reservation.lock().unwrap() = true;
+    *backend.fail_remove.lock().unwrap() = true;
+
+    assert!(matches!(
+        handle.resume(resume(paused.record.revision)).await,
+        Err(Error::Unavailable(_))
+    ));
+    let failed = handle.sync().await.unwrap().record;
+    assert_eq!(failed.state, EnvironmentState::Failed);
+    assert_eq!(failed.checkpoint, checkpoint);
+    assert!(failed.resources_held);
+    assert!(failed.checkpoint_readers.reclaimable());
+    assert_eq!(node.used(), resources);
+    assert!(Path::new(&artifact).exists());
+    assert!(backend.reader_reservations.lock().unwrap().is_empty());
+    assert!(!backend
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| { event == "reader-reserved" || event == "restore" }));
+
+    *backend.fail_remove.lock().unwrap() = false;
+    handle.delete().await.unwrap();
+    assert_eq!(node.used(), Resources::default());
+    assert!(!Path::new(&artifact).exists());
 }
 
 #[tokio::test]
@@ -981,7 +1217,7 @@ async fn reconciliation_preserves_ready_and_deleting_reusable_snapshots() {
     )
     .unwrap();
     let orphan = store.allocate().await.unwrap();
-    node.reconcile_catalog(vec![], vec![snapshot.clone()])
+    node.reconcile_retained(vec![], vec![snapshot.clone()], vec![])
         .await
         .unwrap();
     assert!(path.exists());
@@ -995,7 +1231,7 @@ async fn reconciliation_preserves_ready_and_deleting_reusable_snapshots() {
         )
         .unwrap();
     snapshot.delete("tenant").unwrap();
-    node.reconcile_catalog(vec![], vec![snapshot.clone()])
+    node.reconcile_retained(vec![], vec![snapshot.clone()], vec![])
         .await
         .unwrap();
     assert!(
@@ -1008,7 +1244,9 @@ async fn reconciliation_preserves_ready_and_deleting_reusable_snapshots() {
         .await
         .is_err());
     assert!(path.exists(), "invalid catalog must not trigger cleanup");
-    node.reconcile_catalog(vec![], vec![]).await.unwrap();
+    node.reconcile_retained(vec![], vec![], vec![])
+        .await
+        .unwrap();
     assert!(
         !path.exists(),
         "authoritatively unreferenced artifact is cleaned"
@@ -1290,6 +1528,7 @@ async fn recovery_with_unusable_checkpoint_settles_failed_without_image_start() 
     let (_temp, backend, node, spec, mut assignment) = fixture();
     assignment.generation = 2;
     let record = EnvironmentRecord {
+        checkpoint_readers: Default::default(),
         failure: None,
         spec,
         assignment,
@@ -1368,6 +1607,7 @@ async fn recovery_retries_publication_without_repeating_backend_restore() {
         .unwrap();
     assignment.generation = 2;
     let seed = EnvironmentRecord {
+        checkpoint_readers: Default::default(),
         failure: None,
         spec,
         assignment,
@@ -1857,4 +2097,398 @@ async fn retired_shared_checkpoint(retained: Option<bool>) {
         store.validate_artifact(&artifact).await.is_ok(),
         retained != Some(false)
     );
+}
+
+struct ReaderTraceStore {
+    local: LocalCheckpointStore,
+    materialized: Mutex<Vec<String>>,
+    removed: Mutex<Vec<String>>,
+}
+#[async_trait]
+impl adxlet::checkpoint::CheckpointStore for ReaderTraceStore {
+    fn storage_alias(&self) -> &str {
+        "local"
+    }
+    async fn allocate(&self) -> Result<std::path::PathBuf> {
+        self.local.allocate().await
+    }
+    async fn discard_staged(&self, path: &Path) -> Result<()> {
+        self.local.discard_staged(path).await
+    }
+    async fn retain_staged(&self, path: &Path) -> Result<adx_core::CheckpointArtifact> {
+        self.local.retain_staged(path).await
+    }
+    async fn publish(&self, path: &Path) -> Result<adx_core::CheckpointArtifact> {
+        self.local.publish(path).await
+    }
+    async fn materialize(
+        &self,
+        artifact: &adx_core::CheckpointArtifact,
+    ) -> Result<adxlet::checkpoint::MaterializedCheckpoint> {
+        self.materialized
+            .lock()
+            .unwrap()
+            .push(artifact.location.clone());
+        self.local.materialize(artifact).await
+    }
+    async fn remove(&self, artifact: &adx_core::CheckpointArtifact) -> Result<()> {
+        self.local.remove(artifact).await?;
+        self.removed.lock().unwrap().push(artifact.location.clone());
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn restarted_controller_reopens_actual_reader_not_newer_running_checkpoint() {
+    let (temp, backend, node, spec, assignment) = fixture();
+    let handle = node.environment(spec.clone(), assignment.clone()).unwrap();
+    let created = handle.create().await.unwrap();
+    let paused = handle.pause(pause(created.record.revision)).await.unwrap();
+    let a = paused.record.checkpoint.clone().unwrap();
+    handle.resume(resume(paused.record.revision)).await.unwrap();
+    *backend.workload_request.lock().unwrap() = Some("running-newer-point".into());
+    handle.tick().await.unwrap();
+    let saved = handle.sync().await.unwrap().record;
+    let b = saved.checkpoint.clone().unwrap();
+    assert_ne!(a.artifact, b.artifact);
+    assert_eq!(saved.current_checkpoint_reader().unwrap(), &a);
+    let saved: EnvironmentRecord =
+        serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+    drop(handle);
+    drop(node);
+    tokio::task::yield_now().await;
+    let store = Arc::new(ReaderTraceStore {
+        local: LocalCheckpointStore::new(temp.path().into()).unwrap(),
+        materialized: Mutex::default(),
+        removed: Mutex::default(),
+    });
+    let restarted = Adxlet::new(
+        "node".into(),
+        backend.clone(),
+        backend.clone(),
+        backend.clone(),
+        backend.clone(),
+    )
+    .with_checkpointing(store.clone(), backend.clone())
+    .unwrap();
+    restarted
+        .reconcile_retained(
+            vec![saved],
+            vec![],
+            vec![a.artifact.clone(), b.artifact.clone()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store.materialized.lock().unwrap().as_slice(),
+        std::slice::from_ref(&a.artifact.location)
+    );
+    assert!(Path::new(&a.artifact.location).exists());
+    let current = restarted.environment(spec, assignment).unwrap();
+    assert_eq!(
+        current
+            .sync()
+            .await
+            .unwrap()
+            .record
+            .current_checkpoint_reader()
+            .unwrap(),
+        &a
+    );
+    current.delete().await.unwrap();
+    let removed = store.removed.lock().unwrap();
+    assert!(removed.contains(&a.artifact.location));
+    assert!(removed.contains(&b.artifact.location));
+    assert!(!Path::new(&a.artifact.location).exists());
+}
+
+#[tokio::test]
+async fn uncertain_runtime_removal_keeps_durable_reader() {
+    let (_temp, backend, node, spec, assignment) = fixture();
+    let handle = node.environment(spec, assignment).unwrap();
+    let created = handle.create().await.unwrap();
+    let paused = handle.pause(pause(created.record.revision)).await.unwrap();
+    let a = paused.record.checkpoint.clone().unwrap();
+    handle.resume(resume(paused.record.revision)).await.unwrap();
+    *backend.fail_remove.lock().unwrap() = true;
+    assert!(handle.delete().await.is_err());
+    assert_eq!(
+        handle
+            .sync()
+            .await
+            .unwrap()
+            .record
+            .current_checkpoint_reader()
+            .unwrap(),
+        &a
+    );
+    assert!(Path::new(&a.artifact.location).exists());
+    *backend.fail_remove.lock().unwrap() = false;
+    let deleted = handle.delete().await.unwrap();
+    assert!(deleted.record.checkpoint_readers.reclaimable());
+}
+
+#[tokio::test]
+async fn incomplete_catalog_retains_orphans_until_complete_global_proof() {
+    let (temp, backend, node, spec, assignment) = fixture();
+    let handle = node.environment(spec, assignment).unwrap();
+    let created = handle.create().await.unwrap();
+    let paused = handle.pause(pause(created.record.revision)).await.unwrap();
+    let orphan = temp.path().join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir(&orphan).unwrap();
+    std::fs::write(orphan.join("memory"), b"unclassified").unwrap();
+    let restarted = Adxlet::new(
+        "node".into(),
+        backend.clone(),
+        backend.clone(),
+        backend.clone(),
+        backend.clone(),
+    )
+    .with_checkpointing(
+        Arc::new(LocalCheckpointStore::new(temp.path().into()).unwrap()),
+        backend,
+    )
+    .unwrap();
+    restarted
+        .reconcile(vec![paused.record.clone()])
+        .await
+        .unwrap();
+    assert!(
+        orphan.exists(),
+        "node-only records are not a complete global reference catalog"
+    );
+    restarted
+        .reconcile_retained(vec![paused.record], vec![], vec![])
+        .await
+        .unwrap();
+    assert!(
+        !orphan.exists(),
+        "complete proof permits orphan reclamation"
+    );
+}
+
+struct GcPermissionProbeStore {
+    local: LocalCheckpointStore,
+    calls: std::sync::atomic::AtomicUsize,
+}
+#[async_trait]
+impl adxlet::checkpoint::CheckpointStore for GcPermissionProbeStore {
+    fn storage_alias(&self) -> &str {
+        "local"
+    }
+    async fn allocate(&self) -> Result<std::path::PathBuf> {
+        self.local.allocate().await
+    }
+    async fn discard_staged(&self, path: &Path) -> Result<()> {
+        self.local.discard_staged(path).await
+    }
+    async fn retain_staged(&self, path: &Path) -> Result<adx_core::CheckpointArtifact> {
+        self.local.retain_staged(path).await
+    }
+    async fn publish(&self, path: &Path) -> Result<adx_core::CheckpointArtifact> {
+        self.local.publish(path).await
+    }
+    async fn materialize(
+        &self,
+        artifact: &adx_core::CheckpointArtifact,
+    ) -> Result<adxlet::checkpoint::MaterializedCheckpoint> {
+        self.local.materialize(artifact).await
+    }
+    async fn remove(&self, artifact: &adx_core::CheckpointArtifact) -> Result<()> {
+        self.local.remove(artifact).await
+    }
+    async fn collect_remote_orphans(&self) -> Result<usize> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(0)
+    }
+}
+
+#[tokio::test]
+async fn incomplete_reconciliation_revokes_previous_remote_gc_permission() {
+    let (temp, backend, _old, _spec, _assignment) = fixture();
+    let store = Arc::new(GcPermissionProbeStore {
+        local: LocalCheckpointStore::new(temp.path().into()).unwrap(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let node = Adxlet::new(
+        "node".into(),
+        backend.clone(),
+        backend.clone(),
+        backend.clone(),
+        backend.clone(),
+    )
+    .with_checkpointing(store.clone(), backend)
+    .unwrap();
+    node.reconcile_retained_catalog(vec![], vec![], vec![], true)
+        .await
+        .unwrap();
+    node.collect_remote_orphans().await.unwrap();
+    assert_eq!(store.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    node.reconcile_retained_catalog(vec![], vec![], vec![], false)
+        .await
+        .unwrap();
+    node.collect_remote_orphans().await.unwrap();
+    assert_eq!(
+        store.calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "partial catalog must revoke the previous deletion permission"
+    );
+}
+
+#[tokio::test]
+async fn restore_waits_for_published_reader_reservation_before_runtime_io() {
+    let (_temp, backend, node, spec, assignment) = fixture();
+    let handle = node.environment(spec, assignment).unwrap();
+    let created = handle.create().await.unwrap();
+    let paused = handle.pause(pause(created.record.revision)).await.unwrap();
+    backend.events.lock().unwrap().clear();
+    handle.resume(resume(paused.record.revision)).await.unwrap();
+    let events = backend.events.lock().unwrap().clone();
+    handle.delete().await.unwrap();
+    let reserved = events.iter().position(|event| event == "reader-reserved");
+    let restored = events.iter().position(|event| event == "restore").unwrap();
+    assert!(
+        reserved.is_some_and(|reserved| reserved < restored),
+        "restore must wait for durable cluster reader reservation before backend IO: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn unavailable_reader_authority_never_reaches_runtime_restore() {
+    let (_temp, backend, node, spec, assignment) = fixture();
+    let handle = node.environment(spec, assignment).unwrap();
+    let created = handle.create().await.unwrap();
+    let paused = handle.pause(pause(created.record.revision)).await.unwrap();
+    backend.events.lock().unwrap().clear();
+    *backend.fail_reader_reservation.lock().unwrap() = true;
+    let result = handle.resume(resume(paused.record.revision)).await;
+    let events = backend.events.lock().unwrap().clone();
+    *backend.fail_reader_reservation.lock().unwrap() = false;
+    handle.delete().await.unwrap();
+    assert!(
+        result.is_err(),
+        "restore without reader authority must fail"
+    );
+    assert!(
+        !events.iter().any(|event| event == "restore"),
+        "cluster reservation failure must stop before runtime restore: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn missing_backend_retirement_capability_keeps_reader_and_artifact() {
+    let (_temp, backend, node, spec, assignment) = fixture();
+    let handle = node.environment(spec, assignment).unwrap();
+    let created = handle.create().await.unwrap();
+    let paused = handle.pause(pause(created.record.revision)).await.unwrap();
+    handle.resume(resume(paused.record.revision)).await.unwrap();
+    let artifact = paused.record.checkpoint.unwrap().artifact.location;
+    *backend.fail_reader_retirement.lock().unwrap() = true;
+    assert!(handle.delete().await.is_err());
+    let retained = handle.sync().await.unwrap().record;
+    assert_eq!(retained.checkpoint_readers.readers.len(), 1);
+    assert!(Path::new(&artifact).exists());
+    assert_eq!(node.used(), retained.spec.resources);
+    *backend.fail_reader_retirement.lock().unwrap() = false;
+    handle.delete().await.unwrap();
+}
+
+#[tokio::test]
+async fn lost_reader_release_ack_keeps_artifact_after_backend_exit() {
+    let (_temp, backend, node, spec, assignment) = fixture();
+    let handle = node.environment(spec, assignment).unwrap();
+    let created = handle.create().await.unwrap();
+    let paused = handle.pause(pause(created.record.revision)).await.unwrap();
+    handle.resume(resume(paused.record.revision)).await.unwrap();
+    let artifact = paused.record.checkpoint.unwrap().artifact.location;
+    *backend.fail_reader_release.lock().unwrap() = true;
+    assert!(handle.delete().await.is_err());
+    assert!(backend.running.lock().unwrap().is_empty());
+    let retained = handle.sync().await.unwrap().record;
+    assert_eq!(retained.checkpoint_readers.readers.len(), 1);
+    assert!(Path::new(&artifact).exists());
+    *backend.fail_reader_release.lock().unwrap() = false;
+    handle.delete().await.unwrap();
+}
+
+#[tokio::test]
+async fn permanent_restore_validation_failure_is_terminal_after_positive_reader_cleanup() {
+    let (_temp, backend, node, spec, assignment) = fixture();
+    let handle = node.environment(spec, assignment).unwrap();
+    let created = handle.create().await.unwrap();
+    let paused = handle.pause(pause(created.record.revision)).await.unwrap();
+    let artifact = paused
+        .record
+        .checkpoint
+        .as_ref()
+        .unwrap()
+        .artifact
+        .location
+        .clone();
+    *backend.fail_restore_invalid.lock().unwrap() = true;
+    backend.events.lock().unwrap().clear();
+    let error = handle
+        .resume(resume(paused.record.revision))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Invalid(_)));
+    let failed = handle.sync().await.unwrap().record;
+    assert_eq!(failed.state, EnvironmentState::Failed);
+    assert_eq!(failed.checkpoint, paused.record.checkpoint);
+    assert!(!failed.resources_held);
+    assert_eq!(node.used(), Resources::default());
+    assert!(
+        Path::new(&artifact).exists(),
+        "retain the invalid artifact for explicit deletion/diagnosis"
+    );
+    for _ in 0..3 {
+        node.monitor_environments().await.unwrap();
+    }
+    assert!(handle
+        .resume(resume(handle.sync().await.unwrap().record.revision))
+        .await
+        .is_err());
+    let attempts = backend
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| *event == "restore")
+        .count();
+    assert_eq!(
+        attempts, 1,
+        "permanent format failure must not produce a restore storm"
+    );
+    assert!(backend.running.lock().unwrap().is_empty());
+    handle.delete().await.unwrap();
+}
+
+#[tokio::test]
+async fn permanent_restore_failure_does_not_bypass_uncertain_reader_release() {
+    let (_temp, backend, node, spec, assignment) = fixture();
+    let handle = node.environment(spec.clone(), assignment).unwrap();
+    let created = handle.create().await.unwrap();
+    let paused = handle.pause(pause(created.record.revision)).await.unwrap();
+    let artifact = paused
+        .record
+        .checkpoint
+        .as_ref()
+        .unwrap()
+        .artifact
+        .location
+        .clone();
+    *backend.fail_restore_invalid.lock().unwrap() = true;
+    *backend.fail_reader_release.lock().unwrap() = true;
+    assert!(matches!(
+        handle.resume(resume(paused.record.revision)).await,
+        Err(Error::Unavailable(_))
+    ));
+    let failed = handle.sync().await.unwrap().record;
+    assert_eq!(failed.state, EnvironmentState::Failed);
+    assert!(failed.resources_held);
+    assert_eq!(failed.checkpoint_readers.readers.len(), 1);
+    assert_eq!(node.used(), spec.resources);
+    assert!(Path::new(&artifact).exists());
+    *backend.fail_reader_release.lock().unwrap() = false;
+    handle.delete().await.unwrap();
 }

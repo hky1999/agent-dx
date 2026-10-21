@@ -1,12 +1,15 @@
 //! Async RPC coordination around the synchronous scheduler and Redis repository.
 use adx_transport::rpc::RpcClient;
 mod autoscaling;
+mod checkpoint_readers;
 mod claims;
 mod cloning;
 mod collection;
 mod metrics;
 mod recovery;
 mod resume;
+mod shared_volume_execution;
+mod shared_volumes;
 mod snapshots;
 use crate::{
     storage::{ClaimOutcome, LocalClaim, NodeSession, Session, StoredEnvironment, StoredNode},
@@ -840,6 +843,18 @@ impl CoordinatorRpc {
 }
 #[tonic::async_trait]
 impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
+    async fn reserve_checkpoint_reader(
+        &self,
+        request: Request<pb::ReserveCheckpointReaderRequest>,
+    ) -> std::result::Result<Response<pb::ReserveCheckpointReaderResponse>, Status> {
+        self.reserve_checkpoint_reader_rpc(request).await
+    }
+    async fn release_checkpoint_reader(
+        &self,
+        request: Request<pb::ReleaseCheckpointReaderRequest>,
+    ) -> std::result::Result<Response<pb::ReleaseCheckpointReaderResponse>, Status> {
+        self.release_checkpoint_reader_rpc(request).await
+    }
     async fn retire_dormant(
         &self,
         request: Request<pb::GetEnvironmentRequest>,
@@ -1111,10 +1126,15 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                     ));
                 }
                 let snapshot = state.session.snapshot().await.map_err(status)?;
+                let retained_checkpoints_complete = snapshot.environments.values().all(|i| {
+                    i.result
+                        .as_ref()
+                        .is_some_and(|r| r.checkpoint_readers.complete)
+                });
                 let retained_checkpoints = snapshot
                     .environments
                     .values()
-                    .filter_map(|i| i.result.as_ref().and_then(|r| r.checkpoint.as_ref()))
+                    .flat_map(|i| i.retained_checkpoint_points())
                     .filter(|cp| cp.artifact.storage != "local")
                     .cloned()
                     .map(Into::into)
@@ -1125,26 +1145,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                     .filter(|i| {
                         i.assignment.node_id == r.node_id && requires_node_reconciliation(i)
                     })
-                    .map(|i| {
-                        i.result
-                            .unwrap_or_else(|| EnvironmentRecord {
-                                failure: None,
-                                restart_attempts: 0,
-                                restart_pending: false,
-                                runtime: adx_core::Runtime {
-                                    id: format!("{}-{}", i.spec.id, i.assignment.generation),
-                                    ip: None,
-                                },
-                                spec: i.spec,
-                                assignment: i.assignment,
-                                state: EnvironmentState::Pending,
-                                revision: 0,
-                                resources_held: true,
-                                checkpoint: None,
-                                last_operation: None,
-                            })
-                            .try_into()
-                    })
+                    .map(|i| i.effective_record().try_into())
                     .collect::<Result<Vec<_>>>()
                     .map_err(status)?;
                 let snapshots = state
@@ -1162,6 +1163,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                     .ok_or_else(|| Status::unavailable("node heartbeat state disappeared"))?
                     .inspected = true;
                 Ok(Response::new(pb::InspectNodeResponse {
+                    retained_checkpoints_complete,
                     records,
                     snapshots,
                     retained_checkpoints,
@@ -1489,6 +1491,8 @@ mod reconciliation_tests {
             devices: vec![],
         };
         let mut environment = StoredEnvironment {
+            reader_reservations: Vec::new(),
+            reader_retirements: Vec::new(),
             resume: None,
             failed_since_unix_seconds: None,
             recovery: None,
@@ -1496,6 +1500,7 @@ mod reconciliation_tests {
             spec: spec.clone(),
             assignment: assignment.clone(),
             result: Some(EnvironmentRecord {
+                checkpoint_readers: Default::default(),
                 failure: None,
                 spec,
                 assignment,

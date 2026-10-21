@@ -1,0 +1,44 @@
+syntax = "proto3";
+package adx.control.v1;
+import "environment_types.proto";
+import "shared_volume_types.proto";
+
+// Internal node-only lifetime protocol, not a public mount or catalog API.
+service SharedVolumeExecutionService {
+  rpc ReserveSharedVolumes(ReserveSharedVolumesRequest) returns (SharedVolumeExecutionResponse);
+  rpc ReleaseSharedVolumes(ReleaseSharedVolumesRequest) returns (SharedVolumeRetirementResponse);
+  rpc ListNodeSharedVolumeAttachments(ListNodeSharedVolumeAttachmentsRequest) returns (SharedVolumeExecutionResponse);
+}
+message SharedVolumeAttachment {
+  SharedVolumeMount mount = 1;
+  string tenant_id = 2;
+  string node_id = 3;
+  string environment_id = 4;
+  string runtime_id = 5;
+  uint64 ownership_generation = 6;
+}
+message SharedVolumeRetirement {
+  SharedVolumeAttachment attachment = 1;
+  string backend_receipt = 2;
+}
+message ReserveSharedVolumesRequest {
+  EnvironmentRecord record = 1;
+  string node_session_id = 2;
+}
+message ReleaseSharedVolumesRequest {
+  repeated SharedVolumeRetirement retirements = 1;
+  string node_session_id = 2;
+}
+message ListNodeSharedVolumeAttachmentsRequest {
+  string node_id = 1;
+  string node_session_id = 2;
+}
+message SharedVolumeExecutionResponse {
+  repeated SharedVolumeAttachment attachments = 1;
+  uint64 coordinator_epoch = 2;
+}
+message SharedVolumeRetirementResponse {
+  repeated SharedVolumeRetirement retirements = 1;
+  uint64 coordinator_epoch = 2;
+}
+

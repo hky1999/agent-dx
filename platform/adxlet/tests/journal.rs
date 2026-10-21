@@ -7,11 +7,19 @@ use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
 struct Coordinator {
+    readers: Mutex<Vec<EnvironmentRecord>>,
     failure: Mutex<Option<Error>>,
     records: Mutex<Vec<EnvironmentRecord>>,
 }
 #[async_trait]
 impl StateSink for Coordinator {
+    async fn reserve_checkpoint_reader(&self, record: &EnvironmentRecord) -> Result<()> {
+        if let Some(error) = self.failure.lock().unwrap().clone() {
+            return Err(error);
+        }
+        self.readers.lock().unwrap().push(record.clone());
+        Ok(())
+    }
     async fn commit(&self, record: &EnvironmentRecord) -> Result<Durability> {
         if let Some(e) = self.failure.lock().unwrap().clone() {
             return Err(e);
@@ -22,6 +30,7 @@ impl StateSink for Coordinator {
 }
 fn record(revision: u64) -> EnvironmentRecord {
     EnvironmentRecord {
+        checkpoint_readers: Default::default(),
         failure: None,
         restart_attempts: 0,
         restart_pending: false,
@@ -177,4 +186,36 @@ async fn authoritative_failure_discards_newer_local_running_result() {
     journal.recover(&[failed]).await.unwrap();
     journal.flush().await.unwrap();
     assert!(coordinator.records.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn reader_reservation_never_degrades_to_local_journal() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("reader.sqlite");
+    let coordinator = Arc::new(Coordinator::default());
+    let sink = JournalSink::new(path.clone(), coordinator.clone());
+    let mut restore = record(2);
+    restore.state = EnvironmentState::Starting;
+    restore.runtime.ip = None;
+    let checkpoint = adx_core::RestorePoint {
+        id: "a".into(),
+        origin: None,
+        source_runtime_id: "i-1".into(),
+        expires_at_unix_seconds: None,
+        artifact: adx_core::CheckpointArtifact {
+            storage: "shared".into(),
+            location: "a".into(),
+            size_bytes: 1,
+        },
+    };
+    restore.checkpoint = Some(checkpoint.clone());
+    restore.register_checkpoint_reader(checkpoint).unwrap();
+    *coordinator.failure.lock().unwrap() = Some(Error::Unavailable("offline".into()));
+    assert!(sink.reserve_checkpoint_reader(&restore).await.is_err());
+    assert_eq!(sink.pending().await.unwrap(), 0);
+    assert!(!path.exists());
+    *coordinator.failure.lock().unwrap() = None;
+    sink.reserve_checkpoint_reader(&restore).await.unwrap();
+    assert_eq!(*coordinator.readers.lock().unwrap(), vec![restore]);
+    assert!(!path.exists());
 }

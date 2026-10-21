@@ -24,6 +24,31 @@ adxlet 可使用原来的 `checkpoint_dir`，或显式选择 `checkpoint_storage
 
 部署环境通过标准 AWS 凭证环境变量或环境提供的身份机制配置 S3 访问。实例记录只保存存储别名、制品 ID 与字节数，不保存端点和密钥。每个集群使用独立的 bucket/prefix；共享该存储的节点必须为同一别名配置相同 bucket/prefix，并保持节点 ID 和存储别名稳定；本地目录是节点私有的暂存与下载缓存。
 
+### 共享文件系统（JuiceFS，A0）
+
+```json
+{
+  "checkpoint_storage": {
+    "kind": "shared_fs",
+    "root": "/mnt/juicefs/adx/checkpoints",
+    "local_root": "/var/lib/adx/checkpoints",
+    "volume_uuid": "11111111-2222-3333-4444-555555555555",
+    "mount_root": "/mnt/juicefs"
+  }
+}
+```
+
+`root` 必须是已由部署层挂载完成的共享卷内目录；挂载先就绪，adxlet 不负责挂载。设置 `volume_uuid` 时，启动读取挂载根 `.config`（真实 JuiceFS 形状：顶层 `Meta`/`Format`/`Chunk`/`Security` 节，卷 UUID 在 `Format.UUID` 字段）并显式比对，缺失或不匹配即拒绝服务——不验证就不服务。该字段留空时跳过校验，仅供测试使用。
+
+定位挂载根有两种方式：优先显式配置 `mount_root`（此时还要求 `root` 位于 `mount_root` 之内，确定性最强）；未配置时从 `root` 逐级向上查找最近的 `.config`。注意 `.config` 在挂载根而非 checkpoints 子目录。
+
+- `shared` 策略的捕获直接在共享卷上暂存（`.staging-<uuid>` 目录），发布时执行逐文件 `fsync` + 逐目录 `fsync` + 原子 `rename` 到最终不可变目录。发布校验是**元数据级**的：拒绝符号链接与特殊文件、核对总字节数；不做逐文件内容摘要（SHA 清单）。任何一步失败都不发布 READY，且**保留暂存目录**供回滚恢复和诊断；只有调用方显式 `discard_staged` 才删除。
+- `local` 策略继续使用 `local_root`，保持既有 local-only 不强制写回语义；共享卷上的任何路径都不会被记录为 `local` 制品。
+- 恢复直接读取共享目录（无下载、无缓存副本），读取期间持有 pin，pin 未释放时删除返回 Conflict。
+- 可复用快照复制（`duplicate`）用 `copy_file_range` 生成独立可写分支（JuiceFS 不支持 FICLONE）；父制品在源继续写入和目标恢复运行后保持不变。
+- A0 禁用共享卷自动回收：`collect_remote_orphans` 恒返回 0，`reconcile_local` 只清理节点私有目录；显式配置 `checkpoint_gc.enabled=true` 时构建直接报错，直到 A1 引入读者保护。A0 不宣称生产级删除安全：pin 检查与 `remove` 不在同一临界区、`materialize` 先扫描后登记 pin 的交错窗口，均列为 A1 读者保护与删除并发裁决的明确待办。
+- sandboxd 侧配套 `runtime.checkpoint_sync.sync_output = true`（READY 前输出目录持久化屏障，默认 false 保留 local-only 契约）与 `runtime.runsc.background_restore = true`（后台恢复加载，默认 false）。
+
 ### Environment 匿名恢复点策略
 
 创建 HTTP 的 `pauseOptions.storage` / SDK `PausePolicy.storage` 配置匿名恢复点：

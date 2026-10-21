@@ -184,7 +184,27 @@ impl Api {
             };
         }
         if method == "GET" && path == "/api/environment/v1/capabilities" {
-            return plain(200, json!({"capabilities": ["workload-probes-v1"]}));
+            return plain(
+                200,
+                json!({"capabilities": ["workload-probes-v1", "shared-volume-management-v1"]}),
+            );
+        }
+        if crate::shared_volumes::is_route(&path) {
+            let input = match body(request.into_body(), 8192).await {
+                Ok(value) => value,
+                Err(error) => return error_response(error, &request_id, None, None, false),
+            };
+            return match Box::pin(self.shared_volumes(&method, &path, input, &caller)).await {
+                Ok(value) => {
+                    let mut result = plain(200, value);
+                    result.headers_mut().insert(
+                        "cache-control",
+                        hyper::header::HeaderValue::from_static("no-store"),
+                    );
+                    result
+                }
+                Err(error) => error_response(error, &request_id, None, None, method != "GET"),
+            };
         }
         if method == "GET" && path == "/api/environment/v1/resources" {
             return match self.clients.nodes().await {
@@ -1025,7 +1045,9 @@ fn agent_route(method: &str, path: &str) -> bool {
         )
 }
 fn route_name(path: &str) -> &'static str {
-    if path.starts_with("/global-scheduler/") {
+    if crate::shared_volumes::is_route(path) {
+        "/api/environment/v1/shared-volumes/*"
+    } else if path.starts_with("/global-scheduler/") {
         "/global-scheduler/*"
     } else if path.starts_with("/api/admin/") {
         "/api/admin/*"

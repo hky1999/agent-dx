@@ -303,6 +303,34 @@ class EnvironmentClient:
             raise EnvironmentError("resource query returned an invalid response")
         return payload
 
+    def shared_volume_request(
+        self, method: str, suffix: str, body: Dict[str, Any], request_id: str,
+    ) -> Dict[str, Any]:
+        """Use the existing authenticated TLS/pool lease; never replay a write."""
+        url = f"{self._base}/shared-volumes{suffix}"
+        headers = {"X-Request-ID": request_id, "Accept": "application/json"}
+        try:
+            if method == "GET":
+                response = self._http.get(url, headers=headers, timeout=30)
+            elif method == "POST":
+                response = self._http.post(url, json=body, headers=headers, timeout=30)
+            else:
+                raise ValueError("unsupported shared volume method")
+        except httpx.RequestError as error:
+            raise EnvironmentError(
+                "shared volume request transport failed; outcome may be unknown",
+                request_id=request_id, outcome="unknown",
+            ) from error
+        if response.status_code >= 400:
+            raise self._http_error(response, request_id=request_id)
+        try:
+            value = response.json()
+        except ValueError as error:
+            raise EnvironmentError("invalid shared volume response", request_id=request_id) from error
+        if not isinstance(value, dict):
+            raise EnvironmentError("invalid shared volume response", request_id=request_id)
+        return value
+
     def create_info(self, body: Dict[str, Any]) -> Dict[str, Any]:
         """POST /environments and return the confirmed-running final SSE result."""
         logical_timeout = int(body.get("createTimeoutSeconds") or _DEFAULT_CREATE_LOGICAL_TIMEOUT)

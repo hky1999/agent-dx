@@ -90,6 +90,11 @@ impl Session {
                 });
             }
             stored_environment.result = Some(EnvironmentRecord {
+                checkpoint_readers: stored_environment
+                    .result
+                    .as_ref()
+                    .map(|r| r.checkpoint_readers.clone())
+                    .unwrap_or_default(),
                 failure: None,
                 spec: stored_environment.spec.clone(),
                 assignment: replacement.clone(),

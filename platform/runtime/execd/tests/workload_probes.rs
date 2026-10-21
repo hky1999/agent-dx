@@ -96,6 +96,7 @@ fn start(config: ProbeConfig) -> Process {
         .process_group(0);
     let child = command.spawn().unwrap();
     let record = EnvironmentRecord {
+        checkpoint_readers: Default::default(),
         failure: None,
         spec: EnvironmentSpec {
             runtime_profile: None,

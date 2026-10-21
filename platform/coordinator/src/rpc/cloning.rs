@@ -60,6 +60,22 @@ pub(super) async fn normalize(
             "snapshot image, runtime and resource geometry must match its source".into(),
         ));
     }
+    // Inherit logical mounts only; current permissions and writer occupancy are
+    // revalidated by the normal execution reservation path.
+    let template_execution = pb::EnvironmentSpec::from(template.clone())
+        .execution
+        .unwrap_or_else(|| adx_core::execution::ExecutionOptions::default().into());
+    let execution = request
+        .execution
+        .get_or_insert_with(|| adx_core::execution::ExecutionOptions::default().into());
+    if execution.shared_volumes.is_empty() {
+        execution.shared_volumes = template_execution.shared_volumes;
+    } else if execution.shared_volumes != template_execution.shared_volumes {
+        return Err(Error::Invalid(
+            "snapshot shared volume mounts must match its source".into(),
+        ));
+    }
+    let has_shared_volumes = !execution.shared_volumes.is_empty();
     let overrides = std::mem::take(&mut request.env);
     request.env = template.env.clone().into_iter().collect();
     request.env.extend(overrides);
@@ -72,6 +88,21 @@ pub(super) async fn normalize(
             .into_iter()
             .map(Into::into)
             .collect();
+    }
+    if has_shared_volumes {
+        if policy.required_node.is_empty() {
+            policy.required_node.push(Default::default());
+        }
+        for alternative in &mut policy.required_node {
+            let required = pb::LabelRequirement {
+                key: "ADX_SHARED_VOLUME_STORAGE".into(),
+                op: pb::SelectorOp::Exists as i32,
+                values: vec![],
+            };
+            if !alternative.expressions.contains(&required) {
+                alternative.expressions.push(required);
+            }
+        }
     }
     if snapshot.artifact.storage == "local" {
         if policy.required_node.is_empty() {

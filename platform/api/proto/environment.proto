@@ -7,6 +7,8 @@ import public "environment_types.proto";
 import public "snapshot.proto";
 import public "credentials.proto";
 import public "routes.proto";
+import public "shared_volumes.proto";
+import public "shared_volume_execution.proto";
 
 service CoordinatorService {
   rpc WatchNodes(WatchNodesRequest) returns (stream NodeDirectory);
@@ -25,6 +27,12 @@ service CoordinatorService {
   // Node-owned state decisions are persisted by Coordinator. This does not transfer
   // ownership of the Environment lifecycle to Coordinator.
   rpc CommitEnvironment(CommitEnvironmentRequest) returns (CommitEnvironmentResponse);
+  // Persist a restore reader before materializing files or contacting the runtime.
+  // This updates dependency metadata, never the owner's lifecycle result/revision.
+  rpc ReserveCheckpointReader(ReserveCheckpointReaderRequest) returns (ReserveCheckpointReaderResponse);
+  // A trusted node may release only the exact reader named by a durable backend
+  // retirement receipt. Legacy Delete/NotFound and process death are not proof.
+  rpc ReleaseCheckpointReader(ReleaseCheckpointReaderRequest) returns (ReleaseCheckpointReaderResponse);
 }
 
 service NodeService {
@@ -113,9 +121,14 @@ message CommitEnvironmentRequest { EnvironmentRecord record = 1; string node_ses
 
 message CommitEnvironmentResponse { EnvironmentRecord record = 1; }
 
+message ReserveCheckpointReaderRequest { EnvironmentRecord record = 1; string node_session_id = 2; }
+message ReserveCheckpointReaderResponse { CheckpointReader reader = 1; uint64 coordinator_epoch = 2; }
+message ReleaseCheckpointReaderRequest { CheckpointReader reader = 1; string backend_receipt = 2; string node_session_id = 3; }
+message ReleaseCheckpointReaderResponse { CheckpointReader reader = 1; string backend_receipt = 2; uint64 coordinator_epoch = 3; }
+
 message InspectNodeRequest { string node_id = 1; string session_id = 2; }
 
-message InspectNodeResponse { repeated EnvironmentRecord records = 1; uint64 coordinator_epoch = 2; repeated ReusableSnapshot snapshots = 3; repeated RestorePoint retained_checkpoints = 4; }
+message InspectNodeResponse { repeated EnvironmentRecord records = 1; uint64 coordinator_epoch = 2; repeated ReusableSnapshot snapshots = 3; repeated RestorePoint retained_checkpoints = 4; bool retained_checkpoints_complete = 5; }
 
 message PauseEnvironmentRequest { Assignment assignment = 1; CallerContext caller = 2; string operation_id = 3; uint64 expected_revision = 4; reserved 5; uint64 timeout_seconds = 6; RetentionPolicy retention = 7; }
 

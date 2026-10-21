@@ -5,6 +5,40 @@ fn invalid(name: &str) -> Error {
     Error::Invalid(format!("invalid {name}"))
 }
 
+impl From<adx_core::shared_volumes::SharedVolumeMount> for pb::SharedVolumeMount {
+    fn from(value: adx_core::shared_volumes::SharedVolumeMount) -> Self {
+        use adx_core::shared_volumes::SharedVolumeAccess;
+        Self {
+            volume_id: value.volume_id.as_str().into(),
+            subpath: value.subpath.as_str().into(),
+            target: value.target,
+            access: match value.access {
+                SharedVolumeAccess::ReadOnly => pb::SharedVolumeAccess::ReadOnly,
+                SharedVolumeAccess::ReadWrite => pb::SharedVolumeAccess::ReadWrite,
+            } as i32,
+        }
+    }
+}
+
+impl TryFrom<pb::SharedVolumeMount> for adx_core::shared_volumes::SharedVolumeMount {
+    type Error = Error;
+    fn try_from(value: pb::SharedVolumeMount) -> Result<Self> {
+        use adx_core::shared_volumes::{SharedVolumeAccess, SharedVolumeId, SharedVolumeSubpath};
+        let mount = Self {
+            volume_id: SharedVolumeId::parse(value.volume_id)?,
+            subpath: SharedVolumeSubpath::parse(&value.subpath)?,
+            target: value.target,
+            access: match pb::SharedVolumeAccess::try_from(value.access) {
+                Ok(pb::SharedVolumeAccess::ReadOnly) => SharedVolumeAccess::ReadOnly,
+                Ok(pb::SharedVolumeAccess::ReadWrite) => SharedVolumeAccess::ReadWrite,
+                _ => return Err(invalid("explicit shared volume access")),
+            },
+        };
+        mount.validate()?;
+        Ok(mount)
+    }
+}
+
 impl From<core::S3Source> for pb::S3Source {
     fn from(value: core::S3Source) -> Self {
         Self {
@@ -303,6 +337,7 @@ impl From<core::ExecutionOptions> for pb::ExecutionOptions {
             cwd: value.cwd,
             rootfs: value.rootfs.map(Into::into),
             mounts: value.mounts.into_iter().map(Into::into).collect(),
+            shared_volumes: value.shared_volumes.into_iter().map(Into::into).collect(),
             network: value.network.map(Into::into),
             data_plane: Some(pb::DataPlanePolicy {
                 tunnel: security_pb(value.data_plane.tunnel),
@@ -326,13 +361,21 @@ impl From<core::ExecutionOptions> for pb::ExecutionOptions {
 impl TryFrom<pb::ExecutionOptions> for core::ExecutionOptions {
     type Error = Error;
     fn try_from(value: pb::ExecutionOptions) -> Result<Self> {
+        if value.shared_volumes.len() > core::MAX_SHARED_VOLUME_MOUNTS {
+            return Err(invalid("shared volume mount count"));
+        }
         let data_plane = value.data_plane.unwrap_or_default();
         let limits = value.limits.unwrap_or_default();
-        Ok(Self {
+        let options = Self {
             cwd: value.cwd,
             rootfs: value.rootfs.map(TryInto::try_into).transpose()?,
             mounts: value
                 .mounts
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_>>()?,
+            shared_volumes: value
+                .shared_volumes
                 .into_iter()
                 .map(TryInto::try_into)
                 .collect::<Result<_>>()?,
@@ -357,6 +400,8 @@ impl TryFrom<pb::ExecutionOptions> for core::ExecutionOptions {
                 disk_bytes: limits.disk_bytes,
             },
             extra_config: value.extra_config,
-        })
+        };
+        options.validate_shared_volumes()?;
+        Ok(options)
     }
 }

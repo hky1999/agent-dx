@@ -18,6 +18,7 @@ pub mod rpc;
 pub mod runtime_control;
 pub mod runtime_logs;
 pub mod sandboxd;
+mod shared_volumes;
 
 use adx_core::scheduling::{validate_device_assignment, Device, DeviceAllocation, DeviceLedger};
 use adx_core::{
@@ -68,6 +69,15 @@ pub struct RuntimeStatus {
 
 #[async_trait]
 pub trait RuntimeDriver: Send + Sync {
+    /// Execution-bound stop/fence proof, including an absent but delayed Start.
+    async fn retire_shared_volume_attachments(
+        &self,
+        _attachments: &[adx_core::shared_volume_attachments::SharedVolumeAttachment],
+    ) -> Result<Vec<adx_core::shared_volume_attachments::SharedVolumeAttachmentRetirement>> {
+        Err(Error::Unavailable(
+            "runtime has no durable shared volume retirement capability".into(),
+        ))
+    }
     /// Prepare and start within the create deadline rather than the node RPC cap.
     async fn start_with_deadline(
         &self,
@@ -197,6 +207,17 @@ pub trait RuntimeDriver: Send + Sync {
     /// Idempotent. Success means this runtime is confirmed absent and an older
     /// in-flight start cannot materialize it later. Uncertain cleanup is an error.
     async fn remove(&self, runtime_id: &str) -> Result<()>;
+    /// Retire this exact reader across backend and controller restarts. Success
+    /// must both forbid any delayed Start for its execution and confirm exit.
+    /// Old adapters deliberately remain unsupported rather than attest absence.
+    async fn retire_checkpoint_reader(
+        &self,
+        _reader: &adx_core::CheckpointReader,
+    ) -> Result<adx_core::CheckpointReaderRetirement> {
+        Err(Error::Unavailable(
+            "runtime has no durable checkpoint reader retirement capability".into(),
+        ))
+    }
 }
 
 pub struct RestoreSource<'a> {
@@ -265,6 +286,50 @@ pub trait Routes: Send + Sync {
 
 #[async_trait]
 pub trait StateSink: Send + Sync {
+    /// A local degradation journal is never sufficient for mount admission.
+    async fn reserve_shared_volumes(&self, record: &EnvironmentRecord) -> Result<()> {
+        if record.spec.execution.shared_volumes.is_empty() {
+            return Ok(());
+        }
+        Err(Error::Unavailable(
+            "durable shared volume authority is unsupported".into(),
+        ))
+    }
+    async fn release_shared_volumes(
+        &self,
+        receipts: &[adx_core::shared_volume_attachments::SharedVolumeAttachmentRetirement],
+    ) -> Result<()> {
+        if receipts.is_empty() {
+            return Ok(());
+        }
+        Err(Error::Unavailable(
+            "durable shared volume retirement is unsupported".into(),
+        ))
+    }
+    async fn list_shared_volume_attachments(
+        &self,
+        _node_id: &str,
+    ) -> Result<Vec<adx_core::shared_volume_attachments::SharedVolumeAttachment>> {
+        Err(Error::Unavailable(
+            "complete shared volume authority is unsupported".into(),
+        ))
+    }
+    /// Cluster-authoritative acknowledgement is required before restore IO.
+    /// A local degradation journal is deliberately insufficient.
+    async fn reserve_checkpoint_reader(&self, _record: &EnvironmentRecord) -> Result<()> {
+        Err(Error::Unavailable(
+            "durable checkpoint reader reservation is unsupported".into(),
+        ))
+    }
+    /// Persist the exact backend retirement receipt before dropping any reader.
+    async fn release_checkpoint_reader(
+        &self,
+        _retirement: &adx_core::CheckpointReaderRetirement,
+    ) -> Result<()> {
+        Err(Error::Unavailable(
+            "durable checkpoint reader release is unsupported".into(),
+        ))
+    }
     /// Normal path: Coordinator -> cluster store. On outage, return Journaled only
     /// after a durable local append. Reject stale assignment generations and
     /// revisions. Repeated commits of an identical record are idempotent.
@@ -322,6 +387,7 @@ pub(crate) struct Services {
     readiness: Arc<dyn Readiness>,
     routes: Arc<dyn Routes>,
     sink: Arc<dyn StateSink>,
+    shared_volume_lifecycle: bool,
     admission: Arc<Mutex<Admission>>,
     operation_timeout: Duration,
     checkpoint: Option<Arc<checkpoint::CheckpointServices>>,
@@ -331,6 +397,7 @@ pub(crate) struct Services {
 }
 
 pub struct Adxlet {
+    checkpoint_gc_ready: std::sync::atomic::AtomicBool,
     node_id: String,
     local_holds: Mutex<BTreeMap<String, local::LocalHold>>,
     draining: std::sync::atomic::AtomicBool,
@@ -355,6 +422,7 @@ impl Adxlet {
         sink: Arc<dyn StateSink>,
     ) -> Self {
         Self {
+            checkpoint_gc_ready: std::sync::atomic::AtomicBool::new(false),
             node_id,
             local_holds: Mutex::default(),
             draining: std::sync::atomic::AtomicBool::new(false),
@@ -366,6 +434,7 @@ impl Adxlet {
                 readiness,
                 routes,
                 sink,
+                shared_volume_lifecycle: false,
                 admission: Arc::new(Mutex::new(Admission {
                     ledger: ResourceLedger::new(Resources::default()),
                     devices: DeviceLedger::default(),
@@ -392,6 +461,15 @@ impl Adxlet {
         Arc::get_mut(&mut self.services)
             .ok_or(Error::Conflict)?
             .runtime_control = Some(control);
+        Ok(self)
+    }
+
+    /// Opt in to node-wide durable volume lifetime reconciliation.
+    /// This does not advertise or implement a filesystem mount backend.
+    pub fn with_shared_volume_lifecycle(mut self, enabled: bool) -> Result<Self> {
+        Arc::get_mut(&mut self.services)
+            .ok_or(Error::Conflict)?
+            .shared_volume_lifecycle = enabled;
         Ok(self)
     }
 
@@ -621,6 +699,11 @@ impl Adxlet {
             return Err(Error::Unavailable("node is draining".into()));
         }
         spec.validate()?;
+        if !spec.execution.shared_volumes.is_empty() && !self.services.shared_volume_lifecycle {
+            return Err(Error::Invalid(
+                "shared volume lifecycle is not configured".into(),
+            ));
+        }
         if spec.lifecycle.idle_action == adx_core::lifecycle::IdleAction::Pause
             || spec.lifecycle.pause.is_some()
         {

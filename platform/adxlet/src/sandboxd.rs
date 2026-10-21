@@ -1,10 +1,13 @@
-//! sandboxd PR #56 adapter. The RPC task outlives a canceled caller so cleanup
-//! cannot race its client task. Failed starts are terminal; reconciliation removes
-//! any backend that arrives after the failed create released its reservation.
+//! sandboxd adapter. Execution RPCs use daemon-persisted operation identities;
+//! local mutexes coordinate callers, but never constitute retirement proof.
+mod durable;
+mod shared_volume_mounts;
+mod shared_volumes;
 use crate::RuntimeDriver;
 use adx_core::{EnvironmentSpec, Error, Result};
 use async_trait::async_trait;
 use hyper_util::rt::TokioIo;
+pub use shared_volume_mounts::Config as SharedVolumeMountConfig;
 use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -22,6 +25,8 @@ use proto::sandbox_service_client::SandboxServiceClient;
 
 #[derive(Clone)]
 pub struct Config {
+    /// Deployment-owned node identity; required for execution and retirement.
+    pub node_id: String,
     pub runtime_profile: Option<adx_core::runtime_profile::RuntimeProfile>,
     pub command: Vec<String>,
     pub env: HashMap<String, String>,
@@ -33,6 +38,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            node_id: String::new(),
             runtime_profile: None,
             command: vec!["/usr/local/bin/adx-execd".into()],
             env: HashMap::from([("EXECD_HTTP_PORT".into(), "50090".into())]),
@@ -45,7 +51,7 @@ impl Default for Config {
 
 enum StartState {
     Idle,
-    Started(IpAddr),
+    Started,
     Settled,
     Failed,
     // Checkpoint may still be executing after its transport failed.
@@ -59,6 +65,7 @@ pub struct Sandboxd {
     config: Config,
     starts: Arc<Mutex<BTreeMap<String, Cell>>>,
     backend_ids: Arc<Mutex<BTreeMap<String, String>>>,
+    shared_volume_mounts: Option<Arc<shared_volume_mounts::SharedVolumeMounts>>,
 }
 
 fn unavailable(error: impl std::fmt::Display) -> Error {
@@ -95,6 +102,23 @@ pub async fn connect_when_ready(
 }
 
 impl Sandboxd {
+    pub fn with_shared_volume_mounts(mut self, config: SharedVolumeMountConfig) -> Result<Self> {
+        self.shared_volume_mounts = Some(Arc::new(shared_volume_mounts::SharedVolumeMounts::new(
+            config,
+            self.config.node_id.clone(),
+        )?));
+        Ok(self)
+    }
+
+    async fn retire_prepared_volume_mounts(&self, runtime_id: &str) -> Result<()> {
+        if let Some(provider) = self.shared_volume_mounts.clone() {
+            let id = runtime_id.to_owned();
+            tokio::task::spawn_blocking(move || provider.retire(&id))
+                .await
+                .map_err(unavailable)??;
+        }
+        Ok(())
+    }
     /// Discover live execution backends through sandboxd's Unix socket.
     pub async fn available_runtime_classes(&self) -> Result<Vec<String>> {
         let response = self
@@ -169,6 +193,7 @@ impl Sandboxd {
             config,
             starts: Arc::default(),
             backend_ids: Arc::default(),
+            shared_volume_mounts: None,
         })
     }
 
@@ -222,6 +247,7 @@ impl Sandboxd {
         generation: u64,
         devices: &[adx_core::scheduling::DeviceAllocation],
     ) -> Result<Request<proto::StartRequest>> {
+        spec.validate()?;
         let mut config = self.config.clone();
         // Runtime capability metadata owns the guest paths. Never inherit caller
         // values that could redirect the privileged checkpoint handoff.
@@ -240,9 +266,31 @@ impl Sandboxd {
                     .insert("ADX_ENV_FILE".into(), info.restore_env_path);
             }
         }
-        Ok(self.request(start_request(
-            spec, runtime_id, generation, devices, &config,
-        )?))
+        let mut backend_spec = spec.clone();
+        backend_spec.execution.shared_volumes.clear();
+        let mut request = start_request(&backend_spec, runtime_id, generation, devices, &config)?;
+        for shared in &spec.execution.shared_volumes {
+            if request.mounts.iter().any(|ordinary| {
+                Path::new(&shared.target).starts_with(&ordinary.target)
+                    || Path::new(&ordinary.target).starts_with(&shared.target)
+            }) {
+                return Err(Error::Invalid(
+                    "shared volume overlaps a deployment mount".into(),
+                ));
+            }
+        }
+        if !spec.execution.shared_volumes.is_empty() {
+            let provider = self.shared_volume_mounts.clone().ok_or_else(|| {
+                Error::Invalid("node has no trusted shared volume mount provider".into())
+            })?;
+            let id = runtime_id.to_owned();
+            let mounts = spec.execution.shared_volumes.clone();
+            let prepared = tokio::task::spawn_blocking(move || provider.prepare(&id, &mounts))
+                .await
+                .map_err(unavailable)??;
+            request.mounts.extend(prepared);
+        }
+        Ok(self.request(request))
     }
 
     async fn restore_request(
@@ -288,64 +336,11 @@ impl Sandboxd {
     async fn execute_start(
         &self,
         runtime_id: &str,
-        mut request: Request<proto::StartRequest>,
+        request: Request<proto::StartRequest>,
         deadline: Option<tokio::time::Instant>,
     ) -> Result<IpAddr> {
-        let mut state = self.cell(runtime_id).lock_owned().await;
-        if let StartState::Started(ip) = *state {
-            return Ok(ip);
-        }
-        if matches!(*state, StartState::Failed) {
-            return Err(Error::Conflict);
-        }
-        if matches!(*state, StartState::Uncertain) {
-            return Err(unavailable("start outcome requires reconciliation"));
-        }
-        if let Some(deadline) = deadline {
-            request.set_timeout(
-                adx_transport::deadline::remaining(deadline, Duration::MAX)
-                    .ok_or_else(|| unavailable("runtime start deadline exceeded"))?,
-            );
-        }
-        *state = StartState::Failed;
-        let mut client = self.client.clone();
-        let backend_ids = self.backend_ids.clone();
-        let logical_id = runtime_id.to_string();
-        tokio::spawn(async move {
-            let response = match client.start(request).await {
-                Ok(response) => response.into_inner(),
-                Err(error) => return Err(unavailable(error)),
-            };
-            if !response.id.is_empty() {
-                adx_observability::info!(
-                    event = "environment_identity_mapped",
-                    runtime_id = %logical_id,
-                    backend_id = %response.id,
-                    "sandboxd physical identity mapped to ADX runtime"
-                );
-                backend_ids
-                    .lock()
-                    .expect("shared state lock poisoned")
-                    .insert(logical_id, response.id.clone());
-            }
-            if response.code != 0 {
-                return Err(unavailable(response.message));
-            }
-            if response.id.is_empty() {
-                return Err(unavailable("Start returned no backend identity"));
-            }
-            let ip: IpAddr = response
-                .sandbox_ip
-                .parse()
-                .map_err(|_| unavailable("Start did not return a valid environment IP"))?;
-            if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
-                return Err(unavailable("Start returned a non-routable environment IP"));
-            }
-            *state = StartState::Started(ip);
-            Ok(ip)
-        })
-        .await
-        .map_err(unavailable)?
+        self.execute_identified_start(runtime_id, request, deadline)
+            .await
     }
 
     fn cell(&self, id: &str) -> Cell {
@@ -417,6 +412,15 @@ impl Sandboxd {
                     .is_some()
             {
                 return Err(unavailable("ambiguous managed runtime identity"));
+            }
+            let binding = self.execution_binding(logical)?;
+            if backend.id != binding.sandbox_id
+                || backend.labels.get("adx.node_id") != Some(&self.config.node_id)
+                || backend.labels.get("adx.start_operation") != Some(&binding.operation_id)
+            {
+                return Err(unavailable(
+                    "managed runtime lacks this node's durable start binding",
+                ));
             }
             backend.id = logical.clone();
         }
@@ -536,8 +540,15 @@ pub fn start_request(
     config: &Config,
 ) -> Result<proto::StartRequest> {
     spec.validate()?;
+    // A typed reference is not a mount permit. Until the durable attachment and
+    // node-owned path resolver are wired, fail before constructing any host bind.
+    if !spec.execution.shared_volumes.is_empty() {
+        return Err(Error::Unavailable(
+            "controlled shared volume mounting requires durable node attachment admission".into(),
+        ));
+    }
     adx_core::scheduling::validate_device_assignment(&spec.scheduling.devices, devices)?;
-    if runtime_id.is_empty()
+    if !adx_core::valid_runtime_id(&spec.id, ownership_generation, runtime_id)
         || ownership_generation == 0
         || (config.command.is_empty() && config.runtime_profile.is_none())
     {
@@ -984,6 +995,12 @@ fn runtime_control_peer(config: &Config) -> Result<Option<proto::NetworkEndpoint
 
 #[async_trait]
 impl RuntimeDriver for Sandboxd {
+    async fn retire_shared_volume_attachments(
+        &self,
+        attachments: &[adx_core::shared_volume_attachments::SharedVolumeAttachment],
+    ) -> Result<Vec<adx_core::shared_volume_attachments::SharedVolumeAttachmentRetirement>> {
+        self.retire_volume_execution(attachments).await
+    }
     async fn stats(&self, runtime_id: &str) -> Result<crate::metrics::RuntimeUsage> {
         let value = Sandboxd::stats(self, runtime_id).await?;
         Ok(crate::metrics::RuntimeUsage {
@@ -1150,51 +1167,14 @@ impl RuntimeDriver for Sandboxd {
     }
 
     async fn remove(&self, runtime_id: &str) -> Result<()> {
-        let mut state = self.cell(runtime_id).lock_owned().await;
-        let failed_start = matches!(*state, StartState::Failed);
-        if matches!(*state, StartState::Uncertain) {
-            if self.list_id(runtime_id).await?.is_empty() {
-                return Err(unavailable(
-                    "cannot confirm cleanup while Start outcome is unknown",
-                ));
-            }
-            *state = StartState::Settled;
-        }
-        if let Some(physical) = self.physical_id(runtime_id).await? {
-            match self
-                .client
-                .clone()
-                .delete(self.request(proto::DeleteRequest {
-                    id: physical,
-                    timeout: 0,
-                }))
-                .await
-            {
-                Ok(_) => (),
-                Err(error) if error.code() == Code::NotFound => (),
-                Err(error) => return Err(unavailable(error)),
-            }
-        }
-        if self
-            .list_id(runtime_id)
-            .await?
-            .iter()
-            .any(|x| x.id == runtime_id)
-        {
-            return Err(unavailable("runtime remains after Delete"));
-        }
-        self.backend_ids
-            .lock()
-            .expect("shared state lock poisoned")
-            .remove(runtime_id);
-        // A failed create cannot become successful through a retry of the same
-        // execution. Keep its identity terminal so a later backend is cleanup-only.
-        *state = if failed_start {
-            StartState::Failed
-        } else {
-            StartState::Idle
-        };
-        Ok(())
+        self.retire_identified_start(runtime_id).await.map(|_| ())
+    }
+
+    async fn retire_checkpoint_reader(
+        &self,
+        reader: &adx_core::CheckpointReader,
+    ) -> Result<adx_core::CheckpointReaderRetirement> {
+        self.retire_bound_reader(reader).await
     }
 }
 

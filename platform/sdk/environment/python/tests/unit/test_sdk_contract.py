@@ -8,9 +8,9 @@ import httpx
 from adx_environment import (
     ConnectionConfig,
     DataPlaneSecurityPolicy,
+    Environment,
     PortForwarding,
     S3Config,
-    Environment,
 )
 from adx_environment._transport import EnvironmentClient, EnvironmentHTTPError
 from adx_environment.commands import (
@@ -124,6 +124,54 @@ class _FakeClient:
 
 
 class SDKContractTests(unittest.TestCase):
+    def test_shared_volumes_are_version_checked_and_transmitted_without_sources(self):
+        from adx_environment import SharedVolumeMount
+
+        class MountClient(_FakeClient):
+            def shared_volume_request(self, method, suffix, body, request_id):
+                assert (method, suffix, body) == ("GET", "/mount-contract", {})
+                assert request_id
+                return {"version": 1}
+
+        mount = SharedVolumeMount(
+            "00000000-0000-4000-8000-000000000001", "/shared", access="read_write"
+        )
+        with patch("adx_environment.environment_api.EnvironmentClient", MountClient):
+            environment = Environment(image="example/image:v1", shared_volumes=[mount])
+            try:
+                self.assertEqual(
+                    _FakeClient.created[-1]["sharedVolumes"], [mount.to_dict()]
+                )
+            finally:
+                environment.close()
+
+    def test_old_server_cannot_ignore_a_shared_mount_and_create_without_it(self):
+        from adx_environment import SharedVolumeMount
+
+        class OldClient(_FakeClient):
+            def shared_volume_request(self, *_args):
+                return {"version": 0}
+
+        with patch("adx_environment.environment_api.EnvironmentClient", OldClient):
+            with self.assertRaises(adx_environment.EnvironmentError):
+                Environment(
+                    image="example/image:v1",
+                    shared_volumes=[
+                        SharedVolumeMount(
+                            "00000000-0000-4000-8000-000000000001", "/shared"
+                        )
+                    ],
+                )
+        self.assertEqual(_FakeClient.created, [])
+
+    def test_empty_shared_mounts_preserve_the_legacy_create_shape(self):
+        with patch("adx_environment.environment_api.EnvironmentClient", _FakeClient):
+            environment = Environment(image="example/image:v1")
+            try:
+                self.assertNotIn("sharedVolumes", _FakeClient.created[-1])
+            finally:
+                environment.close()
+
     def setUp(self):
         _FakeClient.created.clear()
 
@@ -186,7 +234,9 @@ class SDKContractTests(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "cannot assign"):
             resume.state = "paused"
 
-    def test_environment_runtime_and_constructor_cwd_are_sent_for_runtime_initialization(self):
+    def test_environment_runtime_and_constructor_cwd_are_sent_for_runtime_initialization(
+        self,
+    ):
         with patch("adx_environment.environment_api.EnvironmentClient", _FakeClient):
             environment = Environment(
                 image="ubuntu:22.04",
@@ -312,15 +362,32 @@ class SDKContractTests(unittest.TestCase):
         ):
             Environment(image="ubuntu:22.04", failover=1, detached=True)
 
-    def test_affinity_groups_keep_weights_and_conjoin_node_id_in_every_alternative(self):
+    def test_affinity_groups_keep_weights_and_conjoin_node_id_in_every_alternative(
+        self,
+    ):
         groups = [
-            {"kind": 0, "affinity": 2, "labelOps": [{"type": 0, "labelKey": "pool", "labelValues": [pool]}]}
+            {
+                "kind": 0,
+                "affinity": 2,
+                "labelOps": [{"type": 0, "labelKey": "pool", "labelValues": [pool]}],
+            }
             for pool in ("a", "b")
         ]
-        groups.append({"kind": 1, "affinity": 0, "weight": 9, "labelOps": [{"type": 2, "labelKey": "app"}]})
+        groups.append(
+            {
+                "kind": 1,
+                "affinity": 0,
+                "weight": 9,
+                "labelOps": [{"type": 2, "labelKey": "app"}],
+            }
+        )
         with patch("adx_environment.environment_api.EnvironmentClient", _FakeClient):
             Environment(
-                image="ubuntu", node_id="node-a", labels={"app": "worker"}, schedule_affinities=groups, detached=True
+                image="ubuntu",
+                node_id="node-a",
+                labels={"app": "worker"},
+                schedule_affinities=groups,
+                detached=True,
             )
         body = _FakeClient.created[-1]
         self.assertEqual(body["labels"], {"app": "worker"})
@@ -457,7 +524,9 @@ class SDKContractTests(unittest.TestCase):
                 return super().invoke(environment_id, action, args, **kwargs)
 
         with self.assertRaises(CommandConflict) as conflict:
-            Commands(_ConflictClient(), "environment-1").run("true", background=True, command_id="stable-id")
+            Commands(_ConflictClient(), "environment-1").run(
+                "true", background=True, command_id="stable-id"
+            )
         self.assertEqual(conflict.exception.environment_id, "environment-1")
         self.assertEqual(conflict.exception.command_id, "stable-id")
         self.assertEqual(conflict.exception.request_id, "request-conflict")
@@ -487,7 +556,10 @@ class SDKContractTests(unittest.TestCase):
                 if action == "process.start":
                     raise EnvironmentHTTPError(
                         410,
-                        {"error": "command result expired", "error_code": "COMMAND_EXPIRED"},
+                        {
+                            "error": "command result expired",
+                            "error_code": "COMMAND_EXPIRED",
+                        },
                         "command result expired",
                         request_id="request-expired",
                     )
@@ -668,7 +740,10 @@ class SDKContractTests(unittest.TestCase):
             )
             self.assertEqual(
                 environment.get_port_auth_headers(),
-                {"Authorization": "Bearer environment-token", "X-Auth": "environment-token"},
+                {
+                    "Authorization": "Bearer environment-token",
+                    "X-Auth": "environment-token",
+                },
             )
 
     def test_duplicate_forwarded_ports_across_descriptor_and_integer_are_rejected(self):

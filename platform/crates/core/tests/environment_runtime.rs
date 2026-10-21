@@ -7,6 +7,7 @@ fn environment_identity_survives_runtime_replacement() {
     }
 
     let mut record = EnvironmentRecord {
+        checkpoint_readers: Default::default(),
         failure: None,
         spec: EnvironmentSpec {
             id: "environment-a".into(),

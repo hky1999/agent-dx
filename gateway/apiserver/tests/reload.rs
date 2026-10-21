@@ -69,6 +69,8 @@ service_impl!(pb::coordinator_service_server::CoordinatorService, {
     inspect_node(InspectNodeRequest) -> InspectNodeResponse,
     create_environment(CreateEnvironmentRequest) -> EnvironmentResult,
     commit_environment(CommitEnvironmentRequest) -> CommitEnvironmentResponse,
+    reserve_checkpoint_reader(ReserveCheckpointReaderRequest) -> ReserveCheckpointReaderResponse,
+    release_checkpoint_reader(ReleaseCheckpointReaderRequest) -> ReleaseCheckpointReaderResponse,
     retire_dormant(GetEnvironmentRequest) -> EnvironmentResult,
 ]);
 

@@ -8,6 +8,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "snapshot.proto",
         "credentials.proto",
         "routes.proto",
+        "shared_volumes.proto",
+        "shared_volume_types.proto",
+        "shared_volume_execution.proto",
     ] {
         println!("cargo:rerun-if-changed=../../api/proto/{file}");
     }

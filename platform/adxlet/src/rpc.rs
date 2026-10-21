@@ -1,6 +1,7 @@
 //! Node RPC adaptation; EnvironmentHandle remains the lifecycle owner.
 use adx_transport::rpc::{authenticated_channel, RpcChannel};
 mod local_create;
+mod shared_volume_execution;
 use crate::{Adxlet, Durability, StateSink};
 use adx_core::{EnvironmentRecord, Error, Result};
 use adx_protocol::{
@@ -548,6 +549,13 @@ impl pb::node_service_server::NodeService for NodeRpc {
 
 #[derive(Clone)]
 pub struct CoordinatorStateSink {
+    volumes: Arc<
+        std::sync::RwLock<
+            pb::shared_volume_execution_service_client::SharedVolumeExecutionServiceClient<
+                RpcChannel,
+            >,
+        >,
+    >,
     snapshots:
         Arc<std::sync::RwLock<pb::snapshot_service_client::SnapshotServiceClient<RpcChannel>>>,
     client: Arc<
@@ -569,6 +577,11 @@ impl CoordinatorStateSink {
             snapshots: Arc::new(std::sync::RwLock::new(
                 pb::snapshot_service_client::SnapshotServiceClient::new(channel.clone()),
             )),
+            volumes: Arc::new(std::sync::RwLock::new(
+                pb::shared_volume_execution_service_client::SharedVolumeExecutionServiceClient::new(
+                    channel.clone(),
+                ),
+            )),
             client: Arc::new(std::sync::RwLock::new(
                 pb::coordinator_service_client::CoordinatorServiceClient::new(channel),
             )),
@@ -581,6 +594,10 @@ impl CoordinatorStateSink {
         self
     }
     pub fn reconnect(&self, channel: RpcChannel) {
+        *self.volumes.write().expect("shared state lock poisoned") =
+            pb::shared_volume_execution_service_client::SharedVolumeExecutionServiceClient::new(
+                channel.clone(),
+            );
         *self.snapshots.write().expect("shared state lock poisoned") =
             pb::snapshot_service_client::SnapshotServiceClient::new(channel.clone());
         *self.client.write().expect("shared state lock poisoned") =
@@ -589,6 +606,86 @@ impl CoordinatorStateSink {
 }
 #[async_trait::async_trait]
 impl StateSink for CoordinatorStateSink {
+    async fn reserve_shared_volumes(&self, record: &EnvironmentRecord) -> Result<()> {
+        self.reserve_volumes(record).await
+    }
+    async fn release_shared_volumes(
+        &self,
+        receipts: &[adx_core::shared_volume_attachments::SharedVolumeAttachmentRetirement],
+    ) -> Result<()> {
+        self.release_volumes(receipts).await
+    }
+    async fn list_shared_volume_attachments(
+        &self,
+        node_id: &str,
+    ) -> Result<Vec<adx_core::shared_volume_attachments::SharedVolumeAttachment>> {
+        self.list_volumes(node_id).await
+    }
+    async fn reserve_checkpoint_reader(&self, record: &EnvironmentRecord) -> Result<()> {
+        let reader = record
+            .current_checkpoint_reader_entry()
+            .ok_or(Error::Conflict)?;
+        let mut request = Request::new(pb::ReserveCheckpointReaderRequest {
+            record: Some(record.clone().try_into()?),
+            node_session_id: self.session_id.clone(),
+        });
+        adx_observability::trace::inject_metadata(request.metadata_mut());
+        request.set_timeout(self.timeout);
+        let mut client = self
+            .client
+            .read()
+            .map_err(|_| Error::Unavailable("Coordinator client unavailable".into()))?
+            .clone();
+        let response =
+            tokio::time::timeout(self.timeout, client.reserve_checkpoint_reader(request))
+                .await
+                .map_err(|_| Error::Unavailable("reader reservation RPC timed out".into()))?
+                .map_err(dependency_status)?
+                .into_inner();
+        let accepted: adx_core::CheckpointReader = response
+            .reader
+            .ok_or_else(|| Error::Unavailable("reader reservation receipt missing".into()))?
+            .try_into()?;
+        if response.coordinator_epoch == 0 || accepted != *reader {
+            return Err(Error::Conflict);
+        }
+        Ok(())
+    }
+    async fn release_checkpoint_reader(
+        &self,
+        retirement: &adx_core::CheckpointReaderRetirement,
+    ) -> Result<()> {
+        retirement.validate()?;
+        let mut request = Request::new(pb::ReleaseCheckpointReaderRequest {
+            reader: Some(retirement.reader.clone().into()),
+            backend_receipt: retirement.backend_receipt.clone(),
+            node_session_id: self.session_id.clone(),
+        });
+        adx_observability::trace::inject_metadata(request.metadata_mut());
+        request.set_timeout(self.timeout);
+        let mut client = self
+            .client
+            .read()
+            .map_err(|_| Error::Unavailable("Coordinator client unavailable".into()))?
+            .clone();
+        let response =
+            tokio::time::timeout(self.timeout, client.release_checkpoint_reader(request))
+                .await
+                .map_err(|_| Error::Unavailable("reader release RPC timed out".into()))?
+                .map_err(dependency_status)?
+                .into_inner();
+        let reader: adx_core::CheckpointReader = response
+            .reader
+            .ok_or_else(|| Error::Unavailable("reader release receipt missing".into()))?
+            .try_into()?;
+        if response.coordinator_epoch == 0
+            || reader != retirement.reader
+            || response.backend_receipt != retirement.backend_receipt
+        {
+            return Err(Error::Conflict);
+        }
+        Ok(())
+    }
     async fn commit(&self, record: &EnvironmentRecord) -> Result<Durability> {
         let mut request = Request::new(pb::CommitEnvironmentRequest {
             record: Some(record.clone().try_into()?),

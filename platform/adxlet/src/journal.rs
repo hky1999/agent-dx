@@ -199,6 +199,104 @@ impl JournalSink {
 
 #[async_trait]
 impl StateSink for JournalSink {
+    async fn reserve_shared_volumes(&self, record: &EnvironmentRecord) -> Result<()> {
+        if record.spec.execution.shared_volumes.is_empty() {
+            return Ok(());
+        }
+        let ready = self.ready.read().await;
+        if !*ready {
+            return Err(unavailable("authoritative recovery required"));
+        }
+        let serial = self
+            .environments
+            .lock()
+            .await
+            .entry(record.spec.id.clone())
+            .or_default()
+            .clone();
+        let _serial = serial.lock().await;
+        self.publish(self.entries(Some(record.spec.id.clone())).await?)
+            .await?;
+        // Never append this to SQLite: another node cannot observe that journal.
+        self.upstream.reserve_shared_volumes(record).await
+    }
+    async fn release_shared_volumes(
+        &self,
+        receipts: &[adx_core::shared_volume_attachments::SharedVolumeAttachmentRetirement],
+    ) -> Result<()> {
+        let Some(first) = receipts.first() else {
+            return Ok(());
+        };
+        for receipt in receipts {
+            receipt.validate()?;
+        }
+        let ready = self.ready.read().await;
+        if !*ready {
+            return Err(unavailable("authoritative recovery required"));
+        }
+        let id = &first.attachment.identity.environment_id;
+        let serial = self
+            .environments
+            .lock()
+            .await
+            .entry(id.clone())
+            .or_default()
+            .clone();
+        let _serial = serial.lock().await;
+        self.publish(self.entries(Some(id.clone())).await?).await?;
+        self.upstream.release_shared_volumes(receipts).await
+    }
+    async fn list_shared_volume_attachments(
+        &self,
+        node_id: &str,
+    ) -> Result<Vec<adx_core::shared_volume_attachments::SharedVolumeAttachment>> {
+        let ready = self.ready.read().await;
+        if !*ready {
+            return Err(unavailable("authoritative recovery required"));
+        }
+        self.upstream.list_shared_volume_attachments(node_id).await
+    }
+    async fn reserve_checkpoint_reader(&self, record: &EnvironmentRecord) -> Result<()> {
+        let ready = self.ready.read().await;
+        if !*ready {
+            return Err(unavailable("authoritative recovery required"));
+        }
+        let serial = self
+            .environments
+            .lock()
+            .await
+            .entry(record.spec.id.clone())
+            .or_default()
+            .clone();
+        let _serial = serial.lock().await;
+        self.publish(self.entries(Some(record.spec.id.clone())).await?)
+            .await?;
+        // Never append this reservation to SQLite: another node cannot see it.
+        self.upstream.reserve_checkpoint_reader(record).await
+    }
+    async fn release_checkpoint_reader(
+        &self,
+        retirement: &adx_core::CheckpointReaderRetirement,
+    ) -> Result<()> {
+        let ready = self.ready.read().await;
+        if !*ready {
+            return Err(unavailable("authoritative recovery required"));
+        }
+        let serial = self
+            .environments
+            .lock()
+            .await
+            .entry(retirement.reader.identity.environment_id.clone())
+            .or_default()
+            .clone();
+        let _serial = serial.lock().await;
+        self.publish(
+            self.entries(Some(retirement.reader.identity.environment_id.clone()))
+                .await?,
+        )
+        .await?;
+        self.upstream.release_checkpoint_reader(retirement).await
+    }
     async fn commit(&self, record: &EnvironmentRecord) -> Result<Durability> {
         let ready = self.ready.read().await;
         if !*ready {

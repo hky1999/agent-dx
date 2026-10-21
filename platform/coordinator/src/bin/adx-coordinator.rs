@@ -205,6 +205,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         builder = builder.tls_config(tls)?;
     }
     let server = builder
+        .add_service(
+            pb::shared_volume_execution_service_server::SharedVolumeExecutionServiceServer::new(
+                rpc.clone(),
+            ),
+        )
+        .add_service(pb::shared_volume_service_server::SharedVolumeServiceServer::new(rpc.clone()))
         .add_service(pb::snapshot_service_server::SnapshotServiceServer::new(
             rpc.clone(),
         ))

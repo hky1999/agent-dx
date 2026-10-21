@@ -100,6 +100,7 @@ impl StateSink for Backend {
 }
 fn record(id: &str, state: EnvironmentState) -> EnvironmentRecord {
     EnvironmentRecord {
+        checkpoint_readers: Default::default(),
         failure: None,
         restart_attempts: 0,
         restart_pending: false,

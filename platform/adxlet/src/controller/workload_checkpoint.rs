@@ -149,19 +149,22 @@ impl Controller {
                 .await?;
             return Err(error);
         }
-        let staged =
-            match before_deadline(deadline, "checkpoint allocation", services.store.allocate())
-                .await
-            {
-                Ok(path) => path,
-                Err(error) => {
-                    services
-                        .cooperation
-                        .finish_workload(&self.record, &id, Some(error.to_string()))
-                        .await?;
-                    return Err(error);
-                }
-            };
+        let staged = match before_deadline(
+            deadline,
+            "checkpoint allocation",
+            services.store.allocate_for_policy(storage),
+        )
+        .await
+        {
+            Ok(path) => path,
+            Err(error) => {
+                services
+                    .cooperation
+                    .finish_workload(&self.record, &id, Some(error.to_string()))
+                    .await?;
+                return Err(error);
+            }
+        };
         if let Err(error) = before_deadline(
             deadline,
             "runtime preparation",

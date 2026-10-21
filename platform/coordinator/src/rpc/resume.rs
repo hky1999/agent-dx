@@ -2,6 +2,10 @@
 use super::*;
 use adx_core::scheduling::{LabelRequirement, LabelSelector, SelectorOp};
 
+fn existing_resume_matches(expected: Option<&str>, current: Option<&str>) -> bool {
+    expected.is_none_or(|expected| current == Some(expected))
+}
+
 impl CoordinatorRpc {
     pub(super) async fn retire_dormant(
         &self,
@@ -98,6 +102,14 @@ impl CoordinatorRpc {
         &self,
         request: pb::EnsureRunningRequest,
     ) -> std::result::Result<pb::GetEnvironmentResponse, Status> {
+        self.ensure_running_for_intent(request, None).await
+    }
+
+    async fn ensure_running_for_intent(
+        &self,
+        request: pb::EnsureRunningRequest,
+        expected_intent: Option<String>,
+    ) -> std::result::Result<pb::GetEnvironmentResponse, Status> {
         let seconds = if request.timeout_seconds == 0 {
             300
         } else {
@@ -138,6 +150,17 @@ impl CoordinatorRpc {
                     .await
                     .map_err(status)?;
                 tenant(request.caller.as_ref(), &stored.spec.tenant_id)?;
+                // Background work may have waited behind a foreground request.
+                // It must not recreate a demand that has completed or changed.
+                if !existing_resume_matches(
+                    expected_intent.as_deref(),
+                    stored
+                        .resume
+                        .as_ref()
+                        .map(|intent| intent.operation_id.as_str()),
+                ) {
+                    return Err(Status::aborted("resume demand completed or replaced"));
+                }
                 if !stored.invalidated
                     && stored.resume.is_none()
                     && stored.result.as_ref().is_some_and(|r| {
@@ -181,6 +204,9 @@ impl CoordinatorRpc {
         &self,
         id: &str,
     ) -> std::result::Result<pb::GetEnvironmentResponse, Status> {
+        // A failed owner RPC does not authorize a second execution. Back off on
+        // that same owner instead of repeatedly creating failed restore attempts.
+        let mut retry_delay = Duration::from_millis(50);
         loop {
             let work = {
                 let mut state = self.0.state.lock().await;
@@ -334,13 +360,15 @@ impl CoordinatorRpc {
             let channel = match endpoint.connect().await {
                 Ok(channel) => channel,
                 Err(_) => {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(2));
                     continue;
                 }
             };
             let mut client =
                 pb::node_service_client::NodeServiceClient::new(self.0.node_tls.wrap(channel));
             let transferred = stored.recovery.as_ref().is_some_and(|r| r.pending);
+            let expected_revision = record.revision;
             let result = if transferred {
                 client
                     .recover_environment(pb::RecoverEnvironmentRequest {
@@ -371,6 +399,7 @@ impl CoordinatorRpc {
                     self.commit(restored, session).await.map_err(status)?;
                 }
                 Err(error) if error.code() == tonic::Code::ResourceExhausted => {
+                    retry_delay = Duration::from_millis(50);
                     let mut state = self.0.state.lock().await;
                     let rejected = state
                         .session
@@ -403,7 +432,31 @@ impl CoordinatorRpc {
                             | tonic::Code::Unknown
                     ) =>
                 {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(2));
+                }
+                Err(error) if error.code() == tonic::Code::NotFound => {
+                    let mut state = self.0.state.lock().await;
+                    // A definitive rejection is terminal only after the owner
+                    // published its stopped rollback. Ambiguous cleanup retains
+                    // the demand and is reported as unavailable, not terminal.
+                    let settled = state
+                        .session
+                        .finish_rejected_resume(
+                            &stored.assignment,
+                            &intent.operation_id,
+                            expected_revision,
+                        )
+                        .await
+                        .map_err(|error| {
+                            Status::unavailable(format!(
+                                "resume rejection remains pending: {error}"
+                            ))
+                        })?;
+                    state.scheduler.cancel_pending(id);
+                    state.remember_environment(settled);
+                    self.0.changed.notify_waiters();
+                    return Err(error);
                 }
                 Err(error) => return Err(error),
             }
@@ -428,6 +481,9 @@ impl CoordinatorRpc {
         };
         let mut count = 0;
         for stored in pending {
+            let Some(intent) = stored.resume else {
+                continue;
+            };
             let request = pb::EnsureRunningRequest {
                 expected_runtime_id: String::new(),
                 environment_id: stored.spec.id,
@@ -437,10 +493,28 @@ impl CoordinatorRpc {
                 }),
                 timeout_seconds: 1,
             };
-            if self.ensure_running(request).await.is_ok() {
+            if self
+                .ensure_running_for_intent(request, Some(intent.operation_id))
+                .await
+                .is_ok()
+            {
                 count += 1;
             }
         }
         Ok(count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::existing_resume_matches;
+
+    #[test]
+    fn background_resume_ticket_requires_exact_existing_identity() {
+        assert!(existing_resume_matches(None, None));
+        assert!(existing_resume_matches(None, Some("new")));
+        assert!(existing_resume_matches(Some("old"), Some("old")));
+        assert!(!existing_resume_matches(Some("old"), None));
+        assert!(!existing_resume_matches(Some("old"), Some("new")));
     }
 }

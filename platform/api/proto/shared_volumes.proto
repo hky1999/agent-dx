@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package adx.control.v1;
+import "environment_types.proto";
+import "shared_volume_types.proto";
+
+// Owner-only volume metadata management. No host paths, mount admission,
+// checkpoint catalog, or physical deletion authority is exposed here.
+service SharedVolumeService {
+  rpc CreateSharedVolume(CreateSharedVolumeRequest) returns (SharedVolume);
+  rpc GetSharedVolume(GetSharedVolumeRequest) returns (SharedVolume);
+  rpc GrantSharedVolume(GrantSharedVolumeRequest) returns (SharedVolume);
+  rpc RevokeSharedVolume(RevokeSharedVolumeRequest) returns (SharedVolume);
+}
+message SharedVolumeGrant {
+  string tenant_id = 1;
+  string subpath = 2;
+  SharedVolumeAccess access = 3;
+}
+message SharedVolume {
+  string id = 1;
+  string owner_tenant_id = 2;
+  uint64 permission_revision = 3;
+  repeated SharedVolumeGrant grants = 4;
+}
+message CreateSharedVolumeRequest { string request_id = 1; CallerContext caller = 2; }
+message GetSharedVolumeRequest { string id = 1; CallerContext caller = 2; }
+message GrantSharedVolumeRequest {
+  string id = 1; CallerContext caller = 2;
+  uint64 expected_permission_revision = 3; SharedVolumeGrant grant = 4;
+}
+message RevokeSharedVolumeRequest {
+  string id = 1; CallerContext caller = 2;
+  uint64 expected_permission_revision = 3; string tenant_id = 4; string subpath = 5;
+}

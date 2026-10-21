@@ -245,6 +245,7 @@ pub(crate) fn spawn(
     let runtime_id = format!("{}-{}", spec.id, assignment.generation);
     spawn_restored(
         EnvironmentRecord {
+            checkpoint_readers: adx_core::CheckpointReaders::known_empty(),
             failure: None,
             restart_attempts: 0,
             restart_pending: false,
@@ -528,7 +529,17 @@ impl Controller {
             if self.durability == Some(Durability::Published) {
                 return Err(Error::Conflict);
             }
+            let retired_reader = self.record.current_checkpoint_reader_entry().cloned();
             self.cleanup().await?;
+            // The catalog predates cleanup's persisted stop receipt. Do not
+            // reintroduce that exact reader when adopting the paused record;
+            // every other dependency and the completeness flag stay intact.
+            if let Some(reader) = retired_reader {
+                record
+                    .checkpoint_readers
+                    .readers
+                    .retain(|entry| entry != &reader);
+            }
             // Cleanup retires the uncommitted execution at its local revision.
             // A live Relay retains that version across full catalog replacement;
             // publishing the older paused revision would prevent reconciliation
@@ -544,6 +555,7 @@ impl Controller {
     }
 
     async fn reconcile(&mut self) -> Result<OperationResult> {
+        self.record.validate_checkpoint_readers()?;
         let observation = if self.record.state == EnvironmentState::Running {
             Some(
                 self.services
@@ -571,9 +583,12 @@ impl Controller {
                 return self.sync().await;
             }
             if self.recovery_files.is_none() {
-                if let (Some(cp), Some(services)) =
-                    (&self.record.checkpoint, &self.services.checkpoint)
-                {
+                let point = self.record.current_checkpoint_reader().or_else(|| {
+                    (!self.record.checkpoint_readers.complete)
+                        .then_some(self.record.checkpoint.as_ref())
+                        .flatten()
+                });
+                if let (Some(cp), Some(services)) = (point, &self.services.checkpoint) {
                     self.recovery_files = Some(services.store.materialize(&cp.artifact).await?);
                 }
             }
@@ -674,11 +689,19 @@ impl Controller {
         if let (Some(cp), Some(services)) = (&self.record.checkpoint, &self.services.checkpoint) {
             services.store.committed(&cp.artifact).await?;
         }
-        // A restored backend may still map an older recovery point. Keep it until stop.
-        if self.recovery_files.is_some() {
+        // Unknown historical dependencies never authorize artifact reclamation.
+        if !self.record.checkpoint_readers.complete {
             return Ok(());
         }
-        while let Some(artifact) = self.obsolete_checkpoints.last() {
+        let mut index = 0;
+        while let Some(artifact) = self.obsolete_checkpoints.get(index) {
+            if self.record.checkpoint_readers.readers.iter().any(|r| {
+                r.checkpoint.artifact.storage == artifact.storage
+                    && r.checkpoint.artifact.location == artifact.location
+            }) {
+                index += 1;
+                continue;
+            }
             self.services
                 .checkpoint
                 .as_ref()
@@ -686,7 +709,7 @@ impl Controller {
                 .store
                 .remove(artifact)
                 .await?;
-            self.obsolete_checkpoints.pop();
+            self.obsolete_checkpoints.remove(index);
         }
         Ok(())
     }
@@ -772,11 +795,17 @@ impl Controller {
             }
             self.services.readiness.expect_runtime(&self.record)?;
             let runtime_start_started = Instant::now();
+            crate::shared_volumes::reserve(&self.services, &self.record).await?;
             self.record.runtime.ip = Some(
                 adx_observability::trace::Trace::child("environment.runtime.start")
                     .run_result(async {
                         if restore_checkpoint || self.record.spec.snapshot_id.is_some() {
-                            let cp = self.record.checkpoint.as_ref().ok_or(Error::Conflict)?;
+                            let cp = self.record.checkpoint.clone().ok_or(Error::Conflict)?;
+                            self.record.register_checkpoint_reader(cp.clone())?;
+                            self.services
+                                .sink
+                                .reserve_checkpoint_reader(&self.record)
+                                .await?;
                             let store = &self
                                 .services
                                 .checkpoint
@@ -933,16 +962,60 @@ impl Controller {
     async fn cleanup(&mut self) -> Result<()> {
         timeout(self.services.operation_timeout, async {
             self.services.routes.retire(&self.record).await?;
+            crate::shared_volumes::retire(&self.services, &self.record).await?;
             if let Some(control) = &self.services.runtime_control {
                 control.retire(&self.record);
             }
-            self.services.runtime.remove(&self.record.runtime.id).await
+            if self.record.current_checkpoint_reader_entry().is_some() {
+                Ok(())
+            } else {
+                self.services.runtime.remove(&self.record.runtime.id).await
+            }
         })
         .await
         .map_err(|_| Error::Unavailable("environment cleanup timed out".into()))??;
+        self.release_checkpoint_reader().await?;
         self.recovery_files = None;
         self.services.metrics.remove(&self.record.spec.id);
         self.release_capacity()
+    }
+
+    async fn release_checkpoint_reader(&mut self) -> Result<()> {
+        let Some(reader) = self.record.current_checkpoint_reader_entry().cloned() else {
+            return Ok(());
+        };
+        timeout(self.services.operation_timeout, async {
+            let retirement = self
+                .services
+                .runtime
+                .retire_checkpoint_reader(&reader)
+                .await?;
+            retirement.validate()?;
+            if retirement.reader != reader {
+                return Err(Error::Conflict);
+            }
+            self.services
+                .sink
+                .release_checkpoint_reader(&retirement)
+                .await
+        })
+        .await
+        .map_err(|_| Error::Unavailable("checkpoint reader retirement timed out".into()))??;
+        if let Some(point) = self.record.release_checkpoint_reader() {
+            if !self
+                .record
+                .checkpoint
+                .as_ref()
+                .is_some_and(|cp| cp.artifact == point.artifact)
+                && !self
+                    .obsolete_checkpoints
+                    .iter()
+                    .any(|a| a == &point.artifact)
+            {
+                self.obsolete_checkpoints.push(point.artifact);
+            }
+        }
+        Ok(())
     }
 
     async fn delete(&mut self) -> Result<OperationResult> {
@@ -963,6 +1036,13 @@ impl Controller {
                     "cleanup failed: {error}; commit failed: {commit}"
                 ))),
             };
+        }
+        if !self.record.checkpoint_readers.readers.is_empty() {
+            self.transition(Event::Fail)?;
+            self.sync().await?;
+            return Err(Error::Unavailable(
+                "other executions still retain checkpoint reads; stop proof required".into(),
+            ));
         }
         if let Some(cp) = self.record.checkpoint.take() {
             self.obsolete_checkpoints.push(cp.artifact);

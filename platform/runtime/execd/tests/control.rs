@@ -391,3 +391,51 @@ async fn workload_checkpoint_timeout_keeps_the_accepted_request_for_reconciliati
     assert_eq!(status.requested_checkpoint.as_deref(), Some("slow"));
     assert!(status.requested_checkpoint_deadline_unix_millis.is_some());
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn blocking_open_completion_wakes_prepare_without_network_activity() {
+    let (entered, entering) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let (handoff, reader) = oneshot::channel();
+    let control = Controller::new(
+        identity(),
+        Arc::new(DelayedOpen {
+            entered,
+            release: Mutex::new(released),
+            reader: Mutex::new(Some(reader)),
+        }),
+    )
+    .unwrap();
+    let pending = {
+        let control = control.clone();
+        tokio::spawn(async move {
+            control
+                .prepare(PrepareCheckpoint {
+                    idle_revision: None,
+                    identity: identity(),
+                    operation_id: "blocking-open-no-network".into(),
+                    expected_revision: 1,
+                })
+                .await
+        })
+    };
+    tokio::task::spawn_blocking(move || {
+        entering
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(control.status().phase, RuntimePhase::Preparing);
+    release.send(()).unwrap();
+    let started = std::time::Instant::now();
+    let prepared = tokio::time::timeout(std::time::Duration::from_secs(2), pending)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(prepared.phase, RuntimePhase::Prepared);
+    // The outer deadline must not be the event that finally wakes the task.
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    handoff.send(HandoffOutcome::Resume).unwrap();
+}

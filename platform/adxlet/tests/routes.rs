@@ -25,6 +25,7 @@ use tonic::{Request, Response, Status};
 
 fn record() -> EnvironmentRecord {
     EnvironmentRecord {
+        checkpoint_readers: Default::default(),
         failure: None,
         restart_attempts: 0,
         restart_pending: false,

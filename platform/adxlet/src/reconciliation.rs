@@ -13,7 +13,12 @@ impl Adxlet {
     /// Collection is permitted only after complete authoritative recovery.
     pub async fn collect_remote_orphans(&self) -> Result<usize> {
         let ready = self.lifecycle_ready.read().await;
-        if !*ready || self.is_draining() {
+        if !*ready
+            || self.is_draining()
+            || !self
+                .checkpoint_gc_ready
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
             return Ok(0);
         }
         match &self.services.checkpoint {
@@ -64,6 +69,17 @@ impl Adxlet {
         self.reconcile_authority(records, snapshots, Some(retained_checkpoints))
             .await
     }
+
+    pub async fn reconcile_retained_catalog(
+        &self,
+        records: Vec<EnvironmentRecord>,
+        snapshots: Vec<Snapshot>,
+        retained_checkpoints: Vec<adx_core::CheckpointArtifact>,
+        complete: bool,
+    ) -> Result<()> {
+        self.reconcile_authority(records, snapshots, complete.then_some(retained_checkpoints))
+            .await
+    }
     async fn reconcile_authority(
         &self,
         records: Vec<EnvironmentRecord>,
@@ -75,8 +91,13 @@ impl Adxlet {
             return Err(Error::Unavailable("node is draining".into()));
         }
         *ready = false;
+        self.checkpoint_gc_ready
+            .store(false, std::sync::atomic::Ordering::Release);
         let mut snapshot_ids = BTreeSet::new();
-        let complete_references = retained_checkpoints.is_some();
+        let complete_references = retained_checkpoints.is_some()
+            && records
+                .iter()
+                .all(|record| record.checkpoint_readers.complete);
         let mut retained = retained_checkpoints.unwrap_or_default();
         for snapshot in snapshots {
             snapshot.validate()?;
@@ -92,6 +113,7 @@ impl Adxlet {
         let mut scalar = ResourceLedger::new(Resources::default());
         let mut cards = DeviceLedger::default();
         for r in records {
+            r.validate_checkpoint_readers()?;
             r.spec.validate()?;
             validate_device_assignment(&r.spec.scheduling.devices, &r.assignment.devices)?;
             if r.assignment.node_id != self.node_id
@@ -120,7 +142,7 @@ impl Adxlet {
                     .chain(
                         catalog
                             .values()
-                            .filter_map(|record| record.checkpoint.as_ref().map(|cp| &cp.artifact)),
+                            .flat_map(|record| record.checkpoint_points().map(|cp| &cp.artifact)),
                     )
                     .map(|artifact| (artifact.storage.clone(), artifact.location.clone()))
                     .collect(),
@@ -177,6 +199,7 @@ impl Adxlet {
         }
         // Validate everything before any destructive action or partial ledger update.
         self.services.routes.begin_reconcile().await?;
+        crate::shared_volumes::reconcile(&self.services, &self.node_id, &catalog).await?;
         for (id, (_, assignment, handle)) in controllers {
             if catalog.get(&id).is_none_or(|r| {
                 r.assignment != assignment
@@ -248,21 +271,36 @@ impl Adxlet {
                     "reconciliation state is not published".into(),
                 ));
             }
-            if let Some(checkpoint) = result.record.checkpoint {
-                retained.push(checkpoint.artifact);
-            }
+            retained.extend(
+                result
+                    .record
+                    .checkpoint_points()
+                    .map(|cp| cp.artifact.clone()),
+            );
         }
-        if let Some(checkpoint) = &self.services.checkpoint {
+        if let Some(checkpoint) = self
+            .services
+            .checkpoint
+            .as_ref()
+            .filter(|_| complete_references)
+        {
             checkpoint.store.reconcile_local(&retained).await?;
         }
         self.services.routes.finish_reconcile().await?;
-        if let Some(checkpoint) = &self.services.checkpoint {
+        if let Some(checkpoint) = self
+            .services
+            .checkpoint
+            .as_ref()
+            .filter(|_| complete_references)
+        {
             checkpoint.store.authorize_remote_gc(&retained).await?;
         }
         self.local_holds
             .lock()
             .expect("shared state lock poisoned")
             .clear();
+        self.checkpoint_gc_ready
+            .store(complete_references, std::sync::atomic::Ordering::Release);
         *ready = true;
         Ok(())
     }

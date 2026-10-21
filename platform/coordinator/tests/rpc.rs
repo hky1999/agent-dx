@@ -998,6 +998,7 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
         .await
         .unwrap();
     let running = EnvironmentRecord {
+        checkpoint_readers: Default::default(),
         failure: None,
         restart_attempts: 0,
         restart_pending: false,
@@ -1414,6 +1415,7 @@ async fn coordinator_restart_bounds_re_registration_grace() {
             .await
             .unwrap();
         let running = EnvironmentRecord {
+            checkpoint_readers: Default::default(),
             failure: None,
             spec: spec("held"),
             assignment,
@@ -1650,6 +1652,7 @@ async fn published_routes_drive_real_gateway_streams_and_reconnect_to_new_coordi
         .await
         .unwrap();
     let mut record = EnvironmentRecord {
+        checkpoint_readers: Default::default(),
         failure: None,
         restart_attempts: 0,
         restart_pending: false,
@@ -2724,6 +2727,7 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
         .await
         .unwrap();
     let old = EnvironmentRecord {
+        checkpoint_readers: Default::default(),
         failure: None,
         spec: spec("held"),
         assignment: previous,

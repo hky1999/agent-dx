@@ -11,14 +11,18 @@ use hyper::{
 use hyper_util::rt::TokioIo;
 use std::{
     collections::HashMap,
+    io::{self, IoSlice},
     net::SocketAddr,
+    pin::Pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::Duration,
+    task::{Context, Poll},
+    time::{Duration, Instant},
 };
 use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpStream,
     sync::{watch, Mutex as AsyncMutex},
     task::AbortHandle,
@@ -34,6 +38,164 @@ struct RuntimeControlKey {
     address: SocketAddr,
 }
 
+#[derive(Default)]
+struct HttpTransportObservation {
+    read_bytes: AtomicU64,
+    write_bytes: AtomicU64,
+    connect_attempts: AtomicU64,
+    local_address: Mutex<Option<SocketAddr>>,
+}
+
+// Observe byte counts only. Forward all I/O, including vectored writes, without
+// inspecting authenticated headers or bodies or changing their framing.
+struct ObservedRuntimeIo {
+    stream: TcpStream,
+    observation: Arc<HttpTransportObservation>,
+}
+
+impl AsyncRead for ObservedRuntimeIo {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let before = buffer.filled().len();
+        let result = Pin::new(&mut this.stream).poll_read(cx, buffer);
+        if matches!(result, Poll::Ready(Ok(()))) {
+            this.observation
+                .read_bytes
+                .fetch_add((buffer.filled().len() - before) as u64, Ordering::Relaxed);
+        }
+        result
+    }
+}
+
+impl AsyncWrite for ObservedRuntimeIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let result = Pin::new(&mut this.stream).poll_write(cx, buffer);
+        if let Poll::Ready(Ok(count)) = &result {
+            this.observation
+                .write_bytes
+                .fetch_add(*count as u64, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffers: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let result = Pin::new(&mut this.stream).poll_write_vectored(cx, buffers);
+        if let Poll::Ready(Ok(count)) = &result {
+            this.observation
+                .write_bytes
+                .fetch_add(*count as u64, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.stream.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
+    }
+}
+
+struct RuntimeHttpTrace {
+    key: RuntimeControlKey,
+    path: String,
+    started: Instant,
+    stage: Mutex<&'static str>,
+    observation: Arc<HttpTransportObservation>,
+    finished: bool,
+}
+
+impl RuntimeHttpTrace {
+    fn new(key: RuntimeControlKey, path: &str, observation: Arc<HttpTransportObservation>) -> Self {
+        Self {
+            key,
+            path: path.into(),
+            started: Instant::now(),
+            stage: Mutex::new("request_started"),
+            observation,
+            finished: false,
+        }
+    }
+
+    fn advance(&self, stage: &'static str) {
+        *self
+            .stage
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = stage;
+    }
+
+    fn current_stage(&self) -> &'static str {
+        *self
+            .stage
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn finish(&mut self, succeeded: bool) {
+        self.finished = true;
+        adx_observability::info!(
+            event = "runtime_control_http_observation",
+            environment_id = %self.key.environment_id,
+            runtime_id = %self.key.runtime_id,
+            generation = self.key.ownership_generation,
+            address = %self.key.address,
+            local_address = ?*self.observation.local_address.lock().unwrap_or_else(|poison| poison.into_inner()),
+            path = %self.path,
+            stage = self.current_stage(),
+            succeeded,
+            elapsed_ms = self.started.elapsed().as_secs_f64() * 1000.0,
+            connection_read_bytes = self.observation.read_bytes.load(Ordering::Relaxed),
+            connection_write_bytes = self.observation.write_bytes.load(Ordering::Relaxed),
+            connection_attempts = self.observation.connect_attempts.load(Ordering::Relaxed),
+            "runtime HTTP request observation; byte counters are connection totals"
+        );
+    }
+}
+
+impl Drop for RuntimeHttpTrace {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        // Includes cancellation by an outer readiness deadline. Do not change
+        // transport retirement or retry policy while collecting this evidence.
+        adx_observability::warn!(
+            event = "runtime_control_http_incomplete",
+            environment_id = %self.key.environment_id,
+            runtime_id = %self.key.runtime_id,
+            generation = self.key.ownership_generation,
+            address = %self.key.address,
+            local_address = ?*self.observation.local_address.lock().unwrap_or_else(|poison| poison.into_inner()),
+            path = %self.path,
+            stage = self.current_stage(),
+            elapsed_ms = self.started.elapsed().as_secs_f64() * 1000.0,
+            connection_read_bytes = self.observation.read_bytes.load(Ordering::Relaxed),
+            connection_write_bytes = self.observation.write_bytes.load(Ordering::Relaxed),
+            connection_attempts = self.observation.connect_attempts.load(Ordering::Relaxed),
+            "runtime HTTP request dropped before completion; byte counters are connection totals"
+        );
+    }
+}
+
 struct RuntimeConnection {
     address: SocketAddr,
     connect_timeout: Duration,
@@ -42,6 +204,7 @@ struct RuntimeConnection {
     driver: Mutex<Option<AbortHandle>>,
     idle_reset: Mutex<Option<watch::Sender<bool>>>,
     idle_task: Mutex<Option<AbortHandle>>,
+    observation: Arc<HttpTransportObservation>,
 }
 
 impl RuntimeConnection {
@@ -54,6 +217,7 @@ impl RuntimeConnection {
             driver: Mutex::new(None),
             idle_reset: Mutex::new(None),
             idle_task: Mutex::new(None),
+            observation: Arc::default(),
         }
     }
 
@@ -88,12 +252,26 @@ impl RuntimeConnection {
         self.close_transport();
     }
 
-    async fn connect(&self) -> Result<SendRequest<Full<Bytes>>> {
+    async fn connect(&self, trace: &RuntimeHttpTrace) -> Result<SendRequest<Full<Bytes>>> {
+        trace.advance("tcp_connect");
+        self.observation
+            .connect_attempts
+            .fetch_add(1, Ordering::Relaxed);
         let stream = tokio::time::timeout(self.connect_timeout, TcpStream::connect(self.address))
             .await
             .map_err(|_| unavailable("connect deadline exceeded"))?
             .map_err(unavailable)?;
+        *self
+            .observation
+            .local_address
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = stream.local_addr().ok();
         stream.set_nodelay(true).map_err(unavailable)?;
+        trace.advance("http_handshake");
+        let stream = ObservedRuntimeIo {
+            stream,
+            observation: self.observation.clone(),
+        };
         let (sender, connection) = http1::handshake(TokioIo::new(stream))
             .await
             .map_err(unavailable)?;
@@ -148,12 +326,18 @@ impl RuntimeConnection {
         }
     }
 
-    async fn send(&self, request: Request<Full<Bytes>>) -> Result<Response<Incoming>> {
+    async fn send(
+        &self,
+        request: Request<Full<Bytes>>,
+        trace: &RuntimeHttpTrace,
+    ) -> Result<Response<Incoming>> {
         if !self.valid.load(Ordering::Acquire) {
             return Err(unavailable("runtime connection is retired"));
         }
         self.set_idle(false);
+        trace.advance("sender_lock");
         let mut sender = self.sender.lock().await;
+        trace.advance("sender_ready");
         let disconnected = match sender.as_mut() {
             Some(sender) => sender.ready().await.is_err(),
             None => true,
@@ -161,7 +345,7 @@ impl RuntimeConnection {
         if disconnected {
             sender.take();
             self.close_transport();
-            *sender = Some(self.connect().await?);
+            *sender = Some(self.connect(trace).await?);
         }
         if !self.valid.load(Ordering::Acquire) {
             sender.take();
@@ -171,7 +355,9 @@ impl RuntimeConnection {
         let Some(active) = sender.as_mut() else {
             return Err(unavailable("runtime sender was not initialized"));
         };
+        trace.advance("response_headers");
         let result = active.send_request(request).await;
+        trace.advance("response_headers_received");
         if result.is_err() || !self.valid.load(Ordering::Acquire) {
             sender.take();
             self.close_transport();
@@ -358,6 +544,7 @@ impl RuntimeControlClient {
         let expected = Self::identity(record);
         let key = self.key(record)?;
         let connection = self.connection(&key);
+        let mut trace = RuntimeHttpTrace::new(key.clone(), path, connection.observation.clone());
         let method = if body.is_some() {
             Method::POST
         } else {
@@ -385,7 +572,7 @@ impl RuntimeControlClient {
                         .header("Content-Type", "application/json")
                         .body(Full::new(Bytes::copy_from_slice(&body)))
                         .map_err(|_| Error::Invalid("invalid runtime HTTP request".into()))?;
-                    match connection.send(request).await {
+                    match connection.send(request, &trace).await {
                         Ok(value) => {
                             response = Some(value);
                             break;
@@ -403,23 +590,51 @@ impl RuntimeControlClient {
             };
             match response.status() {
                 StatusCode::OK => {}
-                StatusCode::CONFLICT => return Err(Error::Conflict),
+                StatusCode::CONFLICT => {
+                    adx_observability::warn!(
+                        event = "runtime_control_http_conflict",
+                        environment_id = %expected.environment_id,
+                        runtime_id = %expected.runtime_id,
+                        generation = expected.ownership_generation,
+                        address = %key.address,
+                        path,
+                        "runtime control rejected the fenced HTTP request"
+                    );
+                    return Err(Error::Conflict);
+                }
                 status => return Err(unavailable(format!("HTTP {status}"))),
             }
+            trace.advance("response_body");
             let body = Limited::new(response.into_body(), 65_536)
                 .collect()
                 .await
                 .map_err(unavailable)?
                 .to_bytes();
+            trace.advance("decode_status");
             let status: RuntimeStatus = serde_json::from_slice(&body).map_err(unavailable)?;
             if status.identity != expected || status.revision == 0 {
+                adx_observability::warn!(
+                    event = "runtime_control_status_identity_rejected",
+                    environment_id = %expected.environment_id,
+                    runtime_id = %expected.runtime_id,
+                    generation = expected.ownership_generation,
+                    address = %key.address,
+                    path,
+                    actual_environment_id = ?status.identity.environment_id.chars().take(128).collect::<String>(),
+                    actual_runtime_id = ?status.identity.runtime_id.chars().take(128).collect::<String>(),
+                    actual_generation = status.identity.ownership_generation,
+                    actual_revision = status.revision,
+                    "runtime control status identity or revision rejected"
+                );
                 return Err(Error::Conflict);
             }
+            trace.advance("validated_status");
             Ok(status)
         })
         .await
         .map_err(|_| unavailable("deadline exceeded"))?;
         connection.set_idle(true);
+        trace.finish(result.is_ok());
         result
     }
     /// Probe observations use the last full stream snapshot, with authenticated
@@ -549,6 +764,7 @@ mod tests {
 
     fn record(port: u16) -> (EnvironmentRecord, RuntimeControlClient) {
         let record = EnvironmentRecord {
+            checkpoint_readers: Default::default(),
             failure: None,
             spec: EnvironmentSpec {
                 runtime_profile: None,
@@ -823,5 +1039,117 @@ mod tests {
         }
         server.join().unwrap();
         assert!(client.clients.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn observed_http_transport_counts_wire_bytes_without_reading_payloads() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (record, client) = record(port);
+        let key = client.key(&record).unwrap();
+        let connection = client.connection(&key);
+        let expected = RuntimeStatus {
+            failure: None,
+            requested_checkpoint: None,
+            requested_checkpoint_deadline_unix_millis: None,
+            identity: RuntimeControlClient::identity(&record),
+            revision: 2,
+            phase: RuntimePhase::Running,
+            checkpoint: None,
+            active_requests: 0,
+            active_commands: 0,
+            activity_revision: 1,
+        };
+        let encoded = serde_json::to_vec(&expected).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, peer) = listener.accept().unwrap();
+            let request = read_request(&mut stream);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                encoded.len()
+            );
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(&encoded).unwrap();
+            (
+                request.len() as u64,
+                (head.len() + encoded.len()) as u64,
+                peer,
+            )
+        });
+        assert_eq!(client.status(&record).await.unwrap(), expected);
+        let (written, read, local) = server.join().unwrap();
+        assert_eq!(
+            connection.observation.write_bytes.load(Ordering::Relaxed),
+            written
+        );
+        assert_eq!(
+            connection.observation.read_bytes.load(Ordering::Relaxed),
+            read
+        );
+        assert_eq!(
+            connection
+                .observation
+                .connect_attempts
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            *connection.observation.local_address.lock().unwrap(),
+            Some(local)
+        );
+        client.retire(&record);
+    }
+
+    #[tokio::test]
+    async fn cancelled_http_send_preserves_pending_stage_and_wire_counts() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (record, client) = record(port);
+        let key = client.key(&record).unwrap();
+        let connection = client.connection(&key);
+        let trace = RuntimeHttpTrace::new(key.clone(), "status", connection.observation.clone());
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_request(&mut stream);
+            entered.send(()).unwrap();
+            released.recv_timeout(Duration::from_secs(5)).unwrap();
+            request.len() as u64
+        });
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/control/v1/status")
+            .header(HOST, key.address.to_string())
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let cancelled = {
+            let pending = connection.send(request, &trace);
+            tokio::pin!(pending);
+            tokio::select! {
+                entered = waiting => entered.unwrap(),
+                result = &mut pending => panic!("unexpected response before release: {result:?}"),
+            }
+            tokio::time::timeout(Duration::from_millis(100), &mut pending)
+                .await
+                .is_err()
+        };
+        assert!(cancelled);
+        assert_eq!(trace.current_stage(), "response_headers");
+        assert_eq!(connection.observation.read_bytes.load(Ordering::Relaxed), 0);
+        connection.retire();
+        release.send(()).unwrap();
+        let written = server.join().unwrap();
+        assert_eq!(
+            connection.observation.write_bytes.load(Ordering::Relaxed),
+            written
+        );
+        assert_eq!(
+            connection
+                .observation
+                .connect_attempts
+                .load(Ordering::Relaxed),
+            1
+        );
     }
 }

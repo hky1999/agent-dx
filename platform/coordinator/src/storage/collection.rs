@@ -49,7 +49,12 @@ impl Session {
     ) -> Result<EnvironmentRecord> {
         let stored = self.get(&expected.spec.id).await?;
         if &stored != expected
+            || !stored.reader_reservations.is_empty()
             || !stored.invalidated
+            || stored
+                .result
+                .as_ref()
+                .is_none_or(|r| !r.checkpoint_readers.reclaimable())
             || stored.resources_held()
             || !stored.failed_collectable(now, 0)
         {

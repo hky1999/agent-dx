@@ -14,7 +14,22 @@ use tokio_stream::wrappers::UnixListenerStream;
 use tonic::{Request, Response, Status};
 
 #[derive(Clone)]
+struct Operation {
+    request: Option<StartWithOperationRequest>,
+    status: StartOperationStatus,
+    done: Arc<Semaphore>,
+    error: Option<Status>,
+}
+#[derive(Clone)]
 struct Server {
+    operations: Arc<Mutex<HashMap<String, Operation>>>,
+    backend_id: Arc<Mutex<String>>,
+    reject_protocol: bool,
+    bad_receipt: bool,
+    bad_identity: bool,
+    identity_error: Option<tonic::Code>,
+    pending_reply: bool,
+    unknown_outcome: bool,
     requests: Arc<Mutex<Vec<String>>>,
     starts: Arc<Mutex<Vec<StartRequest>>>,
     network_updates: Arc<Mutex<Vec<SetNetworkPolicyRequest>>>,
@@ -37,6 +52,14 @@ struct Server {
 impl Default for Server {
     fn default() -> Self {
         Self {
+            operations: Arc::default(),
+            backend_id: Arc::default(),
+            identity_error: None,
+            reject_protocol: false,
+            bad_receipt: false,
+            bad_identity: false,
+            pending_reply: false,
+            unknown_outcome: false,
             requests: Arc::default(),
             starts: Arc::default(),
             network_updates: Arc::default(),
@@ -60,12 +83,226 @@ impl Default for Server {
 }
 #[tonic::async_trait]
 impl sandbox_service_server::SandboxService for Server {
+    async fn start_with_operation(
+        &self,
+        request: Request<StartWithOperationRequest>,
+    ) -> Result<Response<StartOperationStatus>, Status> {
+        if self.reject_protocol {
+            return Err(Status::unimplemented("identified protocol missing"));
+        }
+        let request = request.into_inner();
+        let start = request
+            .start
+            .clone()
+            .ok_or_else(|| Status::invalid_argument("start missing"))?;
+        if start.sandbox_id != request.sandbox_id {
+            return Err(Status::invalid_argument("physical binding"));
+        }
+        if let Some(checkpoint) = &start.checkpoint_info {
+            let pin = request
+                .restore_artifacts
+                .as_ref()
+                .ok_or_else(|| Status::invalid_argument("pin missing"))?;
+            if pin.checkpoint_dir != checkpoint.checkpoint_dir
+                || pin.expected_root_digest != "a".repeat(64)
+            {
+                return Err(Status::failed_precondition("checkpoint pin mismatch"));
+            }
+        }
+        let (operation, fresh) = {
+            let mut operations = self.operations.lock().unwrap();
+            if let Some(old) = operations.get(&request.operation_id) {
+                if old.status.retirement_requested {
+                    return Err(Status::failed_precondition("retired"));
+                }
+                if old.request.as_ref() != Some(&request) {
+                    return Err(Status::failed_precondition("replay differs"));
+                }
+                (old.clone(), false)
+            } else {
+                let op = Operation {
+                    request: Some(request.clone()),
+                    error: None,
+                    done: Arc::new(Semaphore::new(0)),
+                    status: StartOperationStatus {
+                        operation_id: request.operation_id.clone(),
+                        sandbox_id: request.sandbox_id.clone(),
+                        resource_generation: "test-resource-generation".into(),
+                        state: StartOperationState::Running as i32,
+                        ..Default::default()
+                    },
+                };
+                operations.insert(request.operation_id.clone(), op.clone());
+                (op, true)
+            }
+        };
+        if fresh {
+            let service = self.clone();
+            let id = request.operation_id.clone();
+            let mut start = start;
+            start.labels.insert(
+                "akernel.scheduler/resource-generation".into(),
+                "test-resource-generation".into(),
+            );
+            tokio::spawn(async move {
+                let result = service.start(Request::new(start)).await;
+                let running = *service.running.lock().unwrap();
+                let done = {
+                    let mut records = service.operations.lock().unwrap();
+                    let op = records.get_mut(&id).unwrap();
+                    op.status.state = if running {
+                        StartOperationState::Succeeded
+                    } else {
+                        StartOperationState::Failed
+                    } as i32;
+                    op.status.sandbox_ip = service.ip.clone();
+                    if service.unknown_outcome {
+                        op.status.state = StartOperationState::Unknown as i32;
+                    }
+                    op.error = result.err();
+                    op.done.clone()
+                };
+                done.add_permits(1);
+            });
+        }
+        if self.pending_reply {
+            return Ok(Response::new(operation.status));
+        }
+        let permit = operation.done.acquire().await.unwrap();
+        drop(permit);
+        let op = self
+            .operations
+            .lock()
+            .unwrap()
+            .get(&request.operation_id)
+            .unwrap()
+            .clone();
+        if let Some(error) = op.error {
+            return Err(error);
+        }
+        Ok(Response::new(op.status))
+    }
+    async fn get_start_operation(
+        &self,
+        request: Request<GetStartOperationRequest>,
+    ) -> Result<Response<StartOperationStatus>, Status> {
+        if self.reject_protocol {
+            return Err(Status::unimplemented("identified protocol missing"));
+        }
+        let id = request.into_inner().operation_id;
+        self.requests.lock().unwrap().push(format!("get:{id}"));
+        self.operations
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|op| Response::new(op.status.clone()))
+            .ok_or_else(|| Status::not_found("operation"))
+    }
+    async fn retire_start_operation(
+        &self,
+        request: Request<RetireStartOperationRequest>,
+    ) -> Result<Response<RetireStartOperationResponse>, Status> {
+        if self.reject_protocol {
+            return Err(Status::unimplemented("identified protocol missing"));
+        }
+        let request = request.into_inner();
+        let done = {
+            let mut operations = self.operations.lock().unwrap();
+            let op = operations
+                .entry(request.operation_id.clone())
+                .or_insert_with(|| Operation {
+                    request: None,
+                    error: None,
+                    done: Arc::new(Semaphore::new(1)),
+                    status: StartOperationStatus {
+                        operation_id: request.operation_id.clone(),
+                        sandbox_id: request.sandbox_id.clone(),
+                        state: StartOperationState::Failed as i32,
+                        resource_generation: "test-resource-generation".into(),
+                        ..Default::default()
+                    },
+                });
+            if op.status.sandbox_id != request.sandbox_id {
+                return Err(Status::failed_precondition("wrong sandbox"));
+            }
+            op.status.retirement_requested = true;
+            if op.status.state == StartOperationState::Unknown as i32 {
+                return Err(Status::failed_precondition("unproven executor outcome"));
+            }
+            op.done.clone()
+        };
+        let permit = done.acquire().await.unwrap();
+        drop(permit);
+        if *self.running.lock().unwrap() {
+            self.delete(Request::new(DeleteRequest {
+                id: request.sandbox_id.clone(),
+                timeout: 0,
+            }))
+            .await?;
+        }
+        if *self.running.lock().unwrap() {
+            return Err(Status::failed_precondition("runtime remains"));
+        }
+        self.operations
+            .lock()
+            .unwrap()
+            .get_mut(&request.operation_id)
+            .unwrap()
+            .status
+            .retirement_complete = true;
+        Ok(Response::new(RetireStartOperationResponse {
+            operation_id: if self.bad_receipt {
+                "wrong-operation".into()
+            } else {
+                request.operation_id
+            },
+            sandbox_id: request.sandbox_id,
+            resource_generation: "test-resource-generation".into(),
+            retirement_receipt: "positive-test-retirement-receipt".into(),
+        }))
+    }
+    async fn delete_if_generation(
+        &self,
+        _: Request<DeleteIfGenerationRequest>,
+    ) -> Result<Response<DeleteIfGenerationResponse>, Status> {
+        Err(Status::unimplemented(
+            "adapter must use operation retirement",
+        ))
+    }
+    async fn describe_checkpoint_artifacts(
+        &self,
+        request: Request<DescribeCheckpointArtifactsRequest>,
+    ) -> Result<Response<RestoreArtifactIdentity>, Status> {
+        if self.reject_protocol {
+            return Err(Status::unimplemented("identity query missing"));
+        }
+        let directory = request.into_inner().checkpoint_dir;
+        self.requests
+            .lock()
+            .unwrap()
+            .push(format!("describe:{directory}"));
+        if let Some(code) = self.identity_error {
+            return Err(Status::new(
+                code,
+                "checkpoint content root is not verifiable",
+            ));
+        }
+        Ok(Response::new(RestoreArtifactIdentity {
+            checkpoint_dir: if self.bad_identity {
+                "/wrong/checkpoint".into()
+            } else {
+                directory
+            },
+            expected_root_digest: "a".repeat(64),
+        }))
+    }
     async fn start(
         &self,
         request: Request<StartRequest>,
     ) -> Result<Response<StartResponse>, Status> {
         let request = request.into_inner();
-        assert!(request.sandbox_id.is_empty());
+        assert!(request.sandbox_id.starts_with("sbox-"));
+        *self.backend_id.lock().unwrap() = request.sandbox_id.clone();
         self.starts.lock().unwrap().push(request.clone());
         *self.labels.lock().unwrap() = request.labels.clone();
         *self.xpu.lock().unwrap() = request.xpu_allocations.clone();
@@ -100,7 +337,7 @@ impl sandbox_service_server::SandboxService for Server {
             return Err(Status::unavailable("response interrupted after start"));
         }
         Ok(Response::new(StartResponse {
-            id: "generated-backend-id".into(),
+            id: self.backend_id.lock().unwrap().clone(),
             sandbox_ip: self.ip.clone(),
             ..Default::default()
         }))
@@ -126,7 +363,7 @@ impl sandbox_service_server::SandboxService for Server {
         let id = request.id;
         self.requests.lock().unwrap().push(format!("list:{id}"));
         if (!*self.running.lock().unwrap() && self.exit_message.is_none())
-            || (!id.is_empty() && id != "generated-backend-id")
+            || (!id.is_empty() && id != *self.backend_id.lock().unwrap())
         {
             if !id.is_empty() {
                 return Err(Status::not_found("environment not found"));
@@ -143,7 +380,7 @@ impl sandbox_service_server::SandboxService for Server {
         }
         Ok(Response::new(ListSandboxesResponse {
             sandboxes: vec![SandboxStatus {
-                id: "generated-backend-id".into(),
+                id: self.backend_id.lock().unwrap().clone(),
                 labels,
                 state: if *self.running.lock().unwrap() {
                     SandboxState::Running as i32
@@ -158,7 +395,7 @@ impl sandbox_service_server::SandboxService for Server {
         &self,
         request: Request<StatsRequest>,
     ) -> Result<Response<StatsResponse>, Status> {
-        assert_eq!(request.into_inner().id, "generated-backend-id");
+        assert_eq!(request.into_inner().id, *self.backend_id.lock().unwrap());
         Ok(Response::new(StatsResponse {
             memory_usage_bytes: 123,
             cpu_usage_ns: 456,
@@ -170,7 +407,7 @@ impl sandbox_service_server::SandboxService for Server {
         request: Request<CheckpointRequest>,
     ) -> Result<Response<CheckpointResponse>, Status> {
         let r = request.into_inner();
-        assert_eq!(r.id, "generated-backend-id");
+        assert_eq!(r.id, *self.backend_id.lock().unwrap());
         self.requests
             .lock()
             .unwrap()
@@ -255,6 +492,7 @@ async fn connect_with_env(server: Server, env: HashMap<String, String>) -> (Sand
     let adapter = Sandboxd::connect(
         socket,
         Config {
+            node_id: "n".into(),
             env,
             rpc_timeout: Duration::from_secs(2),
             runtime_logs: Some(adxlet::runtime_logs::RuntimeLogPolicy {
@@ -324,6 +562,30 @@ fn kata_start_prepares_guest_pty_without_privileged_guest_capabilities() {
         "noexec",
     ] {
         assert!(pts.options.iter().any(|value| value == option));
+    }
+}
+
+#[test]
+fn shared_volume_references_cannot_bypass_durable_mount_admission() {
+    use adx_core::shared_volumes::{
+        SharedVolumeAccess, SharedVolumeId, SharedVolumeMount, SharedVolumeSubpath,
+    };
+    for runtime in ["runsc", "firecracker"] {
+        for access in [SharedVolumeAccess::ReadOnly, SharedVolumeAccess::ReadWrite] {
+            let mut spec = spec();
+            spec.runtime_class = runtime.into();
+            spec.execution.shared_volumes.push(SharedVolumeMount {
+                volume_id: SharedVolumeId::parse("00000000-0000-4000-8000-000000000001").unwrap(),
+                subpath: SharedVolumeSubpath::parse("project").unwrap(),
+                target: "/shared".into(),
+                access,
+            });
+            assert!(matches!(
+                start_request(&spec, "i-1", 1, &[], &Config::default()),
+                Err(adx_core::Error::Unavailable(message))
+                    if message == "controlled shared volume mounting requires durable node attachment admission"
+            ));
+        }
     }
 }
 
@@ -494,7 +756,7 @@ async fn dynamic_network_policy_uses_generated_backend_identity_and_can_clear() 
         .unwrap();
     let updates = server.network_updates.lock().unwrap();
     assert_eq!(updates.len(), 2);
-    assert_eq!(updates[0].sandbox_id, "generated-backend-id");
+    assert_eq!(updates[0].sandbox_id, *server.backend_id.lock().unwrap());
     let rules = &updates[0]
         .network_policy
         .as_ref()
@@ -561,21 +823,25 @@ async fn cleanup_waits_for_start_after_caller_cancellation() {
     };
     // Start has not settled; no Delete RPC is allowed to overtake it.
     tokio::task::yield_now().await;
-    assert_eq!(*server.requests.lock().unwrap(), vec!["start:"]);
+    assert!(!server
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|v| v.starts_with("delete:")));
     server.release.add_permits(1);
     tokio::time::timeout(Duration::from_secs(3), remove)
         .await
         .unwrap()
         .unwrap()
         .unwrap();
-    assert_eq!(
-        *server.requests.lock().unwrap(),
-        vec![
-            "start:",
-            "delete:generated-backend-id",
-            "list:generated-backend-id"
-        ]
-    );
+    assert!(!*server.running.lock().unwrap());
+    assert!(server
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|v| v == &format!("delete:{}", *server.backend_id.lock().unwrap())));
 }
 
 #[tokio::test]
@@ -598,7 +864,7 @@ async fn settled_start_errors_release_resources_after_confirmed_cleanup() {
                     .lock()
                     .unwrap()
                     .iter()
-                    .any(|x| x == "delete:generated-backend-id"));
+                    .any(|x| x == &format!("delete:{}", *server.backend_id.lock().unwrap())));
             }
         }
     }
@@ -615,10 +881,8 @@ async fn failed_start_releases_absent_backend_without_repeating_start() {
     assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
     adapter.remove("i-1").await.unwrap();
     assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
-    assert_eq!(
-        *server.requests.lock().unwrap(),
-        vec!["start:", "list:", "list:"]
-    );
+    assert_eq!(server.starts.lock().unwrap().len(), 1);
+    assert!(!*server.running.lock().unwrap());
 }
 
 #[tokio::test]
@@ -642,7 +906,7 @@ async fn late_backend_of_failed_start_is_deleted_not_adopted() {
         .lock()
         .unwrap()
         .iter()
-        .any(|s| s == "delete:generated-backend-id"));
+        .any(|s| s == &format!("delete:{}", *server.backend_id.lock().unwrap())));
 }
 
 #[derive(Default)]
@@ -797,15 +1061,13 @@ async fn transport_failure_can_clean_an_execution_discovered_by_labels() {
 
     adapter.remove("i-1").await.unwrap();
 
-    assert_eq!(
-        *server.requests.lock().unwrap(),
-        vec![
-            "start:",
-            "list:",
-            "delete:generated-backend-id",
-            "list:generated-backend-id",
-        ]
-    );
+    assert!(server
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|v| v == &format!("delete:{}", *server.backend_id.lock().unwrap())));
+    assert_eq!(server.starts.lock().unwrap().len(), 1);
     assert!(!*server.running.lock().unwrap());
 }
 
@@ -920,7 +1182,10 @@ async fn restart_recovers_generated_backend_id_from_labels() {
     drop(adapter);
     let restored = Sandboxd::connect(
         harness._directory.path().join("rpc.sock"),
-        Config::default(),
+        Config {
+            node_id: "n".into(),
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
@@ -977,6 +1242,7 @@ async fn daemon_reconnect_adopts_preserved_runtime_without_second_start() {
     let reconnected = connect_when_ready(
         socket,
         Config {
+            node_id: "n".into(),
             rpc_timeout: Duration::from_millis(100),
             ..Default::default()
         },
@@ -1010,7 +1276,10 @@ async fn cleanup_after_restart_finds_uncommitted_runtime_by_labels() {
     adapter.start(&spec(), "i-1", 1, &[]).await.unwrap();
     let restored = Sandboxd::connect(
         harness._directory.path().join("rpc.sock"),
-        Config::default(),
+        Config {
+            node_id: "n".into(),
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
@@ -1044,7 +1313,8 @@ async fn checkpoint_uses_physical_id_and_restore_generates_new_backend_id_with_f
     assert!(adapter.is_running("i-1-r5").await.unwrap());
     let requests = starts.lock().unwrap();
     assert_eq!(requests.len(), 2);
-    assert!(requests.iter().all(|r| r.sandbox_id.is_empty()));
+    assert!(requests.iter().all(|r| !r.sandbox_id.is_empty()));
+    assert_ne!(requests[0].sandbox_id, requests[1].sandbox_id);
     assert_eq!(
         requests[0].envs["ADX_CHECKPOINT_HANDOFF_FILE"],
         "/run/backend/checkpoint"
@@ -1072,6 +1342,7 @@ async fn node_startup_waits_when_sandboxd_socket_appears_late() {
     let waiting = tokio::spawn(connect_when_ready(
         socket.clone(),
         Config {
+            node_id: "n".into(),
             rpc_timeout: Duration::from_millis(50),
             ..Default::default()
         },
@@ -1348,7 +1619,7 @@ async fn exited_backend_uses_wait_reason_before_deletion_and_not_exit_code_alone
             .lock()
             .unwrap()
             .iter()
-            .any(|v| v == "wait:generated-backend-id"));
+            .any(|v| v == &format!("wait:{}", *server.backend_id.lock().unwrap())));
     }
 }
 
@@ -1454,4 +1725,338 @@ async fn controller_cold_preparation_uses_total_create_budget_then_readiness_bud
     );
     assert_eq!(server.starts.lock().unwrap().len(), 1);
     environment.delete().await.unwrap();
+}
+
+fn volume_attachment() -> adx_core::shared_volume_attachments::SharedVolumeAttachment {
+    use adx_core::shared_volumes::{SharedVolumeAccess, SharedVolumeId, SharedVolumeSubpath};
+    let reader = protected_reader();
+    adx_core::shared_volume_attachments::SharedVolumeAttachment {
+        volume_id: SharedVolumeId::parse("00000000-0000-4000-8000-000000000001").unwrap(),
+        subpath: SharedVolumeSubpath::default(),
+        target: "/shared".into(),
+        access: SharedVolumeAccess::ReadWrite,
+        tenant_id: "tenant".into(),
+        node_id: reader.node_id,
+        identity: reader.identity,
+    }
+}
+
+#[tokio::test]
+async fn volume_stop_fences_a_late_start_across_adapter_restart() {
+    let server = Server::default();
+    let (adapter, _a) = connect(server.clone()).await;
+    let attachment = volume_attachment();
+    let receipts = adapter
+        .retire_shared_volume_attachments(std::slice::from_ref(&attachment))
+        .await
+        .unwrap();
+    assert_eq!(receipts[0].attachment, attachment);
+    let (restarted, _b) = connect(server.clone()).await;
+    assert!(restarted.start(&spec(), "i-1", 1, &[]).await.is_err());
+    assert!(server.starts.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn volume_retirement_binds_the_actual_backend_resource_generation() {
+    let server = Server::default();
+    let (adapter, _a) = connect(server.clone()).await;
+    adapter.start(&spec(), "i-1", 1, &[]).await.unwrap();
+    let receipt = adapter
+        .retire_shared_volume_attachments(&[volume_attachment()])
+        .await
+        .unwrap()
+        .remove(0);
+    let proof: serde_json::Value = serde_json::from_str(&receipt.backend_receipt).unwrap();
+    assert_eq!(
+        proof["protocol"],
+        "adx-shared-volume-execution-retirement/v1"
+    );
+    assert_eq!(proof["node_id"], "n");
+    assert_eq!(proof["identity"]["runtime_id"], "i-1");
+    for field in [
+        "operation_id",
+        "sandbox_id",
+        "resource_generation",
+        "retirement_receipt",
+    ] {
+        assert!(!proof[field].as_str().unwrap().is_empty(), "{field}");
+    }
+    assert!(!*server.running.lock().unwrap());
+}
+
+#[tokio::test]
+async fn volume_retirement_rejects_foreign_node_without_a_backend_call() {
+    let server = Server::default();
+    let (adapter, _a) = connect(server.clone()).await;
+    let mut attachment = volume_attachment();
+    attachment.node_id = "other-node".into();
+    assert!(adapter
+        .retire_shared_volume_attachments(&[attachment])
+        .await
+        .is_err());
+    assert!(server.operations.lock().unwrap().is_empty());
+}
+
+fn protected_reader() -> adx_core::CheckpointReader {
+    adx_core::CheckpointReader {
+        node_id: "n".into(),
+        identity: adx_core::runtime::RuntimeIdentity {
+            environment_id: "i".into(),
+            runtime_id: "i-1".into(),
+            ownership_generation: 1,
+        },
+        checkpoint: adx_core::RestorePoint {
+            origin: None,
+            id: "test-checkpoint".into(),
+            artifact: adx_core::CheckpointArtifact {
+                storage: "shared_fs".into(),
+                location: "/test/checkpoint".into(),
+                size_bytes: 5,
+            },
+            expires_at_unix_seconds: None,
+            source_runtime_id: "i-1".into(),
+        },
+    }
+}
+
+#[tokio::test]
+async fn restarted_adapter_cannot_confirm_retirement_before_old_start_settles() {
+    let server = Server {
+        release: Arc::new(Semaphore::new(0)),
+        ..Default::default()
+    };
+    let (original, _a) = connect(server.clone()).await;
+    let starting = {
+        let original = original.clone();
+        tokio::spawn(async move { original.start(&spec(), "i-1", 1, &[]).await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), server.entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let (restarted, _b) = connect(server.clone()).await;
+    let mut retiring = tokio::spawn(async move { restarted.remove("i-1").await });
+    let early = tokio::time::timeout(Duration::from_millis(100), &mut retiring).await;
+    let early_success = matches!(early, Ok(Ok(Ok(()))));
+    server.release.add_permits(1);
+    let _ = tokio::time::timeout(Duration::from_secs(5), starting)
+        .await
+        .unwrap()
+        .unwrap();
+    if early.is_err() {
+        retiring.await.unwrap().unwrap();
+    }
+    original.remove("i-1").await.unwrap();
+    assert!(
+        !*server.running.lock().unwrap(),
+        "fixture cleanup must complete before assertion"
+    );
+    assert!(
+        !early_success,
+        "fresh adapter acknowledged while the admitted executor was still blocked"
+    );
+}
+
+#[tokio::test]
+async fn retirement_before_admission_fences_a_late_start_after_adapter_restart() {
+    let server = Server::default();
+    let (retiring, _a) = connect(server.clone()).await;
+    retiring.remove("i-1").await.unwrap();
+    let (late, _b) = connect(server.clone()).await;
+    assert!(late.start(&spec(), "i-1", 1, &[]).await.is_err());
+    assert!(server.starts.lock().unwrap().is_empty());
+    assert!(!*server.running.lock().unwrap());
+}
+
+#[tokio::test]
+async fn reader_retirement_rejects_foreign_node_before_backend_rpc() {
+    let server = Server::default();
+    let (adapter, _a) = connect(server.clone()).await;
+    let mut reader = protected_reader();
+    reader.node_id = "other-node".into();
+    assert!(adapter.retire_checkpoint_reader(&reader).await.is_err());
+    assert!(server.operations.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn reader_retirement_returns_the_exact_reserved_reader_and_backend_binding() {
+    let server = Server::default();
+    let (adapter, _a) = connect(server.clone()).await;
+    adapter.start(&spec(), "i-1", 1, &[]).await.unwrap();
+    let reader = protected_reader();
+    let receipt = adapter.retire_checkpoint_reader(&reader).await.unwrap();
+    assert_eq!(receipt.reader, reader);
+    let binding: serde_json::Value = serde_json::from_str(&receipt.backend_receipt).unwrap();
+    assert_eq!(binding["node_id"], "n");
+    assert_eq!(binding["reader"]["identity"]["runtime_id"], "i-1");
+    assert!(!binding["retirement_receipt"].as_str().unwrap().is_empty());
+    assert!(!*server.running.lock().unwrap());
+}
+
+#[tokio::test]
+async fn old_protocol_refusal_cannot_turn_empty_inventory_into_cleanup_proof() {
+    let server = Server {
+        reject_protocol: true,
+        ..Default::default()
+    };
+    let (adapter, _a) = connect(server.clone()).await;
+    assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
+    assert!(adapter.remove("i-1").await.is_err());
+    assert!(adapter
+        .retire_checkpoint_reader(&protected_reader())
+        .await
+        .is_err());
+    assert!(server.starts.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn mismatched_retirement_receipt_is_not_positive_exit_proof() {
+    let server = Server {
+        bad_receipt: true,
+        ..Default::default()
+    };
+    let (adapter, _a) = connect(server.clone()).await;
+    assert!(adapter
+        .retire_checkpoint_reader(&protected_reader())
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn mismatched_checkpoint_identity_never_reaches_start_admission() {
+    let server = Server {
+        bad_identity: true,
+        ..Default::default()
+    };
+    let (adapter, _a) = connect(server.clone()).await;
+    let directory = tempfile::tempdir().unwrap();
+    assert!(adapter
+        .restore(&spec(), "i-1", 1, &[], directory.path())
+        .await
+        .is_err());
+    assert!(server.operations.lock().unwrap().is_empty());
+    assert!(server.starts.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn running_operation_status_is_queried_until_terminal_outcome() {
+    let server = Server {
+        pending_reply: true,
+        release: Arc::new(Semaphore::new(0)),
+        ..Default::default()
+    };
+    let (adapter, _a) = connect(server.clone()).await;
+    let starting = {
+        let adapter = adapter.clone();
+        tokio::spawn(async move { adapter.start(&spec(), "i-1", 1, &[]).await })
+    };
+    server.entered.acquire().await.unwrap().forget();
+    assert!(!starting.is_finished());
+    server.release.add_permits(1);
+    starting.await.unwrap().unwrap();
+    assert!(server
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|v| v.starts_with("get:")));
+    adapter.remove("i-1").await.unwrap();
+}
+
+#[tokio::test]
+async fn unknown_start_outcome_never_releases_a_reader_from_empty_observation() {
+    let server = Server {
+        unknown_outcome: true,
+        ..Default::default()
+    };
+    let (adapter, _a) = connect(server.clone()).await;
+    assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
+    assert!(adapter.remove("i-1").await.is_err());
+    assert!(adapter
+        .retire_checkpoint_reader(&protected_reader())
+        .await
+        .is_err());
+    assert!(*server.running.lock().unwrap());
+    assert!(server
+        .operations
+        .lock()
+        .unwrap()
+        .values()
+        .all(|op| op.status.retirement_requested && !op.status.retirement_complete));
+    // Owned in-memory fixture only; do not manufacture a successful receipt.
+    *server.running.lock().unwrap() = false;
+}
+
+#[tokio::test]
+async fn historical_success_does_not_adopt_an_exited_backend_or_repeat_execution() {
+    let server = Server::default();
+    let (original, _a) = connect(server.clone()).await;
+    original.start(&spec(), "i-1", 1, &[]).await.unwrap();
+    // Identical replay must first succeed, proving request equality rather
+    // than accidentally testing different fixture log-directory parameters.
+    original.start(&spec(), "i-1", 1, &[]).await.unwrap();
+    assert_eq!(server.starts.lock().unwrap().len(), 1);
+    *server.running.lock().unwrap() = false;
+    assert!(original.start(&spec(), "i-1", 1, &[]).await.is_err());
+    assert_eq!(server.starts.lock().unwrap().len(), 1);
+    original.remove("i-1").await.unwrap();
+}
+
+#[tokio::test]
+async fn checkpoint_identity_validation_errors_are_permanent_before_start_admission() {
+    for code in [
+        tonic::Code::InvalidArgument,
+        tonic::Code::FailedPrecondition,
+        tonic::Code::Unavailable,
+        tonic::Code::DeadlineExceeded,
+        tonic::Code::Unknown,
+    ] {
+        let server = Server {
+            identity_error: Some(code),
+            ..Default::default()
+        };
+        let (adapter, _guard) = connect(server.clone()).await;
+        let directory = tempfile::tempdir().unwrap();
+        let error = adapter
+            .restore(&spec(), "i-1", 1, &[], directory.path())
+            .await
+            .unwrap_err();
+        if matches!(
+            code,
+            tonic::Code::InvalidArgument | tonic::Code::FailedPrecondition
+        ) {
+            assert!(
+                matches!(error, adx_core::Error::Invalid(_)),
+                "{code:?} lost its permanent classification: {error:?}"
+            );
+        } else {
+            assert!(
+                matches!(error, adx_core::Error::Unavailable(_)),
+                "{code:?} must remain retryable: {error:?}"
+            );
+        }
+        assert!(server.starts.lock().unwrap().is_empty());
+        assert!(server.operations.lock().unwrap().is_empty());
+        assert_eq!(
+            server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.starts_with("describe:"))
+                .count(),
+            1
+        );
+        adapter
+            .retire_checkpoint_reader(&protected_reader())
+            .await
+            .unwrap();
+        assert!(server
+            .operations
+            .lock()
+            .unwrap()
+            .values()
+            .all(|operation| operation.status.retirement_complete));
+    }
 }

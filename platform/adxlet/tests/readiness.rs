@@ -42,6 +42,7 @@ impl RuntimeDriver for Runtime {
 }
 fn record() -> EnvironmentRecord {
     EnvironmentRecord {
+        checkpoint_readers: Default::default(),
         failure: None,
         restart_attempts: 0,
         restart_pending: false,
@@ -251,4 +252,44 @@ async fn probe_observation_uses_http_when_control_stream_is_disconnected() {
         checker.wait_ready(&record).await,
         Err(adx_core::Error::ProbeFailed(_))
     ));
+}
+
+#[tokio::test]
+async fn readiness_timeout_preserves_the_last_malformed_response_error() {
+    let backend = runtime(true);
+    let (port, _server, requests) = serve(r#"{"status":"starting"}"#, None).await;
+    let error = checker(backend.clone(), port)
+        .wait_ready(&record())
+        .await
+        .unwrap_err();
+    let message = error.to_string();
+    assert!(matches!(error, adx_core::Error::Unavailable(_)));
+    assert!(message.contains("deadline exceeded"), "{message}");
+    assert!(message.contains("last probe error"), "{message}");
+    assert!(message.contains("missing field"), "{message}");
+    assert!(requests.load(Ordering::SeqCst) > 1);
+    assert_eq!(backend.checks.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn readiness_timeout_preserves_identity_conflict_without_accepting_it() {
+    let backend = runtime(true);
+    let (port, _server, requests) = serve(
+        r#"{"identity":{"environment_id":"i","runtime_id":"i-9","ownership_generation":1},"revision":1,"phase":"running","checkpoint":null,"active_requests":0,"active_commands":0}"#,
+        None,
+    )
+    .await;
+    let error = checker(backend.clone(), port)
+        .wait_ready(&record())
+        .await
+        .unwrap_err();
+    let message = error.to_string();
+    assert!(matches!(error, adx_core::Error::Unavailable(_)));
+    assert!(message.contains("last probe error"), "{message}");
+    assert!(
+        message.contains(&adx_core::Error::Conflict.to_string()),
+        "{message}"
+    );
+    assert!(requests.load(Ordering::SeqCst) > 1);
+    assert_eq!(backend.checks.load(Ordering::SeqCst), 0);
 }

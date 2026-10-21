@@ -1,5 +1,9 @@
 //! Generated transport contracts and validated conversions, without services.
+mod checkpoint_readers;
+mod reader_retirement;
 mod runtime_profile;
+mod shared_volume_execution;
+mod shared_volumes;
 mod snapshots;
 pub mod control {
     tonic::include_proto!("adx.control.v1");
@@ -210,7 +214,12 @@ impl TryFrom<control::EnvironmentRecord> for adx_core::EnvironmentRecord {
                     .map_err(|_| Error::Invalid("invalid runtime IP".into()))?,
             )
         };
-        Ok(Self {
+        let record = Self {
+            checkpoint_readers: v
+                .checkpoint_readers
+                .map(TryInto::try_into)
+                .transpose()?
+                .unwrap_or_default(),
             spec,
             assignment,
             state,
@@ -225,12 +234,15 @@ impl TryFrom<control::EnvironmentRecord> for adx_core::EnvironmentRecord {
             checkpoint: v.checkpoint.map(TryInto::try_into).transpose()?,
             last_operation: v.last_operation.map(TryInto::try_into).transpose()?,
             failure: v.failure.map(TryInto::try_into).transpose()?,
-        })
+        };
+        record.validate_checkpoint_readers()?;
+        Ok(record)
     }
 }
 impl TryFrom<adx_core::EnvironmentRecord> for control::EnvironmentRecord {
     type Error = Error;
     fn try_from(v: adx_core::EnvironmentRecord) -> Result<Self> {
+        v.validate_checkpoint_readers()?;
         let state = match v.state {
             adx_core::EnvironmentState::Pending => control::EnvironmentState::Pending,
             adx_core::EnvironmentState::Starting => control::EnvironmentState::Starting,
@@ -243,6 +255,7 @@ impl TryFrom<adx_core::EnvironmentRecord> for control::EnvironmentRecord {
             adx_core::EnvironmentState::Failed => control::EnvironmentState::Failed,
         };
         Ok(Self {
+            checkpoint_readers: Some(v.checkpoint_readers.into()),
             spec: Some(v.spec.into()),
             assignment: Some(v.assignment.try_into()?),
             state: state as i32,

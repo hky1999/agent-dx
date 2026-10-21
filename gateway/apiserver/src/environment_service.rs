@@ -558,6 +558,12 @@ fn matches_spec(want: &pb::EnvironmentSpec, got: &pb::EnvironmentSpec) -> bool {
             .env
             .iter()
             .all(|(key, value)| got.env.get(key) == Some(value))
+        && want.execution.as_ref().is_none_or(|want_execution| {
+            want_execution.shared_volumes.is_empty()
+                || got.execution.as_ref().is_some_and(|got_execution| {
+                    want_execution.shared_volumes == got_execution.shared_volumes
+                })
+        })
         && want.priority == got.priority
         && want.lifecycle == got.lifecycle
 }
@@ -798,5 +804,69 @@ mod tests {
             map_create_owner_error(Status::unavailable("directory unavailable")).code(),
             Code::Unavailable
         );
+    }
+}
+
+#[cfg(test)]
+mod snapshot_shared_volume58_tests {
+    use super::*;
+    use adx_core::shared_volumes::{
+        SharedVolumeAccess, SharedVolumeId, SharedVolumeMount, SharedVolumeSubpath,
+    };
+
+    fn mount() -> SharedVolumeMount {
+        SharedVolumeMount {
+            volume_id: SharedVolumeId::parse("00000000-0000-4000-8000-000000000001").unwrap(),
+            subpath: SharedVolumeSubpath::parse("project").unwrap(),
+            target: "/shared".into(),
+            access: SharedVolumeAccess::ReadWrite,
+        }
+    }
+
+    fn spec(mounts: Vec<SharedVolumeMount>) -> pb::EnvironmentSpec {
+        pb::EnvironmentSpec {
+            id: "snapshot58-replay".into(),
+            tenant_id: "tenant".into(),
+            snapshot_id: Some("snapshot58-source".into()),
+            image: "image".into(),
+            runtime_class: "runsc".into(),
+            execution: Some(
+                adx_core::execution::ExecutionOptions {
+                    shared_volumes: mounts,
+                    ..Default::default()
+                }
+                .into(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn snapshot_shared_volume58_replay_accepts_default_and_identical_mounts() {
+        let got = spec(vec![mount()]);
+        assert!(matches_spec(&spec(vec![]), &got));
+        assert!(matches_spec(&got, &got));
+    }
+
+    #[test]
+    fn snapshot_shared_volume58_replay_rejects_explicit_mount_changes() {
+        let got = spec(vec![mount()]);
+        for field in ["volume", "subpath", "target", "access"] {
+            let mut changed = mount();
+            match field {
+                "volume" => {
+                    changed.volume_id =
+                        SharedVolumeId::parse("00000000-0000-4000-8000-000000000002").unwrap()
+                }
+                "subpath" => changed.subpath = SharedVolumeSubpath::parse("other").unwrap(),
+                "target" => changed.target = "/other".into(),
+                "access" => changed.access = SharedVolumeAccess::ReadOnly,
+                _ => unreachable!(),
+            }
+            assert!(
+                !matches_spec(&spec(vec![changed]), &got),
+                "snapshot replay accepted explicit shared-volume {field} mismatch"
+            );
+        }
     }
 }

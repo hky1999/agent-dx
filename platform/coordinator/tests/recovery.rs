@@ -79,6 +79,8 @@ fn saved() -> StoredSnapshot {
         environments: [(
             "i".into(),
             StoredEnvironment {
+                reader_reservations: Vec::new(),
+                reader_retirements: Vec::new(),
                 resume: None,
                 failed_since_unix_seconds: None,
                 recovery: None,

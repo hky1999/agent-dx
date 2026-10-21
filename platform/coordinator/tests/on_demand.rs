@@ -68,9 +68,30 @@ struct Backend {
     restore_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
     restore_entered: tokio::sync::Notify,
     fail_after_gate: AtomicBool,
+    reject_restore_not_found: AtomicBool,
+    uncertain_reader_retirement: AtomicBool,
+    transient_restore_failures: AtomicUsize,
 }
 #[async_trait]
 impl RuntimeDriver for Backend {
+    async fn retire_checkpoint_reader(
+        &self,
+        reader: &adx_core::CheckpointReader,
+    ) -> Result<adx_core::CheckpointReaderRetirement> {
+        if self.uncertain_reader_retirement.load(Ordering::SeqCst) {
+            return Err(adx_core::Error::Unavailable(
+                "test stop proof unavailable".into(),
+            ));
+        }
+        self.remove(&reader.identity.runtime_id).await?;
+        Ok(adx_core::CheckpointReaderRetirement {
+            reader: reader.clone(),
+            backend_receipt: format!(
+                "test-stopped:{}:{}",
+                reader.identity.ownership_generation, reader.identity.runtime_id
+            ),
+        })
+    }
     async fn inventory(&self) -> Result<Vec<adxlet::RuntimeObservation>> {
         Ok(self.running.lock().unwrap().values().cloned().collect())
     }
@@ -127,7 +148,16 @@ impl RuntimeDriver for Backend {
         if let Some(gate) = gate {
             gate.notified().await;
         }
-        if self.fail_after_gate.load(Ordering::SeqCst) {
+        if self.reject_restore_not_found.load(Ordering::SeqCst) {
+            return Err(adx_core::Error::NotFound);
+        }
+        let transient_failure = self
+            .transient_restore_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok();
+        if self.fail_after_gate.load(Ordering::SeqCst) || transient_failure {
             return Err(adx_core::Error::Unavailable(
                 "node process terminated during restore".into(),
             ));
@@ -880,6 +910,84 @@ async fn all_nodes_reject_capacity_without_repeated_assignment_churn() {
 
 #[tokio::test]
 #[ignore = "requires dedicated real Redis"]
+async fn repeated_ambiguous_resume_errors_back_off_and_keep_owner() {
+    let rig = Rig::new(Duration::from_millis(100)).await;
+    let original = rig.session.get("sleep").await.unwrap();
+    let original_location = original
+        .result
+        .unwrap()
+        .checkpoint
+        .unwrap()
+        .artifact
+        .location;
+    rig.source
+        .backend
+        .fail_after_gate
+        .store(true, Ordering::SeqCst);
+    let started = tokio::time::Instant::now();
+    let error = pb::coordinator_service_client::CoordinatorServiceClient::new(
+        channel(&rig.address, Principal::ApiServer).await,
+    )
+    .ensure_running(pb::EnsureRunningRequest {
+        expected_runtime_id: "sleep-1".into(),
+        environment_id: "sleep".into(),
+        caller: caller(),
+        timeout_seconds: 1,
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let attempts = rig.source.backend.restored.load(Ordering::SeqCst);
+    assert!(
+        (1..=6).contains(&attempts),
+        "ambiguous failures must back off within the request budget, got {attempts} attempts"
+    );
+    let pending = rig.session.get("sleep").await.unwrap();
+    assert_eq!(pending.assignment.node_id, "a");
+    assert!(!pending.invalidated);
+    assert!(!pending.resume.as_ref().unwrap().local_rejected);
+    assert_eq!(
+        pending
+            .result
+            .unwrap()
+            .checkpoint
+            .unwrap()
+            .artifact
+            .location,
+        original_location
+    );
+    assert_eq!(rig.target.backend.restored.load(Ordering::SeqCst), 0);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !rig.source.backend.running.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn retry_backoff_still_restores_after_transient_owner_errors() {
+    let rig = Rig::new(Duration::from_millis(100)).await;
+    rig.source
+        .backend
+        .transient_restore_failures
+        .store(2, Ordering::SeqCst);
+    let restored = rig.resume(false).await.unwrap().record.unwrap();
+    assert_eq!(restored.state, pb::EnvironmentState::Running as i32);
+    assert_eq!(restored.assignment.unwrap().node_id, "a");
+    assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 3);
+    assert_eq!(rig.source.backend.running.lock().unwrap().len(), 1);
+    assert_eq!(rig.target.backend.restored.load(Ordering::SeqCst), 0);
+    let committed = rig.session.get("sleep").await.unwrap();
+    assert!(committed.resume.is_none());
+    assert!(committed.result.unwrap().checkpoint.is_some());
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
 async fn transient_owner_rpc_deadline_waits_within_the_resume_budget() {
     let rig = Arc::new(Rig::new(Duration::from_millis(150)).await);
     let gate = Arc::new(tokio::sync::Notify::new());
@@ -1069,13 +1177,19 @@ async fn coordinator_restart_reconciles_the_durable_wake_without_new_identity() 
 #[tokio::test]
 #[ignore = "requires dedicated real Redis"]
 async fn coordinator_restart_during_uncommitted_restore_cleans_then_retries() {
-    coordinator_restart_uncommitted_restore(false).await;
+    coordinator_restart_uncommitted_restore(false, false).await;
 }
 
 #[tokio::test]
 #[ignore = "requires dedicated real Redis"]
 async fn coordinator_restart_reconciles_uncommitted_restore_with_real_versioned_relay() {
-    coordinator_restart_uncommitted_restore(true).await;
+    coordinator_restart_uncommitted_restore(true, false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn coordinator_restart_keeps_uncommitted_reader_when_stop_proof_is_unavailable() {
+    coordinator_restart_uncommitted_restore(false, true).await;
 }
 
 struct VersionedRelay {
@@ -1122,7 +1236,7 @@ impl VersionedRelay {
     }
 }
 
-async fn coordinator_restart_uncommitted_restore(versioned_routes: bool) {
+async fn coordinator_restart_uncommitted_restore(versioned_routes: bool, retirement_unknown: bool) {
     let mut rig = Rig::new(Duration::from_millis(150)).await;
     let relay = if versioned_routes {
         Some(VersionedRelay::start().await)
@@ -1150,6 +1264,12 @@ async fn coordinator_restart_uncommitted_restore(versioned_routes: bool) {
         pending.result.as_ref().unwrap().state,
         adx_core::EnvironmentState::Paused
     );
+    let uncommitted_reader = pending
+        .reader_reservations
+        .iter()
+        .find(|reader| reader.identity.runtime_id == orphan)
+        .cloned()
+        .expect("uncommitted execution must have a durable reader reservation");
     rig.server.abort();
     let _ = (&mut rig.server).await;
     rig.session = rig._redis.store().await.begin(1).await.unwrap();
@@ -1199,6 +1319,85 @@ async fn coordinator_restart_uncommitted_restore(versioned_routes: bool) {
         .sink
         .reconnect(channel(&rig.address, Principal::Node("a".into())).await);
     *rig.source.backend.restore_gate.lock().unwrap() = None;
+    if retirement_unknown {
+        use adxlet::checkpoint::CheckpointStore;
+        rig.source
+            .backend
+            .uncertain_reader_retirement
+            .store(true, Ordering::SeqCst);
+        rig.source.report.heartbeat_sequence += 1;
+        rig.source.report.reconciling = true;
+        rig.source.report.accepting_allocations = false;
+        let mut client = pb::coordinator_service_client::CoordinatorServiceClient::new(
+            channel(&rig.address, Principal::Node("a".into())).await,
+        );
+        client
+            .register_node(rig.source.report.clone())
+            .await
+            .unwrap();
+        let catalog = client
+            .inspect_node(pb::InspectNodeRequest {
+                node_id: rig.source.report.node_id.clone(),
+                session_id: rig.source.report.session_id.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let result = rig
+            .source
+            .manager
+            .reconcile(
+                catalog
+                    .records
+                    .into_iter()
+                    .map(TryInto::try_into)
+                    .collect::<Result<Vec<_>>>()
+                    .unwrap(),
+            )
+            .await;
+        assert!(matches!(result, Err(adx_core::Error::Unavailable(_))));
+        let retained = rig.session.get("sleep").await.unwrap();
+        assert_eq!(retained.assignment, pending.assignment);
+        assert_eq!(retained.result, pending.result);
+        assert_eq!(retained.resume, pending.resume);
+        assert_eq!(
+            retained.reader_reservations,
+            vec![uncommitted_reader.clone()]
+        );
+        assert!(retained.reader_retirements.is_empty());
+        assert!(retained.resources_held());
+        assert!(
+            !rig.session.snapshot().await.unwrap().nodes["a"]
+                .session
+                .as_ref()
+                .unwrap()
+                .routable
+        );
+        assert!(rig
+            .source
+            .backend
+            .running
+            .lock()
+            .unwrap()
+            .contains_key(&orphan));
+        assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 1);
+        assert_eq!(rig.target.backend.restored.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            rig.source.manager.collect_remote_orphans().await.unwrap(),
+            0
+        );
+        let checkpoint = rig
+            .source
+            .store
+            .materialize(&uncommitted_reader.checkpoint.artifact)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(checkpoint.join("memory")).unwrap(),
+            b"continued-state:42"
+        );
+        return;
+    }
     for worker in [&mut rig.source, &mut rig.target] {
         worker.report.heartbeat_sequence += 1;
         register(&rig.address, worker).await;
@@ -1210,10 +1409,23 @@ async fn coordinator_restart_uncommitted_restore(versioned_routes: bool) {
         .lock()
         .unwrap()
         .contains_key(&orphan));
+    let stopped = rig.session.get("sleep").await.unwrap();
+    assert_eq!(stopped.resume, pending.resume);
+    assert!(stopped.reader_reservations.is_empty());
+    assert!(stopped
+        .result
+        .as_ref()
+        .unwrap()
+        .checkpoint_readers
+        .reclaimable());
     assert_eq!(
-        rig.session.get("sleep").await.unwrap().resume,
-        pending.resume
+        stopped.result.as_ref().unwrap().checkpoint,
+        pending.result.as_ref().unwrap().checkpoint
     );
+    assert!(stopped
+        .reader_retirements
+        .iter()
+        .any(|receipt| receipt.reader == uncommitted_reader));
     let restored = rig.resume(false).await.unwrap().record.unwrap();
     assert_eq!(restored.assignment.unwrap().node_id, "a");
     assert_eq!(rig.source.backend.running.lock().unwrap().len(), 1);
@@ -1742,4 +1954,100 @@ async fn original_checkpoint_cache_pressure_is_definite_capacity_rejection() {
         std::fs::read(active.join("occupied")).unwrap(),
         vec![42; 1024]
     );
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn terminal_restore_rejection_finishes_demand_without_background_retry() {
+    let rig = Rig::new(Duration::from_secs(2)).await;
+    let checkpoint = rig
+        .session
+        .get("sleep")
+        .await
+        .unwrap()
+        .result
+        .unwrap()
+        .checkpoint;
+    rig.source
+        .backend
+        .reject_restore_not_found
+        .store(true, Ordering::SeqCst);
+    assert_eq!(
+        rig.resume(false).await.unwrap_err().code(),
+        tonic::Code::NotFound
+    );
+    let stopped = rig.session.get("sleep").await.unwrap();
+    let record = stopped.result.as_ref().unwrap();
+    assert_eq!(record.state, adx_core::EnvironmentState::Paused);
+    assert!(!record.resources_held);
+    assert!(record.checkpoint_readers.reclaimable());
+    assert_eq!(record.checkpoint, checkpoint);
+    assert!(
+        stopped.resume.is_none(),
+        "terminal rejection retained a background wake"
+    );
+    for _ in 0..3 {
+        assert_eq!(rig.rpc.resume_pending().await.unwrap(), 0);
+    }
+    assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 1);
+    assert_eq!(rig.target.backend.restored.load(Ordering::SeqCst), 0);
+    rig.source
+        .backend
+        .reject_restore_not_found
+        .store(false, Ordering::SeqCst);
+    let restored = rig.resume(false).await.unwrap().record.unwrap();
+    assert_eq!(restored.state, pb::EnvironmentState::Running as i32);
+    assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn uncertain_rejected_restore_keeps_reader_protection_and_blocks_retry() {
+    let rig = Rig::new(Duration::from_secs(2)).await;
+    let checkpoint = rig
+        .session
+        .get("sleep")
+        .await
+        .unwrap()
+        .result
+        .unwrap()
+        .checkpoint;
+    rig.source
+        .backend
+        .reject_restore_not_found
+        .store(true, Ordering::SeqCst);
+    rig.source
+        .backend
+        .uncertain_reader_retirement
+        .store(true, Ordering::SeqCst);
+    assert_ne!(
+        rig.resume(false).await.unwrap_err().code(),
+        tonic::Code::NotFound
+    );
+    let pending = rig.session.get("sleep").await.unwrap();
+    // Publishing Failed ends its wake in the existing commit contract. The
+    // independent reader reservation, not that wake, protects unknown execution.
+    assert!(pending.resume.is_none());
+    assert_eq!(pending.assignment.node_id, "a");
+    let record = pending.result.as_ref().unwrap();
+    assert_eq!(record.state, adx_core::EnvironmentState::Failed);
+    assert!(record.resources_held);
+    assert!(pending.resources_held());
+    assert_eq!(record.checkpoint_readers.readers.len(), 1);
+    assert_eq!(
+        pending.reader_reservations,
+        record.checkpoint_readers.readers
+    );
+    assert!(!record.checkpoint_readers.reclaimable());
+    assert_eq!(record.checkpoint, checkpoint);
+    assert_eq!(rig.source.backend.running.lock().unwrap().len(), 1);
+    let restored = rig.source.backend.restored.load(Ordering::SeqCst);
+    for _ in 0..3 {
+        assert_eq!(rig.rpc.resume_pending().await.unwrap(), 0);
+    }
+    assert!(rig.resume(false).await.is_err());
+    assert_eq!(rig.session.get("sleep").await.unwrap(), pending);
+    assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), restored);
+    assert_eq!(rig.source.backend.running.lock().unwrap().len(), 1);
+    assert_eq!(rig.target.backend.restored.load(Ordering::SeqCst), 0);
 }

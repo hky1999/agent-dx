@@ -57,6 +57,11 @@ struct Config {
     checkpoint_storage: Option<adxlet::checkpoint::StorageConfig>,
     #[serde(default)]
     degradation_journal: Option<PathBuf>,
+    /// Opt in to durable shared-volume lifetime, not filesystem mount support.
+    #[serde(default)]
+    shared_volume_lifecycle: bool,
+    #[serde(default)]
+    shared_volume_mounts: Option<adxlet::sandboxd::SharedVolumeMountConfig>,
     #[serde(default)]
     checkpoint_gc: adxlet::checkpoint::RemoteGcConfig,
     report_interval_seconds: u64,
@@ -266,6 +271,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .transpose()?;
     let runtime_config = RuntimeConfig {
+        // Shared filesystem configuration is deployment-owned, never a caller path.
+        node_id: config.node_id.clone(),
         runtime_profile: config.runtime_profile,
         command: config.execd_command,
         env,
@@ -273,7 +280,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rpc_timeout: timeout,
         runtime_logs: Some(config.runtime_logs.clone()),
     };
-    let runtime = Arc::new(tokio::select! {
+    if config.shared_volume_mounts.is_some() && !config.shared_volume_lifecycle {
+        return Err("shared volume mounts require durable lifetime protection".into());
+    }
+    let shared_volume_storage_id = config
+        .shared_volume_mounts
+        .as_ref()
+        .map(|v| v.storage_id.clone());
+    let runtime = tokio::select! {
         result = connect_when_ready(
             config.sandboxd_socket,
             runtime_config,
@@ -281,6 +295,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Duration::from_secs(config.report_interval_seconds),
         ) => result?,
         _ = shutdown() => return Ok(()),
+    };
+    let runtime = Arc::new(match config.shared_volume_mounts {
+        Some(mounts) => runtime.with_shared_volume_mounts(mounts)?,
+        None => runtime,
     });
     // The sandboxd network plugin may create the configured bridge during
     // initialization. Bind only after backend readiness, before admitting work.
@@ -313,6 +331,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .with_runtime_control(control.clone())?
     .with_operation_timeout(timeout)?
+    .with_shared_volume_lifecycle(config.shared_volume_lifecycle)?
     .with_health_check(config.execd_health_failure_threshold)?;
     let checkpoint_storage = match (config.checkpoint_dir, config.checkpoint_storage) {
         (Some(root), None) => Some(adxlet::checkpoint::StorageConfig::Local { root }),
@@ -362,6 +381,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     let mut labels = config.labels;
+    if let Some(id) = shared_volume_storage_id {
+        labels.insert("ADX_SHARED_VOLUME_STORAGE".into(), id);
+    }
     if let Some(alias) = manager.checkpoint_storage_alias() {
         labels.insert("ADX_CHECKPOINT_STORAGE".into(), alias.into());
     }
@@ -547,7 +569,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     adx_core::RestorePoint::try_from(cp).map(|cp| cp.artifact)
                                 })
                                 .collect::<adx_core::Result<Vec<_>>>()?;
-                            let recovery = manager.reconcile_retained(records, snapshots, retained);
+                            let recovery = manager.reconcile_retained_catalog(records, snapshots, retained, catalog.retained_checkpoints_complete);
                             tokio::pin!(recovery);
                             // Large catalogs must not expire a healthy node while
                             // the serial controllers restore bindings and commit results.

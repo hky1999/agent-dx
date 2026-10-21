@@ -5,6 +5,7 @@ impl Session {
     pub async fn retire_dormant(&self, expected: &StoredEnvironment) -> Result<EnvironmentRecord> {
         let stored = self.get(&expected.spec.id).await?;
         if stored != *expected
+            || !stored.reader_reservations.is_empty()
             || !stored.invalidated
             || stored.resources_held()
             || stored
@@ -70,6 +71,62 @@ impl Session {
             }
         }
         Err(Error::Unavailable("resume demand contention".into()))
+    }
+
+    /// Finish one definitively rejected demand, never an unconfirmed execution.
+    /// The owner's newer published rollback must already retain the checkpoint
+    /// without capacity or reader dependencies. CAS fences delayed completions
+    /// against a different owner, a new demand, and a new Coordinator epoch.
+    pub async fn finish_rejected_resume(
+        &self,
+        assignment: &Assignment,
+        operation_id: &str,
+        expected_revision: u64,
+    ) -> Result<StoredEnvironment> {
+        let field = format!("environment:{}", assignment.environment_id);
+        for _ in 0..ATTEMPTS {
+            let [header_value, value] = self.store.fields([HEADER.into(), field.clone()]).await?;
+            let mut header = self.header(&header_value)?;
+            let mut stored: StoredEnvironment = decode(value.as_deref().ok_or(Error::NotFound)?)?;
+            stored.validate()?;
+            let record = stored.result.as_ref().ok_or(Error::Conflict)?;
+            if stored.assignment != *assignment
+                || stored.invalidated
+                || stored
+                    .recovery
+                    .as_ref()
+                    .is_some_and(|recovery| recovery.pending)
+                || stored.resume.as_ref().is_some_and(|intent| {
+                    intent.operation_id != operation_id || intent.local_rejected
+                })
+                || record.state != EnvironmentState::Paused
+                || record.revision <= expected_revision
+                || record.resources_held
+                || !stored.reader_reservations.is_empty()
+                || !record.checkpoint_readers.reclaimable()
+            {
+                return Err(Error::Conflict);
+            }
+            if stored.resume.is_none() {
+                return Ok(stored);
+            }
+            stored.resume = None;
+            header.advance()?;
+            if self
+                .store
+                .cas(
+                    header_value.as_deref().ok_or(Error::Conflict)?,
+                    &header,
+                    Some((&field, encode(&stored)?)),
+                )
+                .await?
+            {
+                return Ok(stored);
+            }
+        }
+        Err(Error::Unavailable(
+            "resume rejection completion contention".into(),
+        ))
     }
 
     /// Only call after the node returned NoCapacity before invoking restore.
