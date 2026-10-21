@@ -26,8 +26,8 @@ pub struct StoredMemoryOperation {
     pub unchanged: bool,
 }
 
-/// The last settled physical state and every operation belonging to that runtime.
-/// Completed requests remain replayable until physical retirement clears the account.
+/// The last settled physical state, pending grant, bounded replay window and
+/// durable closure floor. A forgotten ID cannot bind a new physical source.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoredMemory {
@@ -36,8 +36,23 @@ pub struct StoredMemory {
     pub confirmed: MemoryObservation,
     pub pending: Option<StoredMemoryOperation>,
     pub completed: BTreeMap<String, StoredMemoryOperation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_source_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub latest_completed_issued_unix_millis: u64,
 }
 
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+fn canonical_operation_id(epoch: u64, source: &MemoryObservation) -> Result<String> {
+    Ok(format!(
+        "memory-{}-{}-{:x}",
+        epoch,
+        source.resource_revision,
+        Sha256::digest(encode(source)?.as_bytes())
+    ))
+}
 fn fingerprint(request: &MemoryRequest) -> Result<String> {
     Ok(format!("{:x}", Sha256::digest(encode(request)?.as_bytes())))
 }
@@ -76,8 +91,47 @@ impl StoredMemoryOperation {
 }
 
 impl StoredMemory {
+    fn compact_history(&mut self) -> Result<()> {
+        const COMPLETED_HISTORY_LIMIT: usize = 64;
+        if self.closed_source_revision.is_some() || self.completed.len() > COMPLETED_HISTORY_LIMIT {
+            self.latest_completed_issued_unix_millis =
+                self.latest_completed_issued_unix_millis.max(
+                    self.completed
+                        .values()
+                        .map(|op| op.authorization.issued_unix_millis)
+                        .max()
+                        .unwrap_or(0),
+                );
+        }
+        while self.completed.len() > COMPLETED_HISTORY_LIMIT {
+            let (id, source) = self
+                .completed
+                .iter()
+                .min_by_key(|(id, op)| (op.authorization.request.source.resource_revision, *id))
+                .map(|(id, op)| {
+                    (
+                        id.clone(),
+                        op.authorization.request.source.resource_revision,
+                    )
+                })
+                .ok_or(Error::Conflict)?;
+            self.completed.remove(&id).ok_or(Error::Conflict)?;
+            self.closed_source_revision = Some(
+                self.closed_source_revision
+                    .map_or(source, |old| old.max(source)),
+            );
+        }
+        Ok(())
+    }
     pub(super) fn validate(&self, environment: &StoredEnvironment) -> Result<()> {
         check_observation(environment, &self.confirmed)?;
+        if self.closed_source_revision.is_some_and(|floor| {
+            floor >= self.confirmed.resource_revision
+                || self.completed.len() > 64
+                || self.latest_completed_issued_unix_millis == 0
+        }) {
+            return Err(Error::Conflict);
+        }
         if environment.execution.as_ref().is_some_and(|e| e.pending)
             || environment.recovery.as_ref().is_some_and(|r| r.pending)
         {
@@ -235,6 +289,8 @@ impl Session {
                 confirmed: observation.clone(),
                 pending: None,
                 completed: BTreeMap::new(),
+                closed_source_revision: None,
+                latest_completed_issued_unix_millis: 0,
             });
             environment.validate()?;
             budget::check_holds(&raw, &header, Some(&environment))?;
@@ -305,6 +361,14 @@ impl Session {
                 } else {
                     Err(Error::Conflict)
                 };
+            }
+            if let Some(floor) = account.closed_source_revision {
+                if request.source.resource_revision <= floor
+                    || request.operation_id
+                        != canonical_operation_id(self.epoch(), &request.source)?
+                {
+                    return Err(Error::Conflict);
+                }
             }
             if account.pending.is_some() || account.confirmed != request.source {
                 return Err(Error::Conflict);
@@ -401,6 +465,10 @@ impl Session {
             account
                 .completed
                 .insert(grant.request.operation_id.clone(), pending);
+            account.compact_history()?;
+            if account.closed_source_revision.is_some() {
+                header.schema = header.schema.max(8)
+            }
             environment.validate()?;
             budget::check_holds(&raw, &header, Some(&environment))?;
             header.schema = header.schema.max(6);

@@ -56,6 +56,9 @@ struct Server {
     start_operations: Arc<Mutex<Vec<StartOperationRequest>>>,
     start_queries: Arc<Mutex<Vec<GetStartOperationRequest>>>,
     start_outcomes: Arc<Mutex<HashMap<String, StartOperationResponse>>>,
+    history_requests: Arc<Mutex<Vec<CollectHistoryRequest>>>,
+    lose_history_reply_once: Arc<std::sync::atomic::AtomicBool>,
+    history_batch_capacity: Arc<std::sync::atomic::AtomicUsize>,
     memory: memory_elasticity::MemoryServer,
 }
 impl Default for Server {
@@ -99,12 +102,47 @@ impl Default for Server {
             start_operations: Arc::default(),
             start_queries: Arc::default(),
             start_outcomes: Arc::default(),
+            history_requests: Arc::default(),
+            lose_history_reply_once: Arc::default(),
+            history_batch_capacity: Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)),
             memory: Default::default(),
         }
     }
 }
 #[tonic::async_trait]
 impl sandbox_service_server::SandboxService for Server {
+    async fn collect_history(
+        &self,
+        request: Request<CollectHistoryRequest>,
+    ) -> Result<Response<CollectHistoryResponse>, Status> {
+        let request = request.into_inner();
+        let ids = request
+            .candidates
+            .iter()
+            .map(|c| c.operation_id.clone())
+            .collect();
+        let oversized = request.candidates.len()
+            > self
+                .history_batch_capacity
+                .load(std::sync::atomic::Ordering::SeqCst);
+        self.history_requests.lock().unwrap().push(request);
+        if oversized {
+            return Err(Status::resource_exhausted(
+                "bounded history manifest capacity",
+            ));
+        }
+        if self
+            .lose_history_reply_once
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(Status::unavailable("processed history reply lost"));
+        }
+        Ok(Response::new(CollectHistoryResponse {
+            acknowledged_operation_ids: ids,
+            ..Default::default()
+        }))
+    }
+
     async fn pause(&self, _: Request<PauseRequest>) -> Result<Response<PauseResponse>, Status> {
         Err(Status::unimplemented("outside this lifecycle test"))
     }
@@ -2900,4 +2938,146 @@ async fn authorized_start_persists_original_deadline_for_reopened_cleanup() {
     assert_eq!(query.request_fingerprint, request.request_fingerprint);
     assert_eq!(server.starts.lock().unwrap().len(), 1);
     assert!(!*server.running.lock().unwrap());
+}
+
+#[tokio::test]
+async fn reclaimed_terminal_history_survives_lost_ack_and_catalog_reconciliation() {
+    use adx_core::history::{specification_digest, HistoryBoundary, HistoryProtection};
+    let server = Server::default();
+    let (adapter, harness) = connect(server.clone()).await;
+    adapter.start(&spec(), "i-1", 1, &[]).await.unwrap();
+    adapter.remove("i-1").await.unwrap();
+    let assignment = lifecycle_assignment();
+    let boundary = HistoryBoundary {
+        authority: "test-control".into(),
+        coordinator_epoch: 1,
+        assignment_generation: 1,
+        catalog_revision: 10,
+        protected: std::collections::BTreeMap::from([(
+            "i".into(),
+            HistoryProtection {
+                assignment: assignment.clone(),
+                specification_sha256: specification_digest(&spec()).unwrap(),
+                minimum_runtime_revision: 1,
+                environment_revision: 10,
+            },
+        )]),
+    };
+    server
+        .lose_history_reply_once
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(adapter.collect_history(boundary.clone()).await.is_err());
+    drop(adapter);
+    let adapter = reconnect_with_journal(&harness).await;
+    assert_eq!(adapter.collect_history(boundary).await.unwrap(), 1);
+    assert_eq!(server.history_requests.lock().unwrap().len(), 2);
+    drop(adapter);
+    let adapter = reconnect_with_journal(&harness).await;
+    assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
+    let hooks = Arc::new(LifecycleHooks::default());
+    let node = lifecycle_node(adapter, &hooks);
+    let record = EnvironmentRecord {
+        spec: spec(),
+        assignment,
+        runtime: adx_core::Runtime {
+            id: "i-1".into(),
+            ip: None,
+        },
+        state: EnvironmentState::Failed,
+        revision: 10,
+        resources_held: false,
+        checkpoint: None,
+        last_operation: None,
+        restart_attempts: 0,
+        restart_pending: false,
+    };
+    assert_eq!(node.used(), Resources::default());
+    node.reconcile(vec![record])
+        .await
+        .expect("already released closed history must not require a reclaimed physical receipt");
+    assert_eq!(node.used(), Resources::default());
+    assert_eq!(server.conditional_deletes.lock().unwrap().len(), 1);
+    assert_eq!(server.starts.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn history_capacity_rejection_splits_durable_batch_and_new_allocation_still_works() {
+    use adx_core::history::HistoryBoundary;
+    let server = Server::default();
+    // Three independent starts consume three explicit fake-server permits.
+    server.release.add_permits(2);
+    let (adapter, _harness) = connect(server.clone()).await;
+    for generation in 1..=2 {
+        let id = format!("i-{generation}");
+        adapter.start(&spec(), &id, generation, &[]).await.unwrap();
+        adapter.remove(&id).await.unwrap();
+    }
+    server
+        .history_batch_capacity
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let boundary = HistoryBoundary {
+        authority: "test-control".into(),
+        coordinator_epoch: 1,
+        assignment_generation: 2,
+        catalog_revision: 20,
+        protected: Default::default(),
+    };
+    assert_eq!(adapter.collect_history(boundary).await.unwrap(), 2);
+    let counts: Vec<_> = server
+        .history_requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| r.candidates.len())
+        .collect();
+    assert_eq!(counts, vec![2, 1, 1]);
+    assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
+    adapter.start(&spec(), "i-3", 3, &[]).await.unwrap();
+    let request = server
+        .start_operations
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .clone();
+    let identity = request.history_identity.unwrap();
+    assert_eq!(identity.runtime_id, "i-3");
+    assert_eq!(identity.assignment_generation, 3);
+    adapter.remove("i-3").await.unwrap();
+}
+
+#[tokio::test]
+async fn durable_retirement_before_final_state_reopens_without_another_delete_rpc() {
+    let server = Server::default();
+    let (adapter, harness) = connect(server.clone()).await;
+    adapter.start(&spec(), "i-1", 1, &[]).await.unwrap();
+    adapter.remove("i-1").await.unwrap();
+    drop(adapter);
+    let connection =
+        rusqlite::Connection::open(harness._directory.path().join("operations.sqlite")).unwrap();
+    let payload: String = connection
+        .query_row(
+            "SELECT payload FROM operations WHERE runtime_id='i-1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut record: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert!(record["backend"].is_object());
+    assert!(record["retired_generation"].is_string());
+    record["state"] = serde_json::json!("DeleteUncertain");
+    connection
+        .execute(
+            "UPDATE operations SET payload=?1 WHERE runtime_id='i-1'",
+            [serde_json::to_string(&record).unwrap()],
+        )
+        .unwrap();
+    drop(connection);
+    let reopened = reconnect_with_journal(&harness).await;
+    reopened.remove("i-1").await.unwrap();
+    assert_eq!(
+        server.conditional_deletes.lock().unwrap().len(),
+        1,
+        "durable original retirement must not require a collected receipt or new delete"
+    );
 }

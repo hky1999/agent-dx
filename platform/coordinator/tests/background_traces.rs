@@ -65,6 +65,8 @@ async fn heartbeats_and_scheduler_rounds_do_not_export_spans_but_create_keeps_it
     rpc.inspect_node(node_request(pb::InspectNodeRequest {
         node_id: "node".into(),
         session_id: "boot".into(),
+        history_reclamation: false,
+        include_history: false,
     }))
     .await
     .unwrap();

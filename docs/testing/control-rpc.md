@@ -110,3 +110,7 @@ Rust／RPC 在 macOS ARM64 执行，测试 Redis 7.2.5 使用 AOF always；二�
 Go HTTP、服务配置、Redis 发现、心跳与重启对账、Ingress 路由订阅、Relay 启动同步、SQLite 降级及本地 FC 暂停/恢复、跨节点恢复均已接线。统一发布与基本 K8s 已验收；证书热重载和 K8s FC 后置。
 
 `replace_rejected` 的持久化接口与节点故障后的 checkpoint 恢复流程职责不同。RPC 不把任意 Node 超时当作“尚未执行”来调用旧分配替换；故障恢复按持久化失效、有效 checkpoint、新归属和返回节点对账处理，见 [恢复契约](node-failure-takeover.md)。
+
+## 历史目录边界
+
+已认证节点可以通过 `InspectNode.include_history` 取得初次对账边界，通过 `InspectNode.history_reclamation` 取得不改变对账状态的周期快照。完整权限、持久顺序和错误边界见[历史回收契约](../deployment/history-reclamation.md)。回收确认不构成退役证明，也不归还预算。

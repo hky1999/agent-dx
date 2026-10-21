@@ -132,6 +132,8 @@ async fn host_budget_rpc_rejects_before_execution_and_recovers_after_release() {
         .inspect_node(pb::InspectNodeRequest {
             node_id: "node".into(),
             session_id: report.session_id.clone(),
+            history_reclamation: false,
+            include_history: false,
         })
         .await
         .unwrap();
@@ -149,6 +151,62 @@ async fn host_budget_rpc_rejects_before_execution_and_recovers_after_release() {
         .into_inner()
         .record
         .unwrap();
+    // A read-only authenticated history refresh must preserve live routing and
+    // protect the exact record returned by the same atomic catalog snapshot.
+    let inspect = pb::InspectNodeRequest {
+        node_id: "node".into(),
+        session_id: report.session_id.clone(),
+        history_reclamation: true,
+        include_history: true,
+    };
+    let refreshed = owner
+        .inspect_node(inspect.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    let boundary: adx_core::history::HistoryBoundary =
+        refreshed.history_boundary.unwrap().try_into().unwrap();
+    assert!(!boundary.authority.is_empty());
+    assert_eq!(boundary.coordinator_epoch, session.epoch());
+    let protection = &boundary.protected["first"];
+    let current: EnvironmentRecord = first.clone().try_into().unwrap();
+    assert_eq!(protection.assignment, current.assignment);
+    assert_eq!(protection.environment_revision, current.revision);
+    assert_eq!(protection.minimum_runtime_revision, 0);
+    assert_eq!(
+        protection.specification_sha256,
+        adx_core::history::specification_digest(&current.spec).unwrap()
+    );
+    assert_eq!(refreshed.records.len(), 1);
+    assert_eq!(
+        client
+            .inspect_node(inspect.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    let mut stale = inspect.clone();
+    stale.session_id = "stale-session".into();
+    assert_eq!(
+        owner.inspect_node(stale).await.unwrap_err().code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert_eq!(
+        owner
+            .inspect_node(pb::InspectNodeRequest {
+                history_reclamation: false,
+                ..inspect.clone()
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert_eq!(
+        session.host_budgets().await.unwrap()["physical"].available,
+        Resources::default()
+    );
     for _ in 0..2 {
         assert_eq!(
             client
@@ -188,6 +246,18 @@ async fn host_budget_rpc_rejects_before_execution_and_recovers_after_release() {
     assert_eq!(
         session.host_budgets().await.unwrap()["physical"].available,
         spec("capacity").resources
+    );
+    let refreshed = owner.inspect_node(inspect).await.unwrap().into_inner();
+    let next: adx_core::history::HistoryBoundary =
+        refreshed.history_boundary.unwrap().try_into().unwrap();
+    boundary.check_advance(&next).unwrap();
+    let paused_record: EnvironmentRecord = paused.clone().try_into().unwrap();
+    assert!(paused_record.checkpoint.is_some());
+    assert!(!paused_record.resources_held);
+    assert_eq!(next.protected["first"].minimum_runtime_revision, 1);
+    assert_eq!(
+        next.protected["first"].environment_revision,
+        paused_record.revision
     );
     let second = client
         .create_environment(create("second"))
@@ -358,6 +428,8 @@ async fn host_budget_rpc_rejects_before_execution_and_recovers_after_release() {
         .inspect_node(pb::InspectNodeRequest {
             node_id: "node".into(),
             session_id: report.session_id.clone(),
+            history_reclamation: false,
+            include_history: false,
         })
         .await
         .unwrap()

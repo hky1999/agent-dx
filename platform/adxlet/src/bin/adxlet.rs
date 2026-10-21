@@ -38,6 +38,8 @@ struct Config {
     sandboxd_socket: PathBuf,
     sandboxd_operation_journal: PathBuf,
     #[serde(default)]
+    history_reclamation: bool,
+    #[serde(default)]
     runtime_logs: RuntimeLogPolicy,
     proxy_socket: PathBuf,
     #[serde(default)]
@@ -136,10 +138,13 @@ async fn inspect_node(
     node_id: &str,
     session_id: &str,
     timeout: Duration,
+    include_history: bool,
 ) -> Result<tonic::Response<pb::InspectNodeResponse>, tonic::Status> {
     let mut request = tonic::Request::new(pb::InspectNodeRequest {
         node_id: node_id.into(),
         session_id: session_id.into(),
+        history_reclamation: false,
+        include_history,
     });
     request.set_timeout(timeout);
     bounded_rpc(timeout, coordinator.inspect_node(request)).await
@@ -267,6 +272,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .transpose()?;
     let runtime_config = RuntimeConfig {
+        history_reclamation: config.history_reclamation,
         operation_journal: Some(config.sandboxd_operation_journal),
         runtime_profile: config.runtime_profile,
         command: config.execd_command,
@@ -419,10 +425,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::time::interval(Duration::from_secs(config.report_interval_seconds));
         let mut reconciled = false;
         let mut gc_jobs = tokio::task::JoinSet::new();
+        let mut history_jobs = tokio::task::JoinSet::new();
+        let mut next_history = tokio::time::Instant::now();
         let gc_interval = Duration::from_secs(config.checkpoint_gc.interval_seconds);
         let mut next_gc = tokio::time::Instant::now();
         loop {
             interval.tick().await;
+            while let Some(result) = history_jobs.try_join_next() {
+                match result {
+                    Ok(Ok(_)) => (),
+                    other => adx_observability::warn!("history reclamation incomplete: {other:?}"),
+                }
+            }
             while let Some(result) = gc_jobs.try_join_next() {
                 match result {
                     Ok(Ok(Ok(count))) => {
@@ -492,8 +506,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             last = r.clone();
             match register_node(&mut coordinator, r, timeout).await {
                 Ok(_) if !reconciled => {
-                    let catalog =
-                        inspect_node(&mut coordinator, &config.node_id, &session_id, timeout).await;
+                    let catalog = inspect_node(
+                        &mut coordinator,
+                        &config.node_id,
+                        &session_id,
+                        timeout,
+                        config.history_reclamation,
+                    )
+                    .await;
                     match catalog {
                         Ok(snapshot) => {
                             let mut catalog = snapshot.into_inner();
@@ -517,6 +537,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     &config.node_id,
                                     &session_id,
                                     timeout,
+                                    config.history_reclamation,
                                 )
                                 .await
                                 {
@@ -528,6 +549,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         continue;
                                     }
                                 };
+                            }
+                            if config.history_reclamation {
+                                let boundary:adx_core::history::HistoryBoundary=catalog.history_boundary.clone().ok_or("Coordinator omitted history authority")?.try_into()?;
+                                if let Err(error)=manager.collect_history(boundary).await {
+                                    adx_observability::warn!("history authority installation incomplete: {error}");
+                                    continue;
+                                }
                             }
                             let records = catalog
                                 .records
@@ -590,6 +618,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             );
                             continue;
                         }
+                    }
+                    if config.history_reclamation
+                        && history_jobs.is_empty()
+                        && tokio::time::Instant::now() >= next_history
+                    {
+                        next_history = tokio::time::Instant::now() + Duration::from_secs(30);
+                        let manager = manager.clone();
+                        let mut control = coordinator.clone();
+                        let node_id = config.node_id.clone();
+                        let node_session = session_id.clone();
+                        history_jobs.spawn(async move {
+                            let work = async {
+                                let mut request = tonic::Request::new(pb::InspectNodeRequest {
+                                    node_id,
+                                    session_id: node_session,
+                                    history_reclamation: true,
+                                    include_history: true,
+                                });
+                                request.set_timeout(timeout);
+                                let catalog = bounded_rpc(timeout, control.inspect_node(request))
+                                    .await
+                                    .map_err(|e| adx_core::Error::Unavailable(e.to_string()))?
+                                    .into_inner();
+                                let boundary = catalog
+                                    .history_boundary
+                                    .ok_or_else(|| {
+                                        adx_core::Error::Unavailable(
+                                            "Coordinator omitted history authority".into(),
+                                        )
+                                    })?
+                                    .try_into()?;
+                                manager.collect_history(boundary).await
+                            };
+                            tokio::time::timeout(timeout, work).await.map_err(|_| {
+                                adx_core::Error::Unavailable("history reclamation timed out".into())
+                            })?
+                        });
                     }
                     if config.checkpoint_gc.enabled
                         && gc_jobs.is_empty()

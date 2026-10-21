@@ -100,9 +100,9 @@ message CommitEnvironmentRequest { EnvironmentRecord record = 1; string node_ses
 
 message CommitEnvironmentResponse { EnvironmentRecord record = 1; }
 
-message InspectNodeRequest { string node_id = 1; string session_id = 2; }
+message InspectNodeRequest { string node_id = 1; string session_id = 2; bool history_reclamation = 3; bool include_history = 4; }
 
-message InspectNodeResponse { repeated EnvironmentRecord records = 1; uint64 coordinator_epoch = 2; repeated ReusableSnapshot snapshots = 3; repeated RestorePoint retained_checkpoints = 4; }
+message InspectNodeResponse { repeated EnvironmentRecord records = 1; uint64 coordinator_epoch = 2; repeated ReusableSnapshot snapshots = 3; repeated RestorePoint retained_checkpoints = 4; HistoryBoundary history_boundary = 5; }
 
 message PauseEnvironmentRequest { Assignment assignment = 1; CallerContext caller = 2; string operation_id = 3; uint64 expected_revision = 4; uint64 ttl_seconds = 5; uint64 timeout_seconds = 6; }
 
@@ -265,3 +265,6 @@ message MemoryDecision {
 
 message ReconcileMemoryRequest { MemorySample sample = 1; string node_session_id = 2; }
 message ReconcileMemoryResponse { MemoryDecision decision = 1; }
+
+message HistoryProtection { Assignment assignment = 1; string specification_sha256 = 2; uint64 minimum_runtime_revision = 3; uint64 environment_revision = 4; }
+message HistoryBoundary { string authority = 1; uint64 coordinator_epoch = 2; uint64 assignment_generation = 3; uint64 catalog_revision = 4; repeated HistoryProtection protected = 5; }

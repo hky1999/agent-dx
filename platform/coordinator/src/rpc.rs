@@ -1118,12 +1118,69 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                 let live = state.live.get(&r.node_id).ok_or_else(|| {
                     Status::failed_precondition("register node before reconciliation")
                 })?;
-                if live.session != r.session_id || !live.report.reconciling {
+                if live.session != r.session_id
+                    || (!live.report.reconciling && !r.history_reclamation)
+                {
                     return Err(Status::failed_precondition(
                         "node must enter reconciliation first",
                     ));
                 }
-                let snapshot = state.session.snapshot().await.map_err(status)?;
+                let (authority, snapshot) = if r.include_history || r.history_reclamation {
+                    state.session.history_snapshot().await.map_err(status)?
+                } else {
+                    (
+                        String::new(),
+                        state.session.snapshot().await.map_err(status)?,
+                    )
+                };
+                let history_boundary = if authority.is_empty() {
+                    None
+                } else {
+                    use adx_core::history::{
+                        specification_digest, HistoryBoundary, HistoryIdentity, HistoryProtection,
+                    };
+                    let mut protected = std::collections::BTreeMap::new();
+                    for environment in snapshot.environments.values().filter(|e| {
+                        e.assignment.node_id == r.node_id && requires_node_reconciliation(e)
+                    }) {
+                        let record = environment.effective_record();
+                        let identity = HistoryIdentity {
+                            authority: authority.clone(),
+                            environment_id: record.spec.id.clone(),
+                            runtime_id: record.runtime.id.clone(),
+                            assignment_generation: record.assignment.generation,
+                        };
+                        let runtime_revision = identity.runtime_revision().map_err(status)?;
+                        let minimum_runtime_revision = if record.resources_held {
+                            runtime_revision
+                        } else {
+                            runtime_revision
+                                .checked_add(1)
+                                .ok_or_else(|| status(Error::Conflict))?
+                        };
+                        protected.insert(
+                            record.spec.id.clone(),
+                            HistoryProtection {
+                                assignment: record.assignment.clone(),
+                                specification_sha256: specification_digest(&record.spec)
+                                    .map_err(status)?,
+                                minimum_runtime_revision,
+                                environment_revision: record.revision,
+                            },
+                        );
+                    }
+                    Some(
+                        HistoryBoundary {
+                            authority,
+                            coordinator_epoch: state.session.epoch(),
+                            assignment_generation: snapshot.generation,
+                            catalog_revision: snapshot.revision,
+                            protected,
+                        }
+                        .try_into()
+                        .map_err(status)?,
+                    )
+                };
                 let retained_checkpoints = snapshot
                     .environments
                     .values()
@@ -1150,16 +1207,19 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                     .map(TryInto::try_into)
                     .collect::<Result<Vec<_>>>()
                     .map_err(status)?;
-                state
-                    .live
-                    .get_mut(&r.node_id)
-                    .ok_or_else(|| Status::unavailable("node heartbeat state disappeared"))?
-                    .inspected = true;
+                if !r.history_reclamation {
+                    state
+                        .live
+                        .get_mut(&r.node_id)
+                        .ok_or_else(|| Status::unavailable("node heartbeat state disappeared"))?
+                        .inspected = true;
+                }
                 Ok(Response::new(pb::InspectNodeResponse {
                     records,
                     snapshots,
                     retained_checkpoints,
                     coordinator_epoch: state.session.epoch(),
+                    history_boundary,
                 }))
             })
             .await

@@ -138,6 +138,8 @@ impl Fixture {
             .inspect_node(pb::InspectNodeRequest {
                 node_id: "node".into(),
                 session_id: report.session_id.clone(),
+                history_reclamation: false,
+                include_history: false,
             })
             .await
             .unwrap();

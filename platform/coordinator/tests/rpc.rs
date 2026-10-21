@@ -422,6 +422,8 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
         .inspect_node(pb::InspectNodeRequest {
             node_id: "node".into(),
             session_id: "boot-1".into(),
+            history_reclamation: false,
+            include_history: false,
         })
         .await
         .unwrap();
@@ -997,7 +999,9 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
     assert!(node
         .inspect_node(pb::InspectNodeRequest {
             node_id: "node".into(),
-            session_id: "wrong".into()
+            session_id: "wrong".into(),
+            history_reclamation: false,
+            include_history: false,
         })
         .await
         .is_err());
@@ -1005,6 +1009,8 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
         .inspect_node(pb::InspectNodeRequest {
             node_id: "node".into(),
             session_id: report.session_id.clone(),
+            history_reclamation: false,
+            include_history: false,
         })
         .await
         .unwrap()
@@ -1078,6 +1084,8 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
         .inspect_node(pb::InspectNodeRequest {
             node_id: "node".into(),
             session_id: report.session_id.clone(),
+            history_reclamation: false,
+            include_history: false,
         })
         .await
         .unwrap()
@@ -1275,6 +1283,8 @@ async fn node_restart_before_expiry_requires_new_session_at_registered_endpoint(
         .inspect_node(pb::InspectNodeRequest {
             node_id: "node".into(),
             session_id: "boot-1".into(),
+            history_reclamation: false,
+            include_history: false,
         })
         .await
         .unwrap();
@@ -1370,6 +1380,8 @@ async fn node_restart_before_expiry_requires_new_session_at_registered_endpoint(
         .inspect_node(pb::InspectNodeRequest {
             node_id: "node".into(),
             session_id: "boot-2".into(),
+            history_reclamation: false,
+            include_history: false,
         })
         .await
         .unwrap()
@@ -1509,6 +1521,8 @@ async fn coordinator_restart_bounds_re_registration_grace() {
             .inspect_node(pb::InspectNodeRequest {
                 node_id: "node".into(),
                 session_id: "boot".into(),
+                history_reclamation: false,
+                include_history: false,
             })
             .await
             .unwrap()
@@ -2254,6 +2268,8 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
         .inspect_node(pb::InspectNodeRequest {
             node_id: "node".into(),
             session_id: "gc-boot".into(),
+            history_reclamation: false,
+            include_history: false,
         })
         .await
         .unwrap()
@@ -2738,6 +2754,8 @@ async fn shared_checkpoint_recovers_only_after_source_cleanup_and_keeps_artifact
             .inspect_node(pb::InspectNodeRequest {
                 node_id: report.node_id.clone(),
                 session_id: report.session_id.clone(),
+                history_reclamation: false,
+                include_history: false,
             })
             .await
             .unwrap();
@@ -2790,6 +2808,8 @@ async fn shared_checkpoint_recovers_only_after_source_cleanup_and_keeps_artifact
         .inspect_node(pb::InspectNodeRequest {
             node_id: "target".into(),
             session_id: "target-boot".into(),
+            history_reclamation: false,
+            include_history: false,
         })
         .await
         .unwrap();
@@ -2809,6 +2829,8 @@ async fn shared_checkpoint_recovers_only_after_source_cleanup_and_keeps_artifact
         .inspect_node(pb::InspectNodeRequest {
             node_id: "source".into(),
             session_id: "source-boot".into(),
+            history_reclamation: false,
+            include_history: false,
         })
         .await
         .unwrap()
@@ -2915,6 +2937,8 @@ async fn shared_checkpoint_recovers_only_after_source_cleanup_and_keeps_artifact
         .inspect_node(pb::InspectNodeRequest {
             node_id: "source".into(),
             session_id: "source-boot".into(),
+            history_reclamation: false,
+            include_history: false,
         })
         .await
         .unwrap()

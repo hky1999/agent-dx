@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -25,6 +25,8 @@ pub(super) fn now_millis() -> Result<u64> {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct OperationIntent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_identity: Option<adx_core::history::HistoryIdentity>,
     pub id: String,
     pub kind: String,
     pub fingerprint: String,
@@ -38,6 +40,7 @@ impl OperationIntent {
             .checked_add(duration)
             .ok_or_else(|| Error::Invalid("operation deadline overflow".into()))?;
         Ok(Self {
+            history_identity: None,
             id: uuid::Uuid::new_v4().to_string(),
             kind: kind.into(),
             fingerprint,
@@ -177,6 +180,7 @@ pub(super) struct OperationJournal {
     // The stable lock file is never unlinked. A second process cannot overwrite
     // facts using a stale in-memory snapshot of this same journal.
     lock: Arc<File>,
+    identity: Arc<File>,
 }
 impl OperationJournal {
     pub async fn open(path: PathBuf) -> Result<(Self, BTreeMap<String, OperationRecord>)> {
@@ -198,6 +202,16 @@ impl OperationJournal {
                 .file_name()
                 .ok_or_else(|| Error::Invalid("journal file name required".into()))?;
             let path = fs::canonicalize(parent).map_err(unavailable)?.join(name);
+            if path
+                .with_extension("sqlite.lock")
+                .try_exists()
+                .map_err(unavailable)?
+                && !path.try_exists().map_err(unavailable)?
+            {
+                return Err(unavailable(
+                    "existing operation journal database is missing",
+                ));
+            }
             let lock = Arc::new(private_file(&path.with_extension("sqlite.lock"))?);
             lock.try_lock().map_err(unavailable)?;
             let file = private_file(&path)?;
@@ -222,7 +236,14 @@ impl OperationJournal {
             File::open(path.parent().ok_or(Error::Conflict)?)
                 .and_then(|file| file.sync_all())
                 .map_err(unavailable)?;
-            Ok((Self { path, lock }, records))
+            Ok((
+                Self {
+                    path,
+                    lock,
+                    identity: Arc::new(file),
+                },
+                records,
+            ))
         })
         .await
         .map_err(unavailable)?
@@ -232,25 +253,29 @@ impl OperationJournal {
         record.validate(&id)?;
         let path = self.path.clone();
         let lock = self.lock.clone();
+        let identity = self.identity.clone();
         tokio::task::spawn_blocking(move || {
-            let _lock = lock;
             // Never recreate a journal removed from a running process.
             let metadata = fs::symlink_metadata(&path).map_err(unavailable)?;
             if !metadata.is_file() || metadata.permissions().mode() & 0o777 != 0o600 {
                 return Err(unavailable("operation journal file changed"));
             }
-            let mut connection = database(&path)?;
+            let mut connection = existing_database(&path,&lock,&identity)?;
             let transaction = connection.transaction().map_err(unavailable)?;
             let payload = serde_json::to_string(&record).map_err(unavailable)?;
             // Old binaries must refuse a journal containing memory dispatches.
             // Keep the fence after retirement rather than silently downgrading.
-            if record.memory.is_some() {
+            let version:u32=transaction.query_row("PRAGMA user_version",[],|row|row.get(0)).map_err(unavailable)?;
+            if record.memory.is_some() && version<2 {
                 transaction.execute_batch("PRAGMA user_version=2;").map_err(unavailable)?;
             }
             let previous: Option<String> = transaction.query_row("SELECT payload FROM operations WHERE runtime_id=?1", [&id], |row| row.get(0)).optional().map_err(unavailable)?;
             if previous.as_ref() == Some(&payload) { return Ok(()); }
             transaction.execute("INSERT INTO operations(runtime_id,payload) VALUES (?1,?2) ON CONFLICT(runtime_id) DO UPDATE SET payload=excluded.payload", params![id, payload]).map_err(unavailable)?;
             transaction.execute("INSERT INTO operation_history(runtime_id,payload) VALUES (?1,?2)", params![id, payload]).map_err(unavailable)?;
+            // The complete current record remains authoritative. Audit-only
+            // transitions are a bounded window, compacted in this same commit.
+            transaction.execute("DELETE FROM operation_history WHERE runtime_id=?1 AND sequence NOT IN (SELECT sequence FROM operation_history WHERE runtime_id=?1 ORDER BY sequence DESC LIMIT 8)", [&id]).map_err(unavailable)?;
             transaction.commit().map_err(unavailable)?;
             File::open(path.parent().ok_or(Error::Conflict)?).and_then(|file| file.sync_all()).map_err(unavailable)?;
             Ok(())
@@ -284,12 +309,14 @@ fn database(path: &std::path::Path) -> Result<Connection> {
     let version: u32 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(unavailable)?;
-    if version > 2 {
+    if version > 3 {
         return Err(unavailable("unsupported operation journal schema"));
     }
     connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
         CREATE TABLE IF NOT EXISTS operations (runtime_id TEXT PRIMARY KEY NOT NULL, payload TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS operation_history (sequence INTEGER PRIMARY KEY AUTOINCREMENT, runtime_id TEXT NOT NULL, payload TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS history_boundary (slot INTEGER PRIMARY KEY CHECK(slot=1), payload TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS history_pending (slot INTEGER PRIMARY KEY CHECK(slot=1), payload TEXT NOT NULL);
 ").map_err(unavailable)?;
     if version == 0 {
         connection
@@ -297,4 +324,86 @@ fn database(path: &std::path::Path) -> Result<Connection> {
             .map_err(unavailable)?;
     }
     Ok(connection)
+}
+
+#[cfg(test)]
+mod history_reclamation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn completed_runtime_audit_history_is_bounded_without_losing_latest_facts() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("operations.sqlite");
+        let (journal, records) = OperationJournal::open(path.clone()).await.unwrap();
+        assert!(records.is_empty());
+        let physical_generation = uuid::Uuid::new_v4().to_string();
+        let runtime_id = "history-contract-7";
+        let mut expected = String::new();
+        for _ in 0..24 {
+            let record = OperationRecord {
+                state: StartState::Failed,
+                start: None,
+                action: Some(
+                    OperationIntent::new("delete", "a".repeat(64), Duration::from_secs(30))
+                        .unwrap(),
+                ),
+                backend: Some(BackendIdentity {
+                    id: "sbox-history-contract".into(),
+                    resource_generation: physical_generation.clone(),
+                }),
+                retired_generation: Some(physical_generation.clone()),
+                memory: None,
+            };
+            expected = serde_json::to_string(&record).unwrap();
+            journal.save(runtime_id.into(), record).await.unwrap();
+        }
+        let connection = database(&path).unwrap();
+        let latest: String = connection
+            .query_row(
+                "SELECT payload FROM operations WHERE runtime_id=?1",
+                [runtime_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            latest, expected,
+            "compaction must retain the complete authoritative current record"
+        );
+        let retained: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM operation_history WHERE runtime_id=?1",
+                [runtime_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(retained <= 8, "retired runtime audit history grew to {retained} rows instead of the bounded eight-transition window");
+    }
+}
+
+mod history;
+#[derive(Clone, Serialize, Deserialize)]
+pub(super) struct HistoryAttempt {
+    pub runtime_id: String,
+    pub record: OperationRecord,
+}
+
+fn existing_database(path: &std::path::Path, lock: &File, identity: &File) -> Result<Connection> {
+    for (name, original) in [
+        (path.to_path_buf(), identity),
+        (path.with_extension("sqlite.lock"), lock),
+    ] {
+        let current = fs::symlink_metadata(name).map_err(unavailable)?;
+        let held = original.metadata().map_err(unavailable)?;
+        if !current.is_file()
+            || current.permissions().mode() & 0o777 != 0o600
+            || current.dev() != held.dev()
+            || current.ino() != held.ino()
+            || current.nlink() != 1
+        {
+            return Err(unavailable(
+                "original operation journal file or lock changed",
+            ));
+        }
+    }
+    database(path)
 }

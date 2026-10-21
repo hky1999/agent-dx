@@ -68,6 +68,26 @@ pub struct ExecutionRestore<'a> {
 
 #[async_trait]
 pub trait RuntimeDriver: Send + Sync {
+    /// Validate a complete authoritative recovery record before any local effects.
+    fn admit_reconciled(&self, record: &EnvironmentRecord) -> Result<()> {
+        self.admit_assignment(&record.spec, &record.assignment)
+    }
+    /// Read-only acknowledgment of already-closed log state. Callers must own no
+    /// local or central resource hold; this is never physical retirement proof.
+    async fn closed_history(&self, _record: &EnvironmentRecord) -> Result<bool> {
+        Ok(false)
+    }
+    /// Check a durable allocation boundary before constructing a controller.
+    fn admit_assignment(&self, _spec: &EnvironmentSpec, _assignment: &Assignment) -> Result<()> {
+        Ok(())
+    }
+    async fn collect_history(
+        &self,
+        _boundary: adx_core::history::HistoryBoundary,
+    ) -> Result<usize> {
+        Ok(0)
+    }
+
     /// Persist the exact target as not yet dispatched before requesting central
     /// authorization. Errors must prevent dispatch; cancellation remains recoverable.
     async fn prepare_execution(&self, target: &EnvironmentRecord) -> Result<()>;
@@ -696,6 +716,7 @@ impl Adxlet {
         {
             return Err(Error::Conflict);
         }
+        self.services.runtime.admit_assignment(&spec, &assignment)?;
         let now = Instant::now();
         let mut retired = self
             .retired_environments
@@ -819,5 +840,15 @@ impl Adxlet {
             }
         }
         error.map_or(Ok(()), Err)
+    }
+}
+
+impl Adxlet {
+    pub async fn collect_history(
+        &self,
+        boundary: adx_core::history::HistoryBoundary,
+    ) -> Result<usize> {
+        let _gate = self.lifecycle_ready.write().await;
+        self.services.runtime.collect_history(boundary).await
     }
 }

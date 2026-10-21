@@ -405,3 +405,5 @@ pub mod runtime {
     tonic::include_proto!("adx.runtime.v1");
 }
 pub mod runtime_stream;
+
+mod history;

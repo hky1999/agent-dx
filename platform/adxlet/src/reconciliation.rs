@@ -77,6 +77,7 @@ impl Adxlet {
         let mut cards = DeviceLedger::default();
         for r in records {
             r.spec.validate()?;
+            self.services.runtime.admit_reconciled(&r)?;
             validate_device_assignment(&r.spec.scheduling.devices, &r.assignment.devices)?;
             if r.assignment.node_id != self.node_id
                 || r.assignment.environment_id != r.spec.id
@@ -260,6 +261,9 @@ impl Adxlet {
             return Err(Error::Unavailable("node is reconciling or draining".into()));
         }
         record.spec.validate()?;
+        self.services
+            .runtime
+            .admit_assignment(&record.spec, &record.assignment)?;
         validate_device_assignment(&record.spec.scheduling.devices, &record.assignment.devices)?;
         let cp = record.checkpoint.as_ref().ok_or(Error::Conflict)?;
         let origin = cp.origin.as_ref().ok_or(Error::Conflict)?;

@@ -6,7 +6,7 @@
     {
       "source": "api/runtime/v1/sandbox-api.proto",
       "vendored": "sandbox-api.proto",
-      "sha256": "f521e50f76a088c410d69616c0caa7918653c43cf6a4f9af8067c24461e5f1c4",
+      "sha256": "f207777e2116ee1c89232b77d6b07ff91b1b10ac4ed160f548546db05018964b",
       "upstream_sha256": "a0053b7d6b5f9f4ce1e344e96741192a98a11e79d6b1cac4d17fea5a36b716ab"
     },
     {
@@ -17,9 +17,9 @@
   ],
   "scheduler_extensions": {
     "repository": "https://github.com/hky1999/sandboxd.git",
-    "revision": "c072f2ea679fde560c8108d229557a01d8541bad",
+    "revision": "52126a4ee79a93073beb5ddc433ac71da9c48283",
     "source": "api/runtime/v1/sandbox-api.proto",
-    "sha256": "f521e50f76a088c410d69616c0caa7918653c43cf6a4f9af8067c24461e5f1c4",
+    "sha256": "f207777e2116ee1c89232b77d6b07ff91b1b10ac4ed160f548546db05018964b",
     "fields": [
       "CheckpointRequest.checkpoint_id=7",
       "CheckpointRequest.include_filesystem=8",
@@ -31,7 +31,19 @@
       "CheckpointIfGenerationRequest.checkpoint=1",
       "CheckpointIfGenerationRequest.expected_generation=2",
       "ResolveResourceOperationRequest.original=1",
-      "ResolveResourceOperationRequest.shrink=2"
-    ]
+      "ResolveResourceOperationRequest.shrink=2",
+      "StartOperationRequest.history_identity=5",
+      "GetStartOperationRequest.history_identity=5",
+      "SandboxService.CollectHistory",
+      "HistoryIdentity",
+      "HistoryBoundary",
+      "HistoryProtection",
+      "HistoryCandidate",
+      "CollectHistoryRequest",
+      "CollectHistoryResponse"
+    ],
+    "revision_scope": "此提交是冻结候选的基础提交；历史回收协议来自下列尚未提交的snapshot_tree，不能只凭revision归属新能力。",
+    "snapshot_tree": "93cf457b9ef5595f4e7e53b2a8c5f46df5a031ba",
+    "source_state": "frozen_uncommitted_snapshot"
   }
 }

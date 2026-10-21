@@ -15,6 +15,7 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Request};
 use tower::service_fn;
 
+mod history;
 mod memory;
 mod operations;
 use operations::{OperationIntent, OperationJournal, OperationRecord};
@@ -26,6 +27,7 @@ use proto::sandbox_service_client::SandboxServiceClient;
 
 #[derive(Clone)]
 pub struct Config {
+    pub history_reclamation: bool,
     /// Durable execution intent and physical identity journal. Required by the
     /// node binary; None is intended for isolated in-memory adapter tests.
     pub operation_journal: Option<PathBuf>,
@@ -40,6 +42,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            history_reclamation: false,
             operation_journal: None,
             runtime_profile: None,
             command: vec!["/usr/local/bin/adx-execd".into()],
@@ -90,6 +93,7 @@ pub struct Sandboxd {
     backend_ids: Arc<Mutex<BTreeMap<String, BackendIdentity>>>,
     operations: Arc<Mutex<BTreeMap<String, OperationRecord>>>,
     journal: Option<OperationJournal>,
+    history_boundary: Arc<Mutex<Option<adx_core::history::HistoryBoundary>>>,
 }
 
 fn unavailable(error: impl std::fmt::Display) -> Error {
@@ -198,9 +202,14 @@ impl Sandboxd {
         let (journal, operations) = match &config.operation_journal {
             Some(path) => {
                 let (journal, records) = OperationJournal::open(path.clone()).await?;
+                let records = journal.recover_retired_bindings(records).await?;
                 (Some(journal), records)
             }
             None => (None, BTreeMap::new()),
+        };
+        let history_boundary = match &journal {
+            Some(j) => j.history_boundary().await?,
+            None => None,
         };
         let starts = operations
             .iter()
@@ -213,7 +222,15 @@ impl Sandboxd {
             .collect();
         let backend_ids = operations
             .iter()
-            .filter_map(|(id, record)| record.backend.clone().map(|backend| (id.clone(), backend)))
+            .filter_map(|(id, record)| {
+                record
+                    .backend
+                    .clone()
+                    .filter(|backend| {
+                        record.retired_generation.as_ref() != Some(&backend.resource_generation)
+                    })
+                    .map(|backend| (id.clone(), backend))
+            })
             .collect();
         Ok(Self {
             client: SandboxServiceClient::new(channel),
@@ -222,6 +239,7 @@ impl Sandboxd {
             backend_ids: Arc::new(Mutex::new(backend_ids)),
             operations: Arc::new(Mutex::new(operations)),
             journal,
+            history_boundary: Arc::new(Mutex::new(history_boundary)),
         })
     }
 
@@ -275,6 +293,7 @@ impl Sandboxd {
         generation: u64,
         devices: &[adx_core::scheduling::DeviceAllocation],
     ) -> Result<Request<proto::StartRequest>> {
+        self.history_identity(runtime_id)?;
         let prepared = {
             let state = self.cell(runtime_id).lock_owned().await;
             match &*state {
@@ -395,6 +414,10 @@ impl Sandboxd {
             None => {
                 let mut intent =
                     OperationIntent::new("start_operation", fingerprint, self.config.rpc_timeout)?;
+                if let Some(identity) = self.history_identity(runtime_id)? {
+                    intent.id = identity.operation_id(&intent.fingerprint)?;
+                    intent.history_identity = Some(identity);
+                }
                 if let Some(deadline) = execution_deadline {
                     intent.deadline_unix_millis = intent.deadline_unix_millis.min(deadline);
                 }
@@ -454,6 +477,10 @@ impl Sandboxd {
                 operation_id: intent.id.clone(),
                 request_fingerprint: intent.fingerprint.clone(),
                 deadline_unix_millis: intent.deadline_unix_millis,
+                history_identity: intent
+                    .history_identity
+                    .clone()
+                    .map(history::daemon_identity),
             };
             let outcome = match client.start_operation(adapter.request(operation)).await {
                 Ok(response) => response.into_inner(),
@@ -550,12 +577,18 @@ impl Sandboxd {
         if let Some(action) = action {
             record.action = Some(action);
         }
-        record.backend = self
+        let backend = self
             .backend_ids
             .lock()
             .expect("shared state lock poisoned")
             .get(id)
             .cloned();
+        // Keep the complete original identity after confirmed retirement. It is
+        // historical proof, and is deliberately excluded from the live cache.
+        if backend.is_some() || record.retired_generation.is_none() {
+            record.backend = backend;
+        }
+
         if let Some(journal) = &self.journal {
             journal.save(id.to_owned(), record.clone()).await?;
         }
@@ -717,12 +750,18 @@ impl Sandboxd {
         let response = self
             .client
             .clone()
-            .get_start_operation(self.request(proto::GetStartOperationRequest {
-                operation_id: intent.id.clone(),
-                request_fingerprint: intent.fingerprint.clone(),
-                deadline_unix_millis: intent.deadline_unix_millis,
-                seal_missing: intent.kind == "start_operation",
-            }))
+            .get_start_operation(
+                self.request(proto::GetStartOperationRequest {
+                    operation_id: intent.id.clone(),
+                    request_fingerprint: intent.fingerprint.clone(),
+                    deadline_unix_millis: intent.deadline_unix_millis,
+                    seal_missing: intent.kind == "start_operation",
+                    history_identity: intent
+                        .history_identity
+                        .clone()
+                        .map(history::daemon_identity),
+                }),
+            )
             .await
             .map_err(unavailable)?
             .into_inner();
@@ -1287,6 +1326,63 @@ fn runtime_control_peer(config: &Config) -> Result<Option<proto::NetworkEndpoint
 
 #[async_trait]
 impl RuntimeDriver for Sandboxd {
+    fn admit_reconciled(&self, record: &adx_core::EnvironmentRecord) -> Result<()> {
+        self.admit_assignment(&record.spec, &record.assignment)?;
+        if record.resources_held {
+            self.history_identity(&record.runtime.id)?;
+        }
+        Ok(())
+    }
+    async fn closed_history(&self, record: &adx_core::EnvironmentRecord) -> Result<bool> {
+        if record.resources_held {
+            return Ok(false);
+        }
+        let boundary = self.history_boundary.lock().map_err(unavailable)?.clone();
+        let Some(boundary) = boundary else {
+            return Ok(false);
+        };
+        let identity = adx_core::history::HistoryIdentity {
+            authority: boundary.authority.clone(),
+            environment_id: record.spec.id.clone(),
+            runtime_id: record.runtime.id.clone(),
+            assignment_generation: record.assignment.generation,
+        };
+        if record.assignment.environment_id != record.spec.id
+            || !boundary.is_closed(&identity)?
+            || self
+                .operations
+                .lock()
+                .map_err(unavailable)?
+                .contains_key(&record.runtime.id)
+        {
+            return Ok(false);
+        }
+        let journal = self
+            .journal
+            .as_ref()
+            .ok_or_else(|| unavailable("closed history requires persistent journal"))?;
+        if journal.history_has_facts(record.runtime.id.clone()).await? {
+            return Ok(false);
+        }
+        Ok(self.list_id(&record.runtime.id).await?.is_empty())
+    }
+    async fn collect_history(&self, boundary: adx_core::history::HistoryBoundary) -> Result<usize> {
+        Sandboxd::collect_history(self, boundary).await
+    }
+    fn admit_assignment(
+        &self,
+        spec: &EnvironmentSpec,
+        assignment: &adx_core::Assignment,
+    ) -> Result<()> {
+        let boundary = self.history_boundary.lock().map_err(unavailable)?;
+        match boundary.as_ref() {
+            Some(b) => b.admit_assignment(spec, assignment),
+            None if self.config.history_reclamation => {
+                Err(unavailable("history authority is not installed"))
+            }
+            None => Ok(()),
+        }
+    }
     async fn observe_memory(
         &self,
         record: &adx_core::EnvironmentRecord,
@@ -1522,6 +1618,31 @@ impl RuntimeDriver for Sandboxd {
 
     async fn remove(&self, runtime_id: &str) -> Result<()> {
         let mut state = self.cell(runtime_id).lock_owned().await;
+        let already_retired = self
+            .operations
+            .lock()
+            .map_err(unavailable)?
+            .get(runtime_id)
+            .is_some_and(|record| {
+                record.backend.as_ref().is_some_and(|backend| {
+                    record.retired_generation.as_ref() == Some(&backend.resource_generation)
+                })
+            });
+        if already_retired {
+            if !self.list_id(runtime_id).await?.is_empty() {
+                return Err(unavailable(
+                    "an execution remains for a confirmed retired Runtime",
+                ));
+            }
+            self.backend_ids
+                .lock()
+                .map_err(unavailable)?
+                .remove(runtime_id);
+            *state = StartState::Failed;
+            self.persist(runtime_id, &state, None).await?;
+            return Ok(());
+        }
+
         let failed_start = matches!(*state, StartState::Failed | StartState::StartUncertain);
         let mut physical = self.physical_identity(runtime_id).await?;
         if physical.is_some()

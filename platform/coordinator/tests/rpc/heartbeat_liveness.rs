@@ -132,6 +132,8 @@ async fn fixture(actual_node: &str, actual_session: &str) -> Fixture {
         .inspect_node(pb::InspectNodeRequest {
             node_id: report.node_id.clone(),
             session_id: report.session_id.clone(),
+            history_reclamation: false,
+            include_history: false,
         })
         .await
         .unwrap();
@@ -258,6 +260,8 @@ async fn storage_wait_preserves_reachable_execution_and_requires_reconciliation(
         .inspect_node(pb::InspectNodeRequest {
             node_id: f.report.node_id.clone(),
             session_id: f.report.session_id.clone(),
+            history_reclamation: false,
+            include_history: false,
         })
         .await
         .unwrap()

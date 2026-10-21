@@ -746,6 +746,12 @@ impl Controller {
             if let Some(control) = &self.services.runtime_control {
                 control.retire(&self.record);
             }
+            if !self.held
+                && !self.record.resources_held
+                && self.services.runtime.closed_history(&self.record).await?
+            {
+                return Ok(());
+            }
             self.services.runtime.remove(&self.record.runtime.id).await
         })
         .await

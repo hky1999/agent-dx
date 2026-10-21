@@ -89,7 +89,14 @@ impl Header {
     fn validate(&self) -> Result<()> {
         if !matches!(
             (self.schema, self.host_budgets.is_some()),
-            (1, false) | (2, true) | (3, _) | (4, true) | (5, true) | (6, true) | (7, true)
+            (1, false)
+                | (2, true)
+                | (3, _)
+                | (4, true)
+                | (5, true)
+                | (6, true)
+                | (7, true)
+                | (8, _)
         ) || self.shards == 0
             || self.next_node_shard >= self.shards
             || self.epoch == 0
@@ -1076,6 +1083,27 @@ impl Session {
             return Err(Error::Conflict);
         }
         Ok(header)
+    }
+    /// Publish the durable version fence before serving reclamation authority.
+    pub async fn history_snapshot(&self) -> Result<(String, StoredSnapshot)> {
+        for _ in 0..ATTEMPTS {
+            let raw = self.store.raw().await?;
+            let mut header = self.header(&raw.get(HEADER).cloned())?;
+            if header.schema < 8 {
+                header.schema = 8;
+                header.advance()?;
+                if self
+                    .store
+                    .cas(raw.get(HEADER).ok_or(Error::Conflict)?, &header, None)
+                    .await?
+                {
+                    continue;
+                }
+            } else {
+                return Ok((self.store.key.clone(), snapshot(&raw)?));
+            }
+        }
+        Err(Error::Unavailable("history boundary CAS contention".into()))
     }
     pub async fn snapshot(&self) -> Result<StoredSnapshot> {
         let raw = self.store.raw().await?;

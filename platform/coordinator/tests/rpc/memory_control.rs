@@ -118,6 +118,8 @@ async fn memory_rpc_authenticates_owner_reserves_settles_and_retires_without_sta
         .inspect_node(pb::InspectNodeRequest {
             node_id: "node".into(),
             session_id: report.session_id.clone(),
+            history_reclamation: false,
+            include_history: false,
         })
         .await
         .unwrap();

@@ -151,6 +151,8 @@ impl Rig {
                 .inspect_node(pb::InspectNodeRequest {
                     node_id: id.into(),
                     session_id: format!("boot-{id}"),
+                    history_reclamation: false,
+                    include_history: false,
                 })
                 .await
                 .unwrap();
@@ -302,6 +304,8 @@ async fn failed_gc_cleans_invalidated_owner_and_fences_delayed_running() {
         .inspect_node(pb::InspectNodeRequest {
             node_id: "a".into(),
             session_id: "boot-a".into(),
+            history_reclamation: false,
+            include_history: false,
         })
         .await
         .unwrap()

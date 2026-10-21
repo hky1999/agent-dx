@@ -1612,3 +1612,537 @@ async fn memory_persistence_applied_write_without_confirmation_remains_one_unkno
     );
     assert_eq!(held(&session).await, 192 * MIB);
 }
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn completed_memory_history_is_bounded_and_forgotten_ids_cannot_change_source() {
+    use sha2::{Digest, Sha256};
+    let (rig, s, record, mut observation) = fixture().await;
+    s.initialize_memory(observation.clone(), "boot-first")
+        .await
+        .unwrap();
+    let mut first = None;
+    let mut latest = None;
+    for index in 0..70 {
+        let operation = format!(
+            "memory-{}-{}-{:x}",
+            s.epoch(),
+            observation.resource_revision,
+            Sha256::digest(serde_json::to_vec(&observation).unwrap())
+        );
+        let target = if observation.memory_limit_bytes == 256 * MIB {
+            128
+        } else {
+            256
+        };
+        let grant = s
+            .authorize_memory(
+                request(&observation, &operation, target),
+                "boot-first",
+                1000 + index * 1001,
+            )
+            .await
+            .unwrap();
+        observation = completed(&grant);
+        s.complete_memory(grant.clone(), observation.clone(), "boot-first")
+            .await
+            .unwrap();
+        if first.is_none() {
+            first = Some(grant.clone())
+        };
+        latest = Some(grant);
+    }
+    let snapshot = s.snapshot().await.unwrap();
+    let account = snapshot.environments[&record.spec.id]
+        .memory
+        .as_ref()
+        .unwrap();
+    assert!(
+        account.completed.len() <= 64,
+        "completed memory history grew to {} entries instead of bounded 64",
+        account.completed.len()
+    );
+    assert_eq!(account.confirmed, observation);
+    assert!(account.pending.is_none());
+    assert_eq!(held(&s).await, 256 * MIB);
+    let first = first.unwrap();
+    let mut rebound = first.request.clone();
+    rebound.source = observation.clone();
+    rebound.target_limit_bytes = 128 * MIB;
+    rebound.target_high_bytes = 96 * MIB;
+    assert_eq!(
+        s.authorize_memory(rebound, "boot-first", 100000).await,
+        Err(Error::Conflict),
+        "a forgotten ID cannot bind a new source revision"
+    );
+    assert_eq!(
+        s.complete_memory(first.clone(), completed(&first), "boot-first")
+            .await,
+        Err(Error::Conflict)
+    );
+    let last = latest.unwrap();
+    assert_eq!(
+        s.authorize_memory(last.request.clone(), "boot-first", 100000)
+            .await
+            .unwrap(),
+        last
+    );
+    assert_eq!(held(&s).await, 256 * MIB);
+
+    for target in [128, 256] {
+        let operation = format!(
+            "memory-{}-{}-{:x}",
+            s.epoch(),
+            observation.resource_revision,
+            Sha256::digest(serde_json::to_vec(&observation).unwrap())
+        );
+        let grant = s
+            .authorize_memory(
+                request(&observation, &operation, target),
+                "boot-first",
+                110000 + target,
+            )
+            .await
+            .unwrap();
+        if target == 128 {
+            observation = completed(&grant);
+            s.complete_memory(grant, observation.clone(), "boot-first")
+                .await
+                .unwrap();
+            continue;
+        }
+        assert_eq!(
+            held(&s).await,
+            256 * MIB,
+            "an unknown growth still reserves the target"
+        );
+        let recovered = rig.store().await.begin(1).await.unwrap();
+        assert_eq!(held(&recovered).await, 256 * MIB);
+        let snapshot = recovered.snapshot().await.unwrap();
+        let account = snapshot.environments[&record.spec.id]
+            .memory
+            .as_ref()
+            .unwrap();
+        assert_eq!(account.pending.as_ref().unwrap().authorization, grant);
+        assert!(account.completed.len() <= 64);
+        assert!(account.closed_source_revision.is_some());
+        recovered
+            .complete_memory(grant.clone(), completed(&grant), "boot-first")
+            .await
+            .unwrap();
+        assert_eq!(held(&recovered).await, 256 * MIB);
+    }
+}
+
+// Append to platform/coordinator/tests/storage/memory.rs only when the root
+// agent starts the next test-first phase. This is an unexecuted external draft.
+// Uses that module's existing real-Redis fixture, sample(), held(), and
+// raw_control(); it never calls authorize_memory or complete_memory.
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn memory_control_reconciliation_keeps_progress_after_history_floor_and_restart() {
+    let (mut rig, session, record, mut observation) = fixture_with_elastic(true).await;
+    observation.memory_limit_bytes = 128 * MIB;
+    observation.memory_high_bytes = 96 * MIB;
+    let identity = observation.identity.clone();
+    let policy = adx_coordinator::storage::MemoryControlPolicy {
+        cooldown_millis: 1_000,
+        low_usage_millis: 1_000,
+        low_usage_samples: 2,
+        operation_timeout_millis: 1_000,
+        ..Default::default()
+    };
+    policy.validate().unwrap();
+    let mut now = 1_000_u64;
+    let initial = session
+        .reconcile_memory(
+            sample(&observation, 64, now),
+            "boot-first",
+            now,
+            Some(&policy),
+        )
+        .await
+        .unwrap();
+    assert!(initial.authorization.is_none());
+    assert_eq!(held(&session).await, 128 * MIB);
+
+    for index in 1_u64..=70 {
+        assert_eq!(observation.identity, identity);
+        assert_eq!(observation.resource_revision, index);
+        now += 2_000;
+        let growing = observation.memory_limit_bytes == 128 * MIB;
+        let usage_mib = if growing { 112 } else { 16 };
+        if !growing {
+            let first_low = session
+                .reconcile_memory(
+                    sample(&observation, usage_mib, now),
+                    "boot-first",
+                    now,
+                    Some(&policy),
+                )
+                .await
+                .unwrap();
+            assert!(first_low.authorization.is_none());
+            assert_eq!(held(&session).await, observation.memory_limit_bytes);
+            now += 1_000;
+        }
+        let authorized = session
+            .reconcile_memory(
+                sample(&observation, usage_mib, now),
+                "boot-first",
+                now,
+                Some(&policy),
+            )
+            .await
+            .unwrap();
+        let grant = authorized
+            .authorization
+            .unwrap_or_else(|| panic!("automatic operation {index} must be authorized"));
+        assert_eq!(grant.request.source, observation);
+        assert_eq!(
+            grant.request.target_limit_bytes,
+            if growing { 224 * MIB } else { 128 * MIB }
+        );
+        grant
+            .check_dispatch(now, "boot-first", session.epoch())
+            .unwrap();
+        let reservation = observation
+            .memory_limit_bytes
+            .max(grant.request.target_limit_bytes);
+        assert_eq!(authorized.held_resources.memory_bytes, reservation);
+        assert_eq!(held(&session).await, reservation);
+
+        // Dispatch is modeled as having started within the original deadline.
+        // A later read still showing only the original confirmed source is
+        // unknown, not a non-execution proof; expiry cannot release its hold.
+        now = grant.deadline_unix_millis + 1;
+        let unknown = session
+            .reconcile_memory(
+                sample(&observation, usage_mib, now),
+                "boot-first",
+                now,
+                Some(&policy),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unknown.authorization.as_ref(), Some(&grant));
+        assert!(grant
+            .check_dispatch(now, "boot-first", session.epoch())
+            .is_err());
+        assert_eq!(held(&session).await, reservation);
+        let pending = session.get(&record.spec.id).await.unwrap().memory.unwrap();
+        assert_eq!(pending.confirmed, observation);
+        assert_eq!(pending.pending.as_ref().unwrap().authorization, grant);
+        assert_eq!(
+            pending.completed.len(),
+            usize::try_from((index - 1).min(64)).unwrap()
+        );
+
+        let finished = grant.request.completion().unwrap();
+        if index == 66 {
+            // An unsettled physical report must not bypass the durable floor,
+            // clear the pending grant, or refund a shrink's old reservation.
+            let before = pending.clone();
+            let mut unsettled = finished.clone();
+            unsettled.operation_pending = true;
+            assert_eq!(
+                session
+                    .reconcile_memory(
+                        sample(&unsettled, 64, now),
+                        "boot-first",
+                        now,
+                        Some(&policy)
+                    )
+                    .await,
+                Err(Error::Conflict)
+            );
+            assert_eq!(
+                session.get(&record.spec.id).await.unwrap().memory.unwrap(),
+                before
+            );
+            assert_eq!(held(&session).await, reservation);
+        }
+
+        now += 1;
+        let settled = match session
+            .reconcile_memory(
+                sample(&finished, finished.memory_limit_bytes / MIB / 2, now),
+                "boot-first",
+                now,
+                Some(&policy),
+            )
+            .await
+        {
+            Ok(decision) => decision,
+            Err(error) => {
+                let stuck = session.get(&record.spec.id).await.unwrap().memory.unwrap();
+                assert_eq!(stuck.confirmed, observation);
+                assert_eq!(stuck.pending.as_ref().unwrap().authorization, grant);
+                assert_eq!(held(&session).await, reservation);
+                panic!(
+                    "automatic completion {index} must settle through reconcile_memory: source={}, completion={}, retained={}, floor={:?}, held={}, error={error:?}",
+                    observation.resource_revision, finished.resource_revision,
+                    stuck.completed.len(), stuck.closed_source_revision, reservation
+                );
+            }
+        };
+        assert!(settled.authorization.is_none());
+        assert_eq!(settled.observed, finished);
+        assert_eq!(
+            settled.held_resources.memory_bytes,
+            finished.memory_limit_bytes
+        );
+        assert_eq!(held(&session).await, finished.memory_limit_bytes);
+        observation = finished;
+        let account = session.get(&record.spec.id).await.unwrap().memory.unwrap();
+        assert_eq!(account.confirmed, observation);
+        assert!(account.pending.is_none());
+        assert_eq!(
+            account.completed.len(),
+            usize::try_from(index.min(64)).unwrap()
+        );
+        let expected_floor = if index > 64 { Some(index - 64) } else { None };
+        assert_eq!(account.closed_source_revision, expected_floor);
+        let mut retained_sources = account
+            .completed
+            .values()
+            .map(|operation| operation.authorization.request.source.resource_revision)
+            .collect::<Vec<_>>();
+        retained_sources.sort_unstable();
+        assert_eq!(
+            retained_sources,
+            (index.saturating_sub(63).max(1)..=index).collect::<Vec<_>>()
+        );
+        if let Some(floor) = expected_floor {
+            assert!(account.completed.values().all(|operation| operation
+                .authorization
+                .request
+                .source
+                .resource_revision
+                > floor));
+            assert_eq!(
+                account.latest_completed_issued_unix_millis,
+                grant.issued_unix_millis
+            );
+        }
+        if index == 65 {
+            assert_eq!(account.closed_source_revision, Some(1));
+            assert_eq!(observation.resource_revision, 66);
+        }
+    }
+    assert_eq!(observation.identity, identity);
+    assert_eq!(observation.resource_revision, 71);
+    assert_eq!(held(&session).await, 128 * MIB);
+
+    // Add an unknown 71st automatic growth after the 70-completion window.
+    // Only this private fixture Redis is crashed; no main environment is used.
+    now += 2_000;
+    let pending = session
+        .reconcile_memory(
+            sample(&observation, 112, now),
+            "boot-first",
+            now,
+            Some(&policy),
+        )
+        .await
+        .unwrap()
+        .authorization
+        .unwrap();
+    pending
+        .check_dispatch(now, "boot-first", session.epoch())
+        .unwrap();
+    assert_eq!(pending.request.target_limit_bytes, 224 * MIB);
+    assert_eq!(held(&session).await, 224 * MIB);
+    let before = session.get(&record.spec.id).await.unwrap().memory.unwrap();
+    assert_eq!(before.closed_source_revision, Some(6));
+    assert_eq!(before.completed.len(), 64);
+    assert_eq!(before.pending.as_ref().unwrap().authorization, pending);
+    let field = format!("environment:{}", record.spec.id);
+    let raw_before = raw_control(&rig).await[&field].clone();
+    let persisted: serde_json::Value = serde_json::from_str(&raw_before).unwrap();
+    assert_eq!(persisted["memory"]["closed_source_revision"], 6);
+    assert_eq!(
+        persisted["memory"]["completed"].as_object().unwrap().len(),
+        64
+    );
+
+    rig.crash();
+    rig.start().await;
+    assert_eq!(raw_control(&rig).await[&field], raw_before);
+    let recovered = rig.store().await.begin(1).await.unwrap();
+    assert!(recovered.epoch() > session.epoch());
+    assert_eq!(
+        recovered
+            .get(&record.spec.id)
+            .await
+            .unwrap()
+            .memory
+            .unwrap(),
+        before
+    );
+    assert_eq!(held(&recovered).await, 224 * MIB);
+    now = pending.deadline_unix_millis + 1;
+    let still_unknown = recovered
+        .reconcile_memory(
+            sample(&observation, 112, now),
+            "boot-first",
+            now,
+            Some(&policy),
+        )
+        .await
+        .unwrap();
+    assert_eq!(still_unknown.authorization.as_ref(), Some(&pending));
+    assert!(pending
+        .check_dispatch(now, "boot-first", recovered.epoch())
+        .is_err());
+    assert_eq!(held(&recovered).await, 224 * MIB);
+    // A new observation may legitimately update the private policy window;
+    // the exact authorization, closure facts and reservation must not change.
+    let after_unknown = recovered
+        .get(&record.spec.id)
+        .await
+        .unwrap()
+        .memory
+        .unwrap();
+    assert_eq!(after_unknown.confirmed, before.confirmed);
+    assert_eq!(after_unknown.pending, before.pending);
+    assert_eq!(after_unknown.completed, before.completed);
+    assert_eq!(
+        after_unknown.closed_source_revision,
+        before.closed_source_revision
+    );
+    assert_eq!(
+        after_unknown.latest_completed_issued_unix_millis,
+        before.latest_completed_issued_unix_millis
+    );
+
+    let saved = recovered.snapshot().await.unwrap().nodes["first"].clone();
+    recovered
+        .register_session(
+            saved.node,
+            saved.address,
+            saved.proxy_address,
+            Some(NodeSession {
+                id: "boot-after-history-floor".into(),
+                sequence: 1,
+                routable: true,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        recovered
+            .get(&record.spec.id)
+            .await
+            .unwrap()
+            .memory
+            .unwrap(),
+        after_unknown
+    );
+    assert!(recovered
+        .reconcile_memory(
+            sample(&observation, 112, now),
+            "boot-first",
+            now,
+            Some(&policy)
+        )
+        .await
+        .is_err());
+    assert!(session
+        .reconcile_memory(
+            sample(&observation, 112, now),
+            "boot-after-history-floor",
+            now,
+            Some(&policy)
+        )
+        .await
+        .is_err());
+    assert_eq!(held(&recovered).await, 224 * MIB);
+
+    // A fresh node session may settle the exact predecessor operation without
+    // reauthorizing its expired grant or inventing a retirement/refund proof.
+    observation = pending.request.completion().unwrap();
+    now += 1;
+    let settled = recovered
+        .reconcile_memory(
+            sample(&observation, 112, now),
+            "boot-after-history-floor",
+            now,
+            Some(&policy),
+        )
+        .await
+        .unwrap();
+    assert!(settled.authorization.is_none());
+    let after = recovered
+        .get(&record.spec.id)
+        .await
+        .unwrap()
+        .memory
+        .unwrap();
+    assert!(after.pending.is_none());
+    assert_eq!(after.completed.len(), 64);
+    assert_eq!(after.closed_source_revision, Some(7));
+    assert_eq!(
+        after.latest_completed_issued_unix_millis,
+        pending.issued_unix_millis
+    );
+    assert_eq!(held(&recovered).await, 224 * MIB);
+
+    // Prove the restarted Coordinator and new node session can authorize and
+    // settle another new operation after the retained window advances again.
+    now += 2_000;
+    assert!(recovered
+        .reconcile_memory(
+            sample(&observation, 16, now),
+            "boot-after-history-floor",
+            now,
+            Some(&policy)
+        )
+        .await
+        .unwrap()
+        .authorization
+        .is_none());
+    now += 1_000;
+    let next = recovered
+        .reconcile_memory(
+            sample(&observation, 16, now),
+            "boot-after-history-floor",
+            now,
+            Some(&policy),
+        )
+        .await
+        .unwrap()
+        .authorization
+        .unwrap();
+    assert_eq!(next.request.target_limit_bytes, 128 * MIB);
+    next.check_dispatch(now, "boot-after-history-floor", recovered.epoch())
+        .unwrap();
+    observation = next.request.completion().unwrap();
+    now += 1;
+    assert!(recovered
+        .reconcile_memory(
+            sample(&observation, 64, now),
+            "boot-after-history-floor",
+            now,
+            Some(&policy)
+        )
+        .await
+        .unwrap()
+        .authorization
+        .is_none());
+    let after = recovered
+        .get(&record.spec.id)
+        .await
+        .unwrap()
+        .memory
+        .unwrap();
+    assert_eq!(after.confirmed, observation);
+    assert!(after.pending.is_none());
+    assert_eq!(after.completed.len(), 64);
+    assert_eq!(after.closed_source_revision, Some(8));
+    assert_eq!(
+        after.latest_completed_issued_unix_millis,
+        next.issued_unix_millis
+    );
+    assert_eq!(held(&recovered).await, 128 * MIB);
+}

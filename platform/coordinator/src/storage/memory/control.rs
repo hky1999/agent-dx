@@ -56,6 +56,9 @@ impl MemoryControlPolicy {
     ) -> Result<Option<u64>> {
         let account = env.memory.as_ref().ok_or(Error::Conflict)?;
         if account.pending.is_some()
+            || (account.latest_completed_issued_unix_millis > 0
+                && now.saturating_sub(account.latest_completed_issued_unix_millis)
+                    < self.cooldown_millis)
             || account.completed.values().any(|op| {
                 now.saturating_sub(op.authorization.issued_unix_millis) < self.cooldown_millis
             })
@@ -169,6 +172,8 @@ impl Session {
                     confirmed: observation.clone(),
                     pending: None,
                     completed: BTreeMap::new(),
+                    closed_source_revision: None,
+                    latest_completed_issued_unix_millis: 0,
                     window: MemoryWindow::default(),
                 });
             }
@@ -230,12 +235,7 @@ impl Session {
                             source: observation.clone(),
                             target_limit_bytes: target,
                             target_high_bytes: high(target)?,
-                            operation_id: format!(
-                                "memory-{}-{}-{:x}",
-                                self.epoch(),
-                                observation.resource_revision,
-                                Sha256::digest(encode(observation)?.as_bytes())
-                            ),
+                            operation_id: canonical_operation_id(self.epoch(), observation)?,
                             timeout_millis: p.operation_timeout_millis,
                         };
                         let grant = MemoryAuthorization {
@@ -267,6 +267,14 @@ impl Session {
                             Err(error) => return Err(error),
                         }
                     }
+                }
+            }
+            // A completion can temporarily add a 65th replay entry. Compact it
+            // before validating the persisted account invariants.
+            if let Some(account) = env.memory.as_mut() {
+                account.compact_history()?;
+                if account.closed_source_revision.is_some() {
+                    header.schema = header.schema.max(8)
                 }
             }
             env.validate()?;

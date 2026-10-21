@@ -146,3 +146,7 @@ Rust 共用根 Cargo workspace，Python 工具独立打包；外部 sandboxd 按
 ## 可观测
 
 Coordinator/adxlet 的 Environment 数、资源预留与使用量，Ingress/Relay 的连接、流量与请求指标由各自 `/metrics` 导出。Trace 由组件 OpenTelemetry SDK 经 OTLP/HTTP 发往外部 Collector；结构化 stdout 由 supervisor 滚动压缩，Collector filelog 采集。Pod 可部署 Collector sidecar，进程环境独立托管。统一实时 Trace 队列丢弃指标已后置，不能与已有导出失败计数混同。
+
+## 持久历史回收
+
+`platform/crates/core/src/history.rs` 定义权威拒绝边界与创建身份。`platform/coordinator/src/storage/memory.rs` 保留有界内存完成记录；`platform/adxlet/src/sandboxd/operations/history.rs` 保存节点拒绝边界和回收意图；`platform/adxlet/src/sandboxd/history.rs` 执行与守护进程的历史握手。物理退役与预算结算先于历史处理，具体版本、配置和恢复边界见[历史回收契约](../deployment/history-reclamation.md)。

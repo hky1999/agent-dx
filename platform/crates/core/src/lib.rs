@@ -2,6 +2,7 @@
 
 pub mod checkpoint;
 pub mod execution;
+pub mod history;
 pub mod lifecycle;
 pub mod memory;
 pub mod runtime_profile;

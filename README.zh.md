@@ -208,3 +208,5 @@ SDK 发布名为 `adx-sandbox`，Python 导入名为 `adx_sandbox`，CLI 为 `ad
 ## 许可证
 
 Agent DX 使用 [Apache License 2.0](LICENSE)。
+
+匹配组件支持显式启用持久历史回收，配置、旧请求拒绝和恢复边界见[历史回收契约](docs/deployment/history-reclamation.md)。

@@ -112,6 +112,8 @@ async fn network_create_preserves_tenant_session_and_api_key_checks() {
         .inspect_node(pb::InspectNodeRequest {
             node_id: "node".into(),
             session_id: "boot-1".into(),
+            history_reclamation: false,
+            include_history: false,
         })
         .await
         .unwrap();
