@@ -1,13 +1,15 @@
-# CrossNode shared-storage source delivery
+# CrossNode 共享存储源码交付说明
 
-This experimental integration keeps Environment scheduling and lifecycle in ADX. It adds SharedFs checkpoint handling, persisted checkpoint-reader reservations and execution-bound retirement, and controlled shared-volume admission through the existing public Environment API/SDK chain.
+本实验集成继续由 ADX 负责 Environment（沙箱执行环境）的调度和生命周期。在现有公开 Environment API/SDK 链路上，补齐 SharedFs（共享文件系统）checkpoint 处理、持久化的 checkpoint 读者预留、与具体执行实例绑定的退出确认，以及受控共享卷挂载。
 
-The runtime implementation remains in sandboxd and gVisor. The vendored sandboxd protocol is pinned by `third_party/sandboxd/source.json`; changing the runtime source version must preserve its protocol checksum. No runtime source is copied into this control-plane repository.
+运行时实现仍分别维护在 sandboxd 和 gVisor 中。引入控制面的 sandboxd 协议由 `third_party/sandboxd/source.json` 固定版本；更新运行时源码版本时必须保持协议校验和匹配，不把运行时源码复制到控制面仓库。
 
-`platform/adxlet/src/checkpoint/shared_fs.rs` and its leases module own shared-filesystem publication/materialization behavior. Coordinator reader and attachment records must survive process restart. A timeout or disappearance alone is not a positive retirement proof and cannot authorize collection.
+`platform/adxlet/src/checkpoint/shared_fs.rs` 及其 leases 模块负责共享文件系统上的快照发布和恢复准备。Coordinator 中记录的读者与共享卷挂载关系必须在进程重启后继续有效。操作超时或进程消失本身，不是已经停止读取的可靠证明，不能据此回收底层文件。
 
-Public shared-volume metadata and execution admission are separate from private checkpoint snapshots. Permissions and storage identity must be rechecked before start/restore. A live shared directory is not rolled back when restoring private memory/filesystem state. Existing mounts are not proven stopped by permission revocation alone.
+公共共享卷的元数据、运行时挂载准入，与沙箱私有 checkpoint 是不同的契约。启动和恢复前必须重新检查权限及存储身份。恢复私有内存和文件系统状态时，不回滚正在使用的共享目录；撤销权限也不能证明已有挂载已经停止使用。
 
-The accepted experiment uses two isolated logical nodes on one host with independent JuiceFS clients. It does not establish physical cross-host migration or production storage HA. Runtime compatibility pins, source commits, SDK probes and paired performance data are published separately in `hky1999/AKernel_CR`.
+已验收实验在同一台物理机上运行两个隔离逻辑节点，各自使用独立的 JuiceFS 客户端。该实验尚未证明真实跨物理机迁移或生产存储高可用。运行时兼容版本、源码提交、SDK 验收探针和配对性能数据，统一在 `hky1999/AKernel_CR` 中留档。
 
-The Coordinator shutdown/stream-cancellation candidate and unrelated AFS edits are excluded. Strict whole-workspace optional-AFS checks require their system dependencies; disclose unavailable gates rather than replacing them with component results.
+未验收的 Coordinator 退出/流取消候选，以及无关 AFS 修改，不进入本次交付。严格的全工作区检查包含可选 AFS 组件，需具备相应系统依赖；无法执行的门禁必须明确披露，不能用局部组件通过替代。
+
+文档默认使用中文；配置字段、接口名、命令和必要的技术标识保持原样。
