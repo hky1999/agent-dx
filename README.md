@@ -222,3 +222,5 @@ Agent DX is released under the [Apache License 2.0](LICENSE).
 Persistent scheduler history can be explicitly reclaimed with matching components; see the [configuration, replay and recovery contract](docs/deployment/history-reclamation.md).
 
 Host pressure admission gates creation, growth and recovery while preserving existing reservations; see the [configuration, accounts and storage recovery contract](docs/deployment/pressure-admission.md).
+
+宿主服务和检查点使用[同一持久预算](docs/deployment/overhead-budget.md)，私有控制器接口不对任务开放。

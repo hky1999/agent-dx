@@ -1,7 +1,11 @@
 //! Single-Coordinator Redis persistence. Lua only compares opaque bytes and performs
 //! atomic hash writes; JSON and u64 counters are validated in Rust, never Lua doubles.
 mod budget;
+mod overhead;
+mod parking;
 pub use budget::{HostBudget, HostBudgetStatus, HostMemoryAccounts};
+pub use overhead::OverheadReservation;
+pub use parking::ParkingJournal;
 mod claims;
 pub use claims::{ClaimOutcome, LocalClaim};
 mod collection;
@@ -77,11 +81,21 @@ struct Header {
     next_node_shard: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     host_budgets: Option<BTreeMap<String, HostBudget>>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    overhead_budget: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    parking_journals: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     host_pressure_admission: BTreeMap<String, adx_core::pressure::PressureSource>,
 }
 impl Header {
     fn advance(&mut self) -> Result<()> {
+        if self.parking_journals {
+            self.schema = self.schema.max(11);
+        }
+        if self.overhead_budget {
+            self.schema = self.schema.max(10);
+        }
         if self.host_budgets.is_some() {
             self.schema = self.schema.max(7);
         }
@@ -103,6 +117,8 @@ impl Header {
                 | (7, true)
                 | (8, _)
                 | (9, true)
+                | (10, true)
+                | (11, true)
         ) || self.shards == 0
             || self.next_node_shard >= self.shards
             || self.epoch == 0
@@ -110,6 +126,12 @@ impl Header {
             return Err(Error::Unavailable(
                 "unsupported or corrupt control metadata".into(),
             ));
+        }
+        if self.parking_journals && self.schema < 11 {
+            return Err(Error::Conflict);
+        }
+        if self.overhead_budget && self.schema < 10 {
+            return Err(Error::Conflict);
         }
         if let Some(budgets) = &self.host_budgets {
             budget::validate_budgets(budgets)?;
@@ -822,6 +844,8 @@ impl RedisStore {
                     revision: 0,
                     next_node_shard: 0,
                     host_budgets: None,
+                    overhead_budget: false,
+                    parking_journals: false,
                     host_pressure_admission: BTreeMap::new(),
                 }
             } else {
@@ -949,6 +973,9 @@ fn snapshot(raw: &BTreeMap<String, String>) -> Result<StoredSnapshot> {
             .ok_or_else(|| Error::Unavailable("control metadata missing".into()))?,
     )?;
     h.validate()?;
+    if raw.keys().filter(|k| k.starts_with("parking:")).count() > 16 {
+        return Err(Error::NoCapacity);
+    }
     let mut out = StoredSnapshot {
         shard_count: h.shards,
         generation: h.generation,
@@ -961,6 +988,20 @@ fn snapshot(raw: &BTreeMap<String, String>) -> Result<StoredSnapshot> {
             out.nodes.insert(id.into(), decode(value)?);
         } else if let Some(id) = key.strip_prefix("environment:") {
             out.environments.insert(id.into(), decode(value)?);
+        } else if let Some(id) = key.strip_prefix("overhead:") {
+            if !h.overhead_budget || h.schema < 10 {
+                return Err(Error::Conflict);
+            }
+            overhead::field(id)?;
+            let reservation: OverheadReservation = decode(value)?;
+            reservation.validate()?;
+        } else if let Some(id) = key.strip_prefix("parking:") {
+            if !h.parking_journals || h.schema < 11 {
+                return Err(Error::Conflict);
+            }
+            overhead::field(id)?;
+            let journal: ParkingJournal = decode(value)?;
+            journal.validate()?;
         } else if key != HEADER {
             return Err(Error::Unavailable("unknown control metadata field".into()));
         }

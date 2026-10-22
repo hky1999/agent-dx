@@ -54,3 +54,5 @@ The API always uses the verified tenant, not tenant fields supplied in a request
 The API Server's legacy `/api/agent` compatibility routes forward to `agent_address` when configured and preserve streaming responses. The separate Agent v2 entrypoint in embedded Ingress may call an in-process Activator; Agent authorization and product rules remain in the Agent layer.
 
 See [HTTP contract](docs/sandbox-lifecycle-api.md), [failure behavior](docs/sandbox-runtime-failure.md), [deployment](../../docs/testing/process-deployment.md), and [Rust migration status](../../docs/testing/rust-apiserver.md).
+
+压力停车的暂停请求可以携带source对象，字段为runtimeId、assignmentGeneration及revision。该对象要求完整且只能用于pause；公开入口在派发前和再次读取归属后核对源运行实例及版本。重复完成操作只接受相同请求ID及原版本。不匹配返回冲突，不切换目标。带source的pause不进行网关内部未知结果重试，调用方必须持久对账；sandboxd仍执行自身resource generation条件检查及精确退役。原普通SDK接口可以省略source，但受控停车编排必须显式提供。

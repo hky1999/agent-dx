@@ -87,6 +87,7 @@ impl Operations {
             .record
             .as_ref()
             .ok_or_else(|| Status::unavailable("environment directory returned no record"))?;
+        validate_parking_source(kind, &body, record, request_id)?;
         if kind == Kind::Delete
             && record.state == pb::EnvironmentState::Deleted as i32
             && !record.resources_held
@@ -132,6 +133,15 @@ impl Operations {
             ));
         }
         for attempt in 0..2 {
+            validate_parking_source(
+                kind,
+                &body,
+                owner
+                    .record
+                    .as_ref()
+                    .ok_or_else(|| Status::unavailable("environment record missing"))?,
+                request_id,
+            )?;
             let mut node = pb::node_service_client::NodeServiceClient::new(
                 clients.channel(&owner.node_address).await?,
             );
@@ -333,7 +343,7 @@ impl Operations {
                                     error.code(),
                                     Code::NotFound | Code::FailedPrecondition
                                 ));
-                    if !retryable {
+                    if !retryable || (kind == Kind::Pause && body.get("source").is_some()) {
                         self.pending.lock().await.remove(&key);
                         return Err(error);
                     }
@@ -358,6 +368,54 @@ impl Operations {
         unreachable!()
     }
 }
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ParkingSource {
+    runtime_id: String,
+    assignment_generation: u64,
+    revision: u64,
+}
+
+/// Explicit source fencing for the trusted parking controller. Existing lifecycle
+/// clients may omit source; a supplied fence is never ignored or retargeted.
+fn validate_parking_source(
+    kind: Kind,
+    body: &Value,
+    record: &pb::EnvironmentRecord,
+    request_id: &str,
+) -> Result<(), Status> {
+    let Some(value) = body.get("source") else {
+        return Ok(());
+    };
+    if kind != Kind::Pause {
+        return Err(Status::invalid_argument("source fence only supports pause"));
+    }
+    let source: ParkingSource = serde_json::from_value(value.clone())
+        .map_err(|_| Status::invalid_argument("complete parking source required"))?;
+    let replay = record.last_operation.as_ref().is_some_and(|op| {
+        op.id == request_id && op.kind == kind.code() && op.expected_revision == source.revision
+    });
+    if source.runtime_id.is_empty()
+        || source.runtime_id.len() > 256
+        || source.assignment_generation == 0
+        || source.revision == 0
+        || record
+            .runtime
+            .as_ref()
+            .is_none_or(|r| r.id != source.runtime_id)
+        || record
+            .assignment
+            .as_ref()
+            .is_none_or(|a| a.generation != source.assignment_generation)
+        || (record.revision != source.revision && !replay)
+    {
+        return Err(Status::failed_precondition(
+            "parking source changed; refusing to retarget",
+        ));
+    }
+    Ok(())
+}
+
 pub fn number(value: &Value, key: &str, default: u64, max: u64) -> Result<u64, Status> {
     let value = match value.get(key) {
         None | Some(Value::Null) => default,
@@ -388,4 +446,42 @@ pub fn snapshot_value(
         ));
     }
     Ok(json!({"snapshotId":s.id,"names":s.names}))
+}
+
+#[cfg(test)]
+mod parking_source_tests {
+    use super::*;
+    #[test]
+    fn source_pause_guard_rejects_runtime_assignment_revision_and_partial_identity() {
+        let r = pb::EnvironmentRecord {
+            runtime: Some(pb::Runtime {
+                id: "runtime".into(),
+                ..Default::default()
+            }),
+            assignment: Some(pb::Assignment {
+                generation: 7,
+                ..Default::default()
+            }),
+            revision: 9,
+            ..Default::default()
+        };
+        let source = json!({"runtimeId":"runtime","assignmentGeneration":7,"revision":9});
+        assert!(
+            validate_parking_source(Kind::Pause, &json!({"source":source}), &r, "park").is_ok()
+        );
+        for bad in [
+            json!({"runtimeId":"other","assignmentGeneration":7,"revision":9}),
+            json!({"runtimeId":"runtime","assignmentGeneration":8,"revision":9}),
+            json!({"runtimeId":"runtime","assignmentGeneration":7,"revision":10}),
+            json!({"runtimeId":"runtime"}),
+        ] {
+            assert!(
+                validate_parking_source(Kind::Pause, &json!({"source":bad}), &r, "park").is_err()
+            );
+        }
+        assert!(
+            validate_parking_source(Kind::Resume, &json!({"source":source}), &r, "park").is_err()
+        );
+        assert!(validate_parking_source(Kind::Pause, &json!({}), &r, "park").is_ok());
+    }
 }

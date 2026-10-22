@@ -1385,3 +1385,9 @@ mod admin_keys;
 
 #[path = "storage/pressure.rs"]
 mod pressure;
+
+#[path = "storage/overhead.rs"]
+mod overhead;
+
+#[path = "storage/parking_journal.rs"]
+mod parking_journal;

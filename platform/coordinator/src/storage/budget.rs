@@ -65,6 +65,36 @@ fn statuses(
             )
         })
         .collect();
+    if raw.keys().filter(|k| k.starts_with("overhead:")).count() > 512 {
+        return Err(Error::NoCapacity);
+    }
+    for (field, value) in raw {
+        if let Some(id) = field.strip_prefix("overhead:") {
+            super::overhead::field(id)?;
+            let reservation: super::overhead::OverheadReservation = decode(value)?;
+            reservation.validate()?;
+            let status = out.get_mut(&reservation.host_id).ok_or(Error::Conflict)?;
+            if reservation.retirement_proof_sha256.is_none() {
+                let sum = |a: u64, b: u64| a.checked_add(b).ok_or(Error::NoCapacity);
+                status.held = Resources {
+                    cpu_millis: sum(status.held.cpu_millis, reservation.resources.cpu_millis)?,
+                    memory_bytes: sum(
+                        status.held.memory_bytes,
+                        reservation.resources.memory_bytes,
+                    )?,
+                    disk_bytes: sum(status.held.disk_bytes, reservation.resources.disk_bytes)?,
+                };
+                status.memory_accounts.overhead_bytes = sum(
+                    status.memory_accounts.overhead_bytes,
+                    reservation.resources.memory_bytes,
+                )?;
+                if !status.held.fits(&status.capacity) {
+                    return Err(Error::NoCapacity);
+                }
+                status.available = status.capacity.saturating_sub(status.held);
+            }
+        }
+    }
     let mut add = |record: &StoredEnvironment| -> Result<()> {
         if !record.resources_held() {
             return Ok(());
@@ -204,6 +234,7 @@ pub(super) fn check_admission(
 /// views (unknown and restore) must not be added to those partitions.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostMemoryAccounts {
+    pub overhead_bytes: u64,
     pub birth_bytes: u64,
     pub settled_extra_bytes: u64,
     pub in_flight_extra_bytes: u64,
