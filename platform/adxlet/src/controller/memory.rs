@@ -45,9 +45,18 @@ impl Controller {
                 .as_millis();
             let now = u64::try_from(now)
                 .map_err(|_| Error::Unavailable("system clock overflow".into()))?;
+            let growth_admitted = grant.request.target_limit_bytes
+                <= grant.request.source.memory_limit_bytes
+                || !self
+                    .services
+                    .admission
+                    .lock()
+                    .map_err(|_| Error::Unavailable("admission lock poisoned".into()))?
+                    .pressure_closed();
             let actual = if grant
                 .check_dispatch(now, &decision.node_session_id, decision.coordinator_epoch)
                 .is_ok()
+                && growth_admitted
             {
                 self.apply_memory_hold(&decision)?;
                 self.services

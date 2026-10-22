@@ -2146,3 +2146,148 @@ async fn memory_control_reconciliation_keeps_progress_after_history_floor_and_re
     );
     assert_eq!(held(&recovered).await, 128 * MIB);
 }
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn memory_pressure_preserves_pending_growth_allows_settlement_and_shrink() {
+    let (_rig, s, _record, mut observation) = fixture_with_elastic(true).await;
+    observation.memory_limit_bytes = 128 * MIB;
+    observation.memory_high_bytes = 96 * MIB;
+    s.initialize_memory(observation.clone(), "boot-first")
+        .await
+        .unwrap();
+    let (_root, source) = super::pressure::source();
+    s.configure_host_pressure(BTreeMap::from([("host".into(), source.clone())]))
+        .await
+        .unwrap();
+    let grant = s
+        .authorize_memory(
+            request(&observation, "grow-pressure", 192),
+            "boot-first",
+            10000,
+        )
+        .await
+        .unwrap();
+    let account = &s.host_budgets().await.unwrap()["host"].memory_accounts;
+    assert_eq!(account.birth_bytes, 128 * MIB);
+    assert_eq!(account.settled_extra_bytes, 0);
+    assert_eq!(account.in_flight_extra_bytes, 64 * MIB);
+    assert_eq!(account.unknown_result_bytes, 192 * MIB);
+    assert_eq!(account.competing_ungranted_bytes, 64 * MIB);
+    super::pressure::publish(&source, false);
+    assert_eq!(held(&s).await, 192 * MIB);
+    let grown = completed(&grant);
+    s.complete_memory(grant, grown.clone(), "boot-first")
+        .await
+        .unwrap();
+    assert_eq!(
+        s.authorize_memory(request(&grown, "blocked-growth", 256), "boot-first", 11000)
+            .await,
+        Err(Error::NoCapacity)
+    );
+    let shrink = s
+        .authorize_memory(request(&grown, "shrink-pressure", 128), "boot-first", 12000)
+        .await
+        .unwrap();
+    let mut saved = s.snapshot().await.unwrap().nodes["first"].clone();
+    saved.node.available = false;
+    saved.session.as_mut().unwrap().sequence += 1;
+    s.register_session(
+        saved.node,
+        saved.address,
+        saved.proxy_address,
+        saved.session,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        held(&s).await,
+        192 * MIB,
+        "unconfirmed shrink retains the source allowance"
+    );
+    s.complete_memory(shrink.clone(), completed(&shrink), "boot-first")
+        .await
+        .unwrap();
+    assert_eq!(held(&s).await, 128 * MIB);
+    let account = &s.host_budgets().await.unwrap()["host"].memory_accounts;
+    assert_eq!(
+        account.birth_bytes + account.settled_extra_bytes + account.in_flight_extra_bytes,
+        held(&s).await
+    );
+    assert_eq!(account.unknown_result_bytes, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn memory_pressure_blocks_restore_and_preserves_existing_restore_reservation() {
+    let (_rig, s, mut record, mut observation) = fixture_with_elastic(true).await;
+    observation.memory_limit_bytes = 128 * MIB;
+    observation.memory_high_bytes = 96 * MIB;
+    s.initialize_memory(observation, "boot-first")
+        .await
+        .unwrap();
+    record.state = EnvironmentState::Paused;
+    record.revision += 1;
+    record.resources_held = false;
+    record.runtime.ip = None;
+    record.checkpoint = Some(adx_core::RestorePoint {
+        id: "checkpoint-pressure".into(),
+        origin: None,
+        expires_at_unix_seconds: u64::MAX,
+        source_runtime_id: record.runtime.id.clone(),
+        artifact: adx_core::CheckpointArtifact {
+            storage: "shared".into(),
+            location: "artifact".into(),
+            size_bytes: 8,
+        },
+    });
+    s.commit(record.clone()).await.unwrap();
+    let mut neighbor = record.spec.clone();
+    neighbor.id = "neighbor-pressure".into();
+    let mut assignment = record.assignment.clone();
+    assignment.environment_id = neighbor.id.clone();
+    assignment.generation = 2;
+    s.reserve(neighbor, assignment).await.unwrap();
+    let (_root, source) = super::pressure::source();
+    s.configure_host_pressure(BTreeMap::from([("host".into(), source.clone())]))
+        .await
+        .unwrap();
+    let request = adx_core::execution::ExecutionRequest {
+        expected_revision: record.revision,
+        source: record,
+        kind: adx_core::execution::ExecutionKind::Resume,
+        operation_id: "resume-pressure".into(),
+        timeout_millis: 1000,
+    };
+    super::pressure::publish(&source, false);
+    assert_eq!(
+        s.authorize_execution(request.clone(), "boot-first", 10000)
+            .await,
+        Err(Error::NoCapacity)
+    );
+    assert_eq!(held(&s).await, 128 * MIB);
+    super::pressure::publish(&source, true);
+    let grant = s
+        .authorize_execution(request.clone(), "boot-first", 11000)
+        .await
+        .unwrap();
+    assert_eq!(held(&s).await, 384 * MIB);
+    assert_eq!(
+        s.host_budgets().await.unwrap()["host"]
+            .memory_accounts
+            .restore_in_flight_bytes,
+        256 * MIB
+    );
+    std::fs::remove_file(&source.path).unwrap();
+    assert_eq!(
+        s.authorize_execution(request, "boot-first", 12000)
+            .await
+            .unwrap(),
+        grant
+    );
+    assert_eq!(
+        held(&s).await,
+        384 * MIB,
+        "unknown restore remains reserved when observation disappears"
+    );
+}

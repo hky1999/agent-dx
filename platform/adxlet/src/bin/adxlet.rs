@@ -51,6 +51,8 @@ struct Config {
     #[serde(default)]
     pressure: Option<PressureConfig>,
     #[serde(default)]
+    host_pressure: Option<adx_core::pressure::PressureSource>,
+    #[serde(default)]
     metrics_listen: Option<SocketAddr>,
     #[serde(default)]
     execd_health_failure_threshold: Option<u32>,
@@ -319,6 +321,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(UdsRoutes::new(config.proxy_socket.clone(), timeout)?),
         state_sink,
     )
+    .with_host_pressure(config.host_pressure.clone())?
     .with_runtime_control(control.clone())?
     .with_operation_timeout(timeout)?
     .with_health_check(config.execd_health_failure_threshold)?;
@@ -341,6 +344,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?
             .with_snapshot_catalog(sink.clone())?;
     }
+    manager.set_pressure(config.pressure.is_some());
     let manager = Arc::new(manager);
     manager.pause_lifecycle().await;
     let (o, valid) = loop {
@@ -487,7 +491,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .await
                     {
                         Ok(Ok(pressure)) => gate.update(pressure),
-                        _ => false,
+                        _ => {
+                            gate.close();
+                            false
+                        }
                     };
                 manager.set_pressure(!accepting);
             }

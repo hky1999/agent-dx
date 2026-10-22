@@ -391,7 +391,7 @@ impl Session {
                     unchanged: false,
                 });
             environment.validate()?;
-            budget::check_admission(&raw, &header, &environment)?;
+            budget::check_memory_admission(&raw, &header, &environment)?;
             header.schema = header.schema.max(6);
             header.advance()?;
             if self

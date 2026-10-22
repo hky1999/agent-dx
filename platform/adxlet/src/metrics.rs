@@ -99,7 +99,8 @@ impl Adxlet {
         let devices_fresh = admission
             .devices_valid_until
             .is_some_and(|until| tokio::time::Instant::now() < until);
-        let accepting = lifecycle_ready && fresh && !admission.maintenance && !admission.pressure;
+        let accepting =
+            lifecycle_ready && fresh && !admission.maintenance && !admission.pressure_closed();
         let mut text = adx_observability::metrics::Text::default();
         text.gauge("adx_node_accepting_allocations", &[], u64::from(accepting));
         text.gauge("adx_node_resource_observation_fresh", &[], u64::from(fresh));

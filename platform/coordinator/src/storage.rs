@@ -1,7 +1,7 @@
 //! Single-Coordinator Redis persistence. Lua only compares opaque bytes and performs
 //! atomic hash writes; JSON and u64 counters are validated in Rust, never Lua doubles.
 mod budget;
-pub use budget::{HostBudget, HostBudgetStatus};
+pub use budget::{HostBudget, HostBudgetStatus, HostMemoryAccounts};
 mod claims;
 pub use claims::{ClaimOutcome, LocalClaim};
 mod collection;
@@ -77,11 +77,16 @@ struct Header {
     next_node_shard: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     host_budgets: Option<BTreeMap<String, HostBudget>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    host_pressure_admission: BTreeMap<String, adx_core::pressure::PressureSource>,
 }
 impl Header {
     fn advance(&mut self) -> Result<()> {
         if self.host_budgets.is_some() {
             self.schema = self.schema.max(7);
+        }
+        if !self.host_pressure_admission.is_empty() {
+            self.schema = self.schema.max(9);
         }
         self.revision = self.revision.checked_add(1).ok_or(Error::Conflict)?;
         Ok(())
@@ -97,6 +102,7 @@ impl Header {
                 | (6, true)
                 | (7, true)
                 | (8, _)
+                | (9, true)
         ) || self.shards == 0
             || self.next_node_shard >= self.shards
             || self.epoch == 0
@@ -107,6 +113,15 @@ impl Header {
         }
         if let Some(budgets) = &self.host_budgets {
             budget::validate_budgets(budgets)?;
+        }
+        if !self.host_pressure_admission.is_empty() {
+            if self.schema < 9 {
+                return Err(Error::Conflict);
+            }
+            budget::validate_pressure_sources(
+                self.host_budgets.as_ref(),
+                &self.host_pressure_admission,
+            )?;
         }
         Ok(())
     }
@@ -807,6 +822,7 @@ impl RedisStore {
                     revision: 0,
                     next_node_shard: 0,
                     host_budgets: None,
+                    host_pressure_admission: BTreeMap::new(),
                 }
             } else {
                 let mut h: Header = decode(old)?;

@@ -5,6 +5,7 @@ pub mod execution;
 pub mod history;
 pub mod lifecycle;
 pub mod memory;
+pub mod pressure;
 pub mod runtime_profile;
 pub mod snapshots;
 pub use checkpoint::{

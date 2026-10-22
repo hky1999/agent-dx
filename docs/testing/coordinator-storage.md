@@ -161,3 +161,5 @@ cargo clippy --locked -p adx-coordinator -p adx-core -p adx-scheduling --all-tar
 持续低用量窗口更新及新授权预留。窗口字段从schema 5引入，当前宿主预算使用schema 7，旧写入者不能忽略该状态或绕过持久确认。
 当前会话可以结算原会话的精确物理结果，但不能重用旧授权执行。
 节点能力和自动策略要求见[自动内存控制](../deployment/memory-control.md)。
+
+宿主压力关闭期间仍允许精确结算和缩容，创建、扩容和恢复由持久中心与节点最终准入共同限制。配置、资源分项及存储恢复边界见[压力准入契约](../deployment/pressure-admission.md)。

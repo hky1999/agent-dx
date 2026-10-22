@@ -1,0 +1,12 @@
+{
+  "path": "/run/akernel-pressure/physical-host-1.json",
+  "max_age_millis": 3000,
+  "identity": {
+    "host_id": "physical-host-1",
+    "authority": "replace-with-operator-generation",
+    "boot_id": "replace-with-current-boot-id",
+    "parent_device": 30,
+    "parent_inode": 1,
+    "storage_identity_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  }
+}

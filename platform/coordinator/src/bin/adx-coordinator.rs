@@ -37,6 +37,8 @@ struct Config {
     #[serde(default)]
     host_budgets: Option<BTreeMap<String, HostBudget>>,
     #[serde(default)]
+    host_pressure_admission: BTreeMap<String, adx_core::pressure::PressureSource>,
+    #[serde(default)]
     memory_control: Option<adx_coordinator::storage::MemoryControlPolicy>,
     placement: String,
     rpc_timeout_seconds: u64,
@@ -96,6 +98,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(budgets) = config.host_budgets {
         session.configure_host_budgets(budgets).await?;
     }
+    session
+        .configure_host_pressure(config.host_pressure_admission)
+        .await?;
     let mut administrators = Vec::new();
     let mut tenants = Vec::new();
     for credential in config.bootstrap_credentials {

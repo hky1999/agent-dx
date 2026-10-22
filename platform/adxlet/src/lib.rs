@@ -323,10 +323,19 @@ pub(crate) struct Admission {
     valid_until: Option<Instant>,
     maintenance: bool,
     pressure: bool,
+    host_pressure: Option<adx_core::pressure::PressureSource>,
     runtime_classes: Option<std::collections::BTreeSet<String>>,
 }
 
 impl Admission {
+    fn pressure_closed(&self) -> bool {
+        self.pressure
+            || self
+                .host_pressure
+                .as_ref()
+                .is_some_and(|source| source.check_now().is_err())
+    }
+
     fn memory_hold(&mut self, record: &EnvironmentRecord, target: Resources) -> Result<()> {
         let ceiling = record.spec.execution_ceiling();
         if target.cpu_millis != ceiling.cpu_millis
@@ -342,7 +351,7 @@ impl Admission {
             .ok_or(Error::Conflict)?;
         if target.memory_bytes > previous.memory_bytes
             && (self.maintenance
-                || self.pressure
+                || self.pressure_closed()
                 || self.valid_until.is_none_or(|until| Instant::now() >= until))
         {
             return Err(Error::NoCapacity);
@@ -361,7 +370,7 @@ impl Admission {
         resources: Resources,
     ) -> Result<()> {
         if self.maintenance
-            || self.pressure
+            || self.pressure_closed()
             || self
                 .runtime_classes
                 .as_ref()
@@ -446,6 +455,7 @@ impl Adxlet {
                     valid_until: None,
                     maintenance: false,
                     pressure: false,
+                    host_pressure: None,
                     runtime_classes: None,
                 })),
                 operation_timeout: Duration::from_secs(30),
@@ -586,6 +596,24 @@ impl Adxlet {
         Ok(self)
     }
 
+    /// Configure the trusted host observation before creating Environment handles.
+    /// Invalid configuration returns Invalid; shared service ownership returns Conflict.
+    pub fn with_host_pressure(
+        mut self,
+        source: Option<adx_core::pressure::PressureSource>,
+    ) -> Result<Self> {
+        if let Some(source) = &source {
+            source.validate()?;
+        }
+        Arc::get_mut(&mut self.services)
+            .ok_or(Error::Conflict)?
+            .admission
+            .lock()
+            .map_err(|_| Error::Unavailable("admission lock poisoned".into()))?
+            .host_pressure = source;
+        Ok(self)
+    }
+
     pub fn set_maintenance(&self, maintenance: bool) {
         self.services
             .admission
@@ -617,7 +645,7 @@ impl Adxlet {
             .lock()
             .expect("shared state lock poisoned");
         !admission.maintenance
-            && !admission.pressure
+            && !admission.pressure_closed()
             && admission
                 .runtime_classes
                 .as_ref()

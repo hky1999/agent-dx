@@ -103,3 +103,37 @@ async fn external_http_source_supplies_host_and_expires_on_disconnect() {
         .await
         .is_err());
 }
+
+#[test]
+fn pressure_starts_closed_until_a_complete_low_sample() {
+    let mut gate = PressureGate::new(PressurePolicy::default()).unwrap();
+    assert!(
+        !gate.update(Pressure {
+            memory_percent: 85,
+            disk_percent: 85
+        }),
+        "a middle-band first observation must not open admission"
+    );
+    assert!(gate.update(Pressure {
+        memory_percent: 70,
+        disk_percent: 70
+    }));
+}
+
+#[test]
+fn pressure_failure_requires_a_new_complete_low_sample() {
+    let mut gate = PressureGate::new(PressurePolicy::default()).unwrap();
+    assert!(gate.update(Pressure {
+        memory_percent: 70,
+        disk_percent: 70
+    }));
+    gate.close();
+    assert!(!gate.update(Pressure {
+        memory_percent: 85,
+        disk_percent: 70
+    }));
+    assert!(gate.update(Pressure {
+        memory_percent: 70,
+        disk_percent: 70
+    }));
+}

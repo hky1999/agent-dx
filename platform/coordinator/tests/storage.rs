@@ -1382,3 +1382,6 @@ async fn recovery_never_uses_missing_local_or_expired_checkpoint() {
 
 #[path = "storage/admin_keys.rs"]
 mod admin_keys;
+
+#[path = "storage/pressure.rs"]
+mod pressure;

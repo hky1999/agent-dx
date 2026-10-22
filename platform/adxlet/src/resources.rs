@@ -412,8 +412,12 @@ impl PressureGate {
         }
         Ok(Self {
             policy,
-            accepting: true,
+            accepting: false,
         })
+    }
+    /// Invalidate the hysteresis state after an observation failure.
+    pub fn close(&mut self) {
+        self.accepting = false;
     }
     pub fn update(&mut self, pressure: Pressure) -> bool {
         if pressure.memory_percent >= self.policy.memory_high_percent

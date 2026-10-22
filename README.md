@@ -220,3 +220,5 @@ The SDK distribution is `adx-sandbox`, its Python import is `adx_sandbox`, and i
 Agent DX is released under the [Apache License 2.0](LICENSE).
 
 Persistent scheduler history can be explicitly reclaimed with matching components; see the [configuration, replay and recovery contract](docs/deployment/history-reclamation.md).
+
+Host pressure admission gates creation, growth and recovery while preserving existing reservations; see the [configuration, accounts and storage recovery contract](docs/deployment/pressure-admission.md).

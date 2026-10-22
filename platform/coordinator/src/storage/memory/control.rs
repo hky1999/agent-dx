@@ -254,7 +254,7 @@ impl Session {
                             authorization: grant,
                         };
                         env.memory.as_mut().ok_or(Error::Conflict)?.pending = Some(operation);
-                        match budget::check_admission(&raw, &header, &env) {
+                        match budget::check_memory_admission(&raw, &header, &env) {
                             Ok(()) => {
                                 let window =
                                     &mut env.memory.as_mut().ok_or(Error::Conflict)?.window;

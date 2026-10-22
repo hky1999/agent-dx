@@ -282,7 +282,7 @@ async fn storage_wait_preserves_reachable_execution_and_requires_reconciliation(
 async fn assert_owner_expires(actual_node: &str, actual_session: &str, queued: bool) {
     let mut f = fixture(actual_node, actual_session).await;
     let before = f.session.get("held").await.unwrap();
-    let budget = f.session.host_budgets().await.unwrap();
+    let mut budget = f.session.host_budgets().await.unwrap();
     if queued {
         stall_registration(&mut f).await;
     } else {
@@ -295,6 +295,11 @@ async fn assert_owner_expires(actual_node: &str, actual_session: &str, queued: b
     assert!(held.resources_held());
     assert_eq!(held.assignment, before.assignment);
     assert_eq!(held.result.unwrap().state, EnvironmentState::Failed);
+    // Holds and their partitions remain; the unknown-result overlap changes.
+    for status in budget.values_mut() {
+        assert_eq!(status.memory_accounts.unknown_result_bytes, 0);
+        status.memory_accounts.unknown_result_bytes = status.held.memory_bytes;
+    }
     assert_eq!(f.session.host_budgets().await.unwrap(), budget);
 }
 
@@ -321,7 +326,7 @@ async fn reachable_owner_without_queued_heartbeat_still_expires() {
 async fn consumed_receipt_cannot_be_replayed_to_keep_owner_alive() {
     let mut f = fixture("node", "owner-boot").await;
     let before = f.session.get("held").await.unwrap();
-    let budget = f.session.host_budgets().await.unwrap();
+    let mut budget = f.session.host_budgets().await.unwrap();
     stall_registration(&mut f).await;
     assert_eq!(f.rpc.expire_nodes().await.unwrap(), 0);
     assert_eq!(f.probes.load(Ordering::SeqCst), 1);
@@ -341,6 +346,11 @@ async fn consumed_receipt_cannot_be_replayed_to_keep_owner_alive() {
     assert!(held.resources_held());
     assert_eq!(held.assignment, before.assignment);
     assert_eq!(held.result.unwrap().state, EnvironmentState::Failed);
+    // Holds and their partitions remain; the unknown-result overlap changes.
+    for status in budget.values_mut() {
+        assert_eq!(status.memory_accounts.unknown_result_bytes, 0);
+        status.memory_accounts.unknown_result_bytes = status.held.memory_bytes;
+    }
     assert_eq!(f.session.host_budgets().await.unwrap(), budget);
 }
 

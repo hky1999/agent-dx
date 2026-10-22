@@ -251,6 +251,12 @@ async fn rig() -> (Arc<Rig>, Arc<Adxlet>, adxlet::EnvironmentHandle) {
 async fn rig_with_idle(
     idle_timeout_seconds: u64,
 ) -> (Arc<Rig>, Arc<Adxlet>, adxlet::EnvironmentHandle) {
+    rig_with_source(idle_timeout_seconds, None).await
+}
+async fn rig_with_source(
+    idle_timeout_seconds: u64,
+    source: Option<adx_core::pressure::PressureSource>,
+) -> (Arc<Rig>, Arc<Adxlet>, adxlet::EnvironmentHandle) {
     let rig = Arc::new(Rig {
         node: Mutex::default(),
         actual: Mutex::default(),
@@ -268,13 +274,17 @@ async fn rig_with_idle(
         active_requests: AtomicUsize::new(0),
         activate_during_memory: AtomicBool::new(false),
     });
-    let node = Arc::new(Adxlet::new(
-        "node".into(),
-        rig.clone(),
-        rig.clone(),
-        rig.clone(),
-        rig.clone(),
-    ));
+    let node = Arc::new(
+        Adxlet::new(
+            "node".into(),
+            rig.clone(),
+            rig.clone(),
+            rig.clone(),
+            rig.clone(),
+        )
+        .with_host_pressure(source)
+        .unwrap(),
+    );
     *rig.node.lock().unwrap() = Arc::downgrade(&node);
     node.update_capacity(
         Resources {
@@ -394,8 +404,15 @@ async fn memory_actor_local_capacity_or_pressure_prevents_dispatch_after_center_
     )
     .unwrap();
     node.set_pressure(true);
-    assert_eq!(handle.tick().await, Err(Error::NoCapacity));
+    handle
+        .tick()
+        .await
+        .expect("closed pressure still permits exact unchanged resolution");
+    assert_eq!(rig.resolved.load(Ordering::SeqCst), 1);
+    assert!(rig.grant.lock().unwrap().is_none());
+    assert_eq!(node.used().memory_bytes, 128 * MIB);
     node.set_pressure(false);
+    *rig.target.lock().unwrap() = Some(256 * MIB);
     handle.tick().await.unwrap();
     assert_eq!(rig.applied.load(Ordering::SeqCst), 1);
     handle.delete().await.unwrap();
@@ -435,9 +452,25 @@ async fn memory_actor_resolves_expired_grant_even_when_local_growth_admission_is
 async fn memory_actor_resolves_old_epoch_or_session_without_redispatching() {
     for old_session in [false, true] {
         let (rig, node, handle) = rig().await;
-        node.set_pressure(true);
+        node.update_capacity(
+            Resources {
+                cpu_millis: 500,
+                memory_bytes: 128 * MIB,
+                disk_bytes: 0,
+            },
+            Duration::from_secs(60),
+        )
+        .unwrap();
         assert_eq!(handle.tick().await, Err(Error::NoCapacity));
-        node.set_pressure(false);
+        node.update_capacity(
+            Resources {
+                cpu_millis: 500,
+                memory_bytes: 256 * MIB,
+                disk_bytes: 0,
+            },
+            Duration::from_secs(60),
+        )
+        .unwrap();
         {
             let mut pending = rig.grant.lock().unwrap();
             let grant = pending.as_mut().unwrap();
@@ -569,5 +602,80 @@ async fn memory_actor_activity_after_memory_wait_invalidates_previous_idle_obser
     assert!(handle.tick().await.is_err());
     tokio::time::advance(Duration::from_secs(1)).await;
     assert!(handle.tick().await.unwrap().is_some());
+    assert_eq!(node.used(), Resources::default());
+}
+
+fn host_source() -> (tempfile::TempDir, adx_core::pressure::PressureSource) {
+    let root = tempfile::tempdir().unwrap();
+    let source = serde_json::from_value(
+        serde_json::json!({"path":root.path().join("pressure.json"),"max_age_millis":10000,
+        "identity":{"host_id":"host","authority":"authority","boot_id":std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap().trim(),"parent_device":30,
+        "parent_inode":42,"storage_identity_sha256":"a".repeat(64)}}),
+    )
+    .unwrap();
+    publish_host(&source);
+    (root, source)
+}
+fn publish_host(source: &adx_core::pressure::PressureSource) {
+    let now = now();
+    std::fs::write(&source.path,serde_json::json!({"schema":1,"identity":source.identity,"sequence":1,
+        "observed_unix_millis":now,"valid_until_unix_millis":now+10000,"accepting":true,"reason":"low_watermark",
+        "metrics":{"host_memory_per_mille":100,"parent_memory_per_mille":100,"host_memory_psi_per_mille":0,
+        "parent_memory_psi_per_mille":0,"disk_used_per_mille":100,"parent_memory_current_bytes":100,
+        "parent_memory_max_bytes":1000,"disk_available_bytes":900}}).to_string()).unwrap();
+}
+#[tokio::test]
+async fn memory_actor_rechecks_host_source_after_center_reserved_growth() {
+    let (_root, source) = host_source();
+    let (rig, node, handle) = rig_with_source(0, Some(source.clone())).await;
+    node.update_capacity(
+        Resources {
+            cpu_millis: 500,
+            memory_bytes: 128 * MIB,
+            disk_bytes: 0,
+        },
+        Duration::from_secs(60),
+    )
+    .unwrap();
+    assert_eq!(handle.tick().await, Err(Error::NoCapacity));
+    assert!(rig.grant.lock().unwrap().is_some());
+    node.update_capacity(
+        Resources {
+            cpu_millis: 500,
+            memory_bytes: 256 * MIB,
+            disk_bytes: 0,
+        },
+        Duration::from_secs(60),
+    )
+    .unwrap();
+    std::fs::write(&source.path, "malformed").unwrap();
+    assert!(!node.accepting_allocations());
+    handle.tick().await.unwrap();
+    assert_eq!(rig.applied.load(Ordering::SeqCst), 0);
+    assert_eq!(rig.resolved.load(Ordering::SeqCst), 1);
+    assert_eq!(node.used().memory_bytes, 128 * MIB);
+    assert!(rig.grant.lock().unwrap().is_none());
+    publish_host(&source);
+    *rig.target.lock().unwrap() = Some(256 * MIB);
+    handle.tick().await.unwrap();
+    assert_eq!(rig.applied.load(Ordering::SeqCst), 1);
+    std::fs::remove_file(&source.path).unwrap();
+    handle.delete().await.unwrap();
+    assert_eq!(node.used(), Resources::default());
+}
+#[tokio::test]
+async fn memory_actor_closed_host_source_still_settles_lost_physical_reply() {
+    let (_root, source) = host_source();
+    let (rig, node, handle) = rig_with_source(0, Some(source.clone())).await;
+    rig.lose_apply_reply.store(true, Ordering::SeqCst);
+    assert!(handle.tick().await.is_err());
+    assert_eq!(node.used().memory_bytes, 256 * MIB);
+    std::fs::remove_file(&source.path).unwrap();
+    handle.tick().await.unwrap();
+    assert_eq!(rig.applied.load(Ordering::SeqCst), 1);
+    assert_eq!(rig.resolved.load(Ordering::SeqCst), 0);
+    assert_eq!(node.used().memory_bytes, 256 * MIB);
+    assert!(rig.grant.lock().unwrap().is_none());
+    handle.delete().await.unwrap();
     assert_eq!(node.used(), Resources::default());
 }
