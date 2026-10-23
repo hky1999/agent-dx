@@ -492,8 +492,10 @@ async fn host_budget_configuration_race_cannot_publish_an_overdrawn_pool() {
 }
 
 async fn paused_execution(session: &Session, id: &str) -> EnvironmentRecord {
-    let allocation = assignment(id, "first", 1);
-    session.reserve(spec(id), allocation.clone()).await.unwrap();
+    let allocation = match session.claim(spec(id), &candidate("first")).await.unwrap() {
+        ClaimOutcome::Owned(stored) => stored.assignment,
+        other => panic!("a fresh paused fixture must own its allocated generation: {other:?}"),
+    };
     let mut result = running(spec(id), allocation);
     session.commit(result.clone()).await.unwrap();
     result.state = EnvironmentState::Paused;
@@ -510,6 +512,11 @@ async fn paused_execution(session: &Session, id: &str) -> EnvironmentRecord {
             location: "artifact".into(),
             size_bytes: 8,
         },
+    });
+    result.last_operation = Some(adx_core::CompletedOperation {
+        id: "pause-source".into(),
+        kind: adx_core::LifecycleKind::Pause,
+        expected_revision: result.revision - 1,
     });
     session.commit(result.clone()).await.unwrap();
     result
@@ -971,5 +978,345 @@ async fn execution_authorization_restart_policy_and_checkpoint_replacement_are_d
             session.host_budgets().await.unwrap()["host"].held,
             spec("one").resources
         );
+    }
+}
+
+async fn queued_setup() -> (common::Redis, Session) {
+    let rig = common::Redis::new().await;
+    let session = rig.store().await.begin(1).await.unwrap();
+    let mut configured = budgets();
+    configured.get_mut("host").unwrap().capacity = Resources {
+        cpu_millis: 200,
+        memory_bytes: 256,
+        disk_bytes: 0,
+    };
+    session.configure_host_budgets(configured).await.unwrap();
+    for id in ["first", "second"] {
+        session
+            .register_session(
+                node(id),
+                format!("{id}:1"),
+                format!("{id}:2"),
+                Some(NodeSession {
+                    id: format!("boot-{id}"),
+                    sequence: 1,
+                    routable: true,
+                }),
+            )
+            .await
+            .unwrap();
+    }
+    (rig, session)
+}
+fn restore_peak() -> adx_coordinator::storage::OverheadReservation {
+    adx_coordinator::storage::OverheadReservation {
+        host_id: "host".into(),
+        owner_sha256: "a".repeat(64),
+        resources: Resources {
+            cpu_millis: 10,
+            memory_bytes: 16,
+            disk_bytes: 0,
+        },
+        retirement_proof_sha256: None,
+    }
+}
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn queued_restore_peak_is_atomic_and_replays_original_deadline() {
+    let (_rig, session) = queued_setup().await;
+    let request = execution_request(paused_execution(&session, "queued").await);
+    let grant = session
+        .authorize_execution_with_peak(
+            request.clone(),
+            "boot-first",
+            1000,
+            "peak-one",
+            restore_peak(),
+        )
+        .await
+        .unwrap();
+    let revision = session.revision().await.unwrap();
+    assert_eq!(
+        session
+            .authorize_execution_with_peak(
+                request.clone(),
+                "boot-first",
+                1500,
+                "peak-one",
+                restore_peak()
+            )
+            .await
+            .unwrap(),
+        grant
+    );
+    assert_eq!(revision, session.revision().await.unwrap());
+    let normal = session
+        .authorize_execution(request.clone(), "boot-first", 2000)
+        .await
+        .unwrap();
+    assert_eq!(normal, grant);
+    let accepted_revision = session.revision().await.unwrap();
+    assert_eq!(
+        accepted_revision,
+        revision + 1,
+        "node acceptance is one durable CAS"
+    );
+    assert!(
+        session
+            .get("queued")
+            .await
+            .unwrap()
+            .execution
+            .unwrap()
+            .peak
+            .unwrap()
+            .node_accepted
+    );
+    assert_eq!(
+        session
+            .authorize_execution(request.clone(), "boot-first", 3000)
+            .await
+            .unwrap(),
+        grant
+    );
+    assert_eq!(
+        session
+            .authorize_execution_with_peak(request, "boot-first", 5000, "peak-one", restore_peak())
+            .await
+            .unwrap(),
+        grant
+    );
+    assert_eq!(accepted_revision, session.revision().await.unwrap());
+    assert_eq!(
+        session.host_budgets().await.unwrap()["host"].held,
+        Resources {
+            cpu_millis: 110,
+            memory_bytes: 144,
+            disk_bytes: 0
+        }
+    );
+    assert_eq!(
+        session
+            .retire_overhead("peak-one", &"a".repeat(64), &"b".repeat(64))
+            .await,
+        Err(Error::Conflict)
+    );
+    session.commit(completed_execution(&grant)).await.unwrap();
+    session
+        .retire_overhead("peak-one", &"a".repeat(64), &"b".repeat(64))
+        .await
+        .unwrap();
+    assert_eq!(
+        session.host_budgets().await.unwrap()["host"].held,
+        spec("queued").resources
+    );
+}
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn queued_restore_budget_refusal_leaves_neither_vm_nor_peak() {
+    let (_rig, session) = queued_setup().await;
+    let source = paused_execution(&session, "queued").await;
+    let mut too_large = restore_peak();
+    too_large.resources.memory_bytes = 256;
+    let before = session.revision().await.unwrap();
+    assert_eq!(
+        session
+            .authorize_execution_with_peak(
+                execution_request(source),
+                "boot-first",
+                1000,
+                "too-large",
+                too_large
+            )
+            .await,
+        Err(Error::NoCapacity)
+    );
+    assert_eq!(session.revision().await.unwrap(), before);
+    assert!(session.overhead_reservations().await.unwrap().is_empty());
+    assert!(session.get("queued").await.unwrap().execution.is_none());
+    assert_eq!(
+        session.host_budgets().await.unwrap()["host"].held,
+        Resources::default()
+    );
+}
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn queued_restore_racing_peaks_cannot_oversubscribe_or_split_grants() {
+    let (_rig, session) = queued_setup().await;
+    let a = execution_request(paused_execution(&session, "one").await);
+    let b = execution_request(paused_execution(&session, "two").await);
+    let (a, b) = tokio::join!(
+        session.authorize_execution_with_peak(a, "boot-first", 1000, "peak-a", restore_peak()),
+        session.authorize_execution_with_peak(b, "boot-first", 1000, "peak-b", restore_peak())
+    );
+    assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
+    assert!(matches!(a, Err(Error::NoCapacity)) || matches!(b, Err(Error::NoCapacity)));
+    assert_eq!(session.overhead_reservations().await.unwrap().len(), 1);
+    assert_eq!(
+        session.host_budgets().await.unwrap()["host"]
+            .held
+            .cpu_millis,
+        110
+    );
+}
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn queued_restore_restart_preserves_peak_and_fences_old_epoch() {
+    let (rig, session) = queued_setup().await;
+    let request = execution_request(paused_execution(&session, "queued").await);
+    session
+        .authorize_execution_with_peak(request.clone(), "boot-first", 1000, "peak", restore_peak())
+        .await
+        .unwrap();
+    let restarted = rig.store().await.begin(1).await.unwrap();
+    assert_eq!(
+        restarted.host_budgets().await.unwrap()["host"]
+            .held
+            .cpu_millis,
+        110
+    );
+    assert_eq!(
+        session
+            .authorize_execution(request, "boot-first", 2000)
+            .await,
+        Err(Error::Conflict)
+    );
+    assert!(restarted.overhead_reservations().await.unwrap()["peak"]
+        .retirement_proof_sha256
+        .is_none());
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn queued_restore_cancel_before_node_dispatch_keeps_peak_until_cleanup() {
+    let (_rig, session) = queued_setup().await;
+    let request = execution_request(paused_execution(&session, "cancel-queued").await);
+    session
+        .authorize_execution_with_peak(
+            request.clone(),
+            "boot-first",
+            1000,
+            "peak-cancel",
+            restore_peak(),
+        )
+        .await
+        .unwrap();
+    let mut deleted = request.source;
+    deleted.state = EnvironmentState::Deleted;
+    deleted.revision += 2;
+    deleted.checkpoint = None;
+    deleted.last_operation = None;
+    session.commit(deleted).await.unwrap();
+    assert_eq!(session.get("cancel-queued").await, Err(Error::NotFound));
+    assert_eq!(
+        session.host_budgets().await.unwrap()["host"]
+            .held
+            .cpu_millis,
+        10,
+        "only the unconsumed VM authorization is closed by the owned deletion"
+    );
+    assert!(
+        session.overhead_reservations().await.unwrap()["peak-cancel"]
+            .retirement_proof_sha256
+            .is_none()
+    );
+    session
+        .retire_overhead("peak-cancel", &restore_peak().owner_sha256, &"b".repeat(64))
+        .await
+        .unwrap();
+    assert_eq!(
+        session.host_budgets().await.unwrap()["host"]
+            .held
+            .cpu_millis,
+        0
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn queued_restore_target_requires_node_acceptance_before_commit() {
+    let (_rig, session) = queued_setup().await;
+    let request = execution_request(paused_execution(&session, "accept-queued").await);
+    let grant = session
+        .authorize_execution_with_peak(
+            request.clone(),
+            "boot-first",
+            1000,
+            "peak-accept",
+            restore_peak(),
+        )
+        .await
+        .unwrap();
+    let mut result = grant.target.clone();
+    result.state = EnvironmentState::Running;
+    result.revision += 1;
+    result.runtime.ip = Some("10.0.0.3".parse().unwrap());
+    result.last_operation = Some(adx_core::CompletedOperation {
+        id: request.operation_id.clone(),
+        kind: adx_core::LifecycleKind::Resume,
+        expected_revision: request.expected_revision,
+    });
+    assert_eq!(
+        session.commit(result.clone()).await,
+        Err(Error::Conflict),
+        "metadata pre-reservation alone cannot publish an executed target"
+    );
+    let accepted = session
+        .authorize_execution(request, "boot-first", 2000)
+        .await
+        .unwrap();
+    assert_eq!(
+        accepted, grant,
+        "node acceptance preserves the original deadline and target"
+    );
+    session.commit(result).await.unwrap();
+    assert_eq!(
+        session.host_budgets().await.unwrap()["host"]
+            .held
+            .cpu_millis,
+        110
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn queued_restore_node_acceptance_racing_cancel_has_one_winner() {
+    for _ in 0..8 {
+        let (_rig, session) = queued_setup().await;
+        let request = execution_request(paused_execution(&session, "race-cancel").await);
+        session
+            .authorize_execution_with_peak(
+                request.clone(),
+                "boot-first",
+                1000,
+                "peak-race",
+                restore_peak(),
+            )
+            .await
+            .unwrap();
+        let mut deleted = request.source.clone();
+        deleted.state = EnvironmentState::Deleted;
+        deleted.revision += 2;
+        deleted.checkpoint = None;
+        deleted.last_operation = None;
+        deleted.last_operation = None;
+        let (accepted, cancelled) = tokio::join!(
+            session.authorize_execution(request, "boot-first", 2000),
+            session.commit(deleted)
+        );
+        assert_eq!(
+            usize::from(accepted.is_ok()) + usize::from(cancelled.is_ok()),
+            1,
+            "a cancelled unconsumed grant cannot also be handed to a node"
+        );
+        assert_eq!(
+            session.host_budgets().await.unwrap()["host"]
+                .held
+                .cpu_millis,
+            if cancelled.is_ok() { 10 } else { 110 }
+        );
+        assert!(session.overhead_reservations().await.unwrap()["peak-race"]
+            .retirement_proof_sha256
+            .is_none());
     }
 }

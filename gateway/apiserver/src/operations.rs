@@ -82,7 +82,13 @@ impl Operations {
         let clients = &self.clients;
         // Workload checkpoint acknowledges publication before the directory watch
         // necessarily catches up. Reload must start from the committed revision.
-        let mut owner = clients.owner(id, caller, kind == Kind::Reload).await?;
+        let mut owner = clients
+            .owner(
+                id,
+                caller,
+                kind == Kind::Reload || (kind == Kind::Resume && body.get("source").is_some()),
+            )
+            .await?;
         let record = owner
             .record
             .as_ref()
@@ -343,7 +349,10 @@ impl Operations {
                                     error.code(),
                                     Code::NotFound | Code::FailedPrecondition
                                 ));
-                    if !retryable || (kind == Kind::Pause && body.get("source").is_some()) {
+                    if !retryable
+                        || (matches!(kind, Kind::Pause | Kind::Resume)
+                            && body.get("source").is_some())
+                    {
                         self.pending.lock().await.remove(&key);
                         return Err(error);
                     }
@@ -374,6 +383,8 @@ struct ParkingSource {
     runtime_id: String,
     assignment_generation: u64,
     revision: u64,
+    #[serde(default)]
+    checkpoint_id: Option<String>,
 }
 
 /// Explicit source fencing for the trusted parking controller. Existing lifecycle
@@ -387,14 +398,43 @@ fn validate_parking_source(
     let Some(value) = body.get("source") else {
         return Ok(());
     };
-    if kind != Kind::Pause {
-        return Err(Status::invalid_argument("source fence only supports pause"));
+    if !matches!(kind, Kind::Pause | Kind::Resume) {
+        return Err(Status::invalid_argument(
+            "source fence only supports pause or resume",
+        ));
     }
     let source: ParkingSource = serde_json::from_value(value.clone())
         .map_err(|_| Status::invalid_argument("complete parking source required"))?;
     let replay = record.last_operation.as_ref().is_some_and(|op| {
         op.id == request_id && op.kind == kind.code() && op.expected_revision == source.revision
     });
+    let resume_replay = kind == Kind::Resume
+        && replay
+        && record
+            .checkpoint
+            .as_ref()
+            .is_some_and(|cp| cp.source_runtime_id == source.runtime_id)
+        && source.revision.checked_add(1).is_some_and(|revision| {
+            record.runtime.as_ref().is_some_and(|r| {
+                r.id == format!(
+                    "{}-{}-r{revision}",
+                    record.spec.as_ref().map_or("", |s| s.id.as_str()),
+                    source.assignment_generation
+                )
+            })
+        });
+    if kind == Kind::Resume
+        && source.checkpoint_id.as_deref().is_none_or(|id| {
+            record
+                .checkpoint
+                .as_ref()
+                .is_none_or(|cp| cp.id != id || cp.source_runtime_id != source.runtime_id)
+        })
+    {
+        return Err(Status::failed_precondition(
+            "original recovery point changed",
+        ));
+    }
     if source.runtime_id.is_empty()
         || source.runtime_id.len() > 256
         || source.assignment_generation == 0
@@ -402,7 +442,7 @@ fn validate_parking_source(
         || record
             .runtime
             .as_ref()
-            .is_none_or(|r| r.id != source.runtime_id)
+            .is_none_or(|r| r.id != source.runtime_id && !resume_replay)
         || record
             .assignment
             .as_ref()
@@ -410,7 +450,7 @@ fn validate_parking_source(
         || (record.revision != source.revision && !replay)
     {
         return Err(Status::failed_precondition(
-            "parking source changed; refusing to retarget",
+            "lifecycle source changed; refusing to retarget",
         ));
     }
     Ok(())
@@ -483,5 +523,32 @@ mod parking_source_tests {
             validate_parking_source(Kind::Resume, &json!({"source":source}), &r, "park").is_err()
         );
         assert!(validate_parking_source(Kind::Pause, &json!({}), &r, "park").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod recovery_source_tests {
+    use super::*;
+    #[test]
+    fn source_fenced_resume_is_accepted_before_dispatch() {
+        let record = pb::EnvironmentRecord {
+            runtime: Some(pb::Runtime {
+                id: "source".into(),
+                ..Default::default()
+            }),
+            assignment: Some(pb::Assignment {
+                generation: 7,
+                ..Default::default()
+            }),
+            checkpoint: Some(pb::RestorePoint {
+                id: "park-original".into(),
+                source_runtime_id: "source".into(),
+                ..Default::default()
+            }),
+            revision: 9,
+            ..Default::default()
+        };
+        let body = json!({"source":{"runtimeId":"source","assignmentGeneration":7,"revision":9,"checkpointId":"park-original"}});
+        assert!(validate_parking_source(Kind::Resume, &body, &record, "resume-once").is_ok());
     }
 }

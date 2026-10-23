@@ -50,6 +50,7 @@ fn statuses(
     replacement: Option<&StoredEnvironment>,
 ) -> Result<BTreeMap<String, HostBudgetStatus>> {
     validate_budgets(budgets)?;
+    super::execution::validate_peak_links(raw, replacement)?;
     let mut out: BTreeMap<_, _> = budgets
         .iter()
         .map(|(id, budget)| {

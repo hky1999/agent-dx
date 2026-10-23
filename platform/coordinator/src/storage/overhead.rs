@@ -13,7 +13,7 @@ pub struct OverheadReservation {
     /// Caller verifies all processes, temporary files and retained artifacts have retired.
     pub retirement_proof_sha256: Option<String>,
 }
-fn digest(value: &str) -> Result<()> {
+pub(super) fn digest(value: &str) -> Result<()> {
     if value.len() != 64
         || !value
             .bytes()
@@ -143,6 +143,16 @@ impl Session {
                 } else {
                     Err(Error::Conflict)
                 };
+            }
+            for (key, value) in &raw {
+                if key.starts_with("environment:") {
+                    let environment: StoredEnvironment = decode(value)?;
+                    if environment.execution.as_ref().is_some_and(|e| {
+                        e.pending && e.peak.as_ref().is_some_and(|p| p.reservation_id == id)
+                    }) {
+                        return Err(Error::Conflict);
+                    }
+                }
             }
             reservation.retirement_proof_sha256 = Some(proof_sha256.into());
             header.overhead_budget = true;

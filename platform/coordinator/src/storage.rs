@@ -12,7 +12,7 @@ mod collection;
 mod credentials;
 mod execution;
 mod failure;
-pub use execution::StoredExecution;
+pub use execution::{ExecutionPeak, StoredExecution};
 mod memory;
 pub use memory::{MemoryControlPolicy, StoredMemory, StoredMemoryOperation};
 mod recovery;
@@ -44,10 +44,9 @@ local old = redis.call('HGET', KEYS[1], 'header')
 if ARGV[1] == '' then
   if redis.call('HLEN', KEYS[1]) ~= 0 then return 0 end
 elseif old ~= ARGV[1] then return 0 end
-if #ARGV == 2 then
-  redis.call('HSET', KEYS[1], 'header', ARGV[2])
-else
-  redis.call('HSET', KEYS[1], 'header', ARGV[2], ARGV[3], ARGV[4])
+redis.call('HSET', KEYS[1], 'header', ARGV[2])
+for i = 3, #ARGV, 2 do
+  redis.call('HSET', KEYS[1], ARGV[i], ARGV[i+1])
 end
 return 1
 "#;
@@ -85,11 +84,16 @@ struct Header {
     overhead_budget: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     parking_journals: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    queued_recovery: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     host_pressure_admission: BTreeMap<String, adx_core::pressure::PressureSource>,
 }
 impl Header {
     fn advance(&mut self) -> Result<()> {
+        if self.queued_recovery {
+            self.schema = self.schema.max(12);
+        }
         if self.parking_journals {
             self.schema = self.schema.max(11);
         }
@@ -119,6 +123,7 @@ impl Header {
                 | (9, true)
                 | (10, true)
                 | (11, true)
+                | (12, true)
         ) || self.shards == 0
             || self.next_node_shard >= self.shards
             || self.epoch == 0
@@ -126,6 +131,9 @@ impl Header {
             return Err(Error::Unavailable(
                 "unsupported or corrupt control metadata".into(),
             ));
+        }
+        if self.queued_recovery && self.schema < 12 {
+            return Err(Error::Conflict);
         }
         if self.parking_journals && self.schema < 11 {
             return Err(Error::Conflict);
@@ -241,7 +249,11 @@ impl StoredEnvironment {
     }
     pub(crate) fn effective_record(&self) -> EnvironmentRecord {
         if !self.invalidated {
-            if let Some(execution) = self.execution.as_ref().filter(|e| e.pending) {
+            if let Some(execution) = self
+                .execution
+                .as_ref()
+                .filter(|e| e.pending && e.peak.as_ref().is_none_or(|p| p.node_accepted))
+            {
                 return execution.authorization.target.clone();
             }
         }
@@ -749,20 +761,27 @@ impl RedisStore {
         header: &Header,
         field: Option<(&str, String)>,
     ) -> Result<bool> {
+        let fields = field.into_iter().collect::<Vec<_>>();
+        self.cas_fields(expected, header, &fields).await
+    }
+    /// Compare one opaque header and atomically publish all ownership fields.
+    async fn cas_fields(
+        &self,
+        expected: &str,
+        header: &Header,
+        fields: &[(&str, String)],
+    ) -> Result<bool> {
         if header.host_budgets.is_some() {
             self.require_durable_budget();
         }
-        let changed = field
-            .as_ref()
-            .map(|(name, _)| vec![(*name).to_owned()])
-            .unwrap_or_default();
+        let changed = fields.iter().map(|(name, _)| (*name).to_owned()).collect();
         let mut cmd = redis::cmd("EVAL");
         cmd.arg(CAS)
             .arg(1)
             .arg(&self.key)
             .arg(expected)
             .arg(encode(header)?);
-        if let Some((name, value)) = field {
+        for (name, value) in fields {
             cmd.arg(name).arg(value);
         }
         let applied: u8 = self.query(cmd).await?;
@@ -846,6 +865,7 @@ impl RedisStore {
                     host_budgets: None,
                     overhead_budget: false,
                     parking_journals: false,
+                    queued_recovery: false,
                     host_pressure_admission: BTreeMap::new(),
                 }
             } else {
@@ -1495,6 +1515,9 @@ impl Session {
                 &result,
                 header.host_budgets.is_some() || header.schema >= 3,
             )?;
+            if execution::undispatched_cancellation(&stored_environment, &result) {
+                stored_environment.execution = None;
+            }
             let mut previous = stored_environment.clone();
             if !stored_environment.invalidated
                 && stored_environment
