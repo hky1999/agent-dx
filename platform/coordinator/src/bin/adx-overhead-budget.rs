@@ -91,7 +91,7 @@ async fn execute() -> Result<(), Box<dyn std::error::Error>> {
         {
             Ok(grant) => println!(
                 "{}",
-                serde_json::json!({"admitted":true,"authorization":{"operation":grant.request.operation_id,"source_runtime":grant.request.source.runtime.id,"source_revision":grant.request.expected_revision,"target_runtime":grant.target.runtime.id,"deadline_ms":grant.deadline_unix_millis,"peak_reservation_id":command.id}})
+                serde_json::json!({"admitted":true,"authorization":{"operation":grant.request.operation_id,"source_runtime":grant.request.source.runtime.id,"source_revision":grant.request.expected_revision,"target_runtime":grant.target.runtime.id,"deadline_ms":grant.deadline_unix_millis,"coordinator_epoch":grant.coordinator_epoch,"peak_reservation_id":command.id}})
             ),
             Err(adx_core::Error::NoCapacity) => println!(
                 "{}",
