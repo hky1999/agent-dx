@@ -3,7 +3,7 @@
 mod budget;
 mod overhead;
 mod parking;
-pub use budget::{HostBudget, HostBudgetStatus, HostMemoryAccounts};
+pub use budget::{HostBudget, HostBudgetSnapshot, HostBudgetStatus, HostMemoryAccounts};
 pub use overhead::OverheadReservation;
 pub use parking::ParkingJournal;
 mod claims;

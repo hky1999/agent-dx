@@ -897,7 +897,9 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                     let state = service.0.state.lock().await;
                     state.healthy().map_err(status)?;
                     // 持久预算必须每次成功读取；离线和存储错误都不是零占用证明。
-                    let budgets = state.session.host_budgets().await.map_err(status)?;
+                    let budget_snapshot =
+                        state.session.host_budget_snapshot().await.map_err(status)?;
+                    let budgets = budget_snapshot.budgets;
                     let nodes = state
                         .nodes
                         .values()
@@ -947,7 +949,8 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                         })
                         .collect();
                     Ok(pb::NodeDirectory {
-                        epoch: state.session.epoch(),
+                        epoch: budget_snapshot.epoch,
+                        control_revision: budget_snapshot.revision,
                         valid_for_millis: 2500,
                         nodes,
                         host_budget_configured: !budgets.is_empty(),

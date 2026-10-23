@@ -1320,3 +1320,111 @@ async fn queued_restore_node_acceptance_racing_cancel_has_one_winner() {
             .is_none());
     }
 }
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn host_budget_snapshot_version_and_holds_share_one_concurrent_read() {
+    use adx_coordinator::storage::OverheadReservation;
+    let (_rig, session) = setup().await;
+    let baseline = session.host_budget_snapshot().await.unwrap();
+    assert_eq!(baseline.epoch, session.epoch());
+    let base_revision = baseline.revision;
+    let writer_session = session.clone();
+    let writer = tokio::spawn(async move {
+        for i in 0..64 {
+            let id = format!("snapshot-hold-{i}");
+            writer_session
+                .reserve_overhead(
+                    &id,
+                    OverheadReservation {
+                        host_id: "host".into(),
+                        owner_sha256: "a".repeat(64),
+                        resources: Resources {
+                            cpu_millis: 1,
+                            memory_bytes: 1,
+                            disk_bytes: 0,
+                        },
+                        retirement_proof_sha256: None,
+                    },
+                )
+                .await
+                .unwrap();
+            tokio::task::yield_now().await;
+            writer_session
+                .retire_overhead(&id, &"a".repeat(64), &"b".repeat(64))
+                .await
+                .unwrap();
+        }
+    });
+    let mut reads = 0;
+    loop {
+        let value = session.host_budget_snapshot().await.unwrap();
+        assert_eq!(value.epoch, baseline.epoch);
+        let changes = value.revision.checked_sub(base_revision).unwrap();
+        let held = &value.budgets["host"].held;
+        assert_eq!(
+            held.cpu_millis,
+            changes % 2,
+            "revision must identify the same atomic state as holds"
+        );
+        assert_eq!(held.memory_bytes, changes % 2);
+        assert_eq!(held.disk_bytes, 0);
+        reads += 1;
+        if writer.is_finished() && reads >= 32 {
+            break;
+        }
+        assert!(reads < 2048, "bounded concurrent snapshot verification");
+        tokio::task::yield_now().await;
+    }
+    writer.await.unwrap();
+    let final_view = session.host_budget_snapshot().await.unwrap();
+    assert_eq!(final_view.revision, base_revision + 128);
+    assert_eq!(final_view.budgets["host"].held, Resources::default());
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn host_budget_snapshot_fences_old_session_and_keeps_positive_hold() {
+    use adx_coordinator::storage::OverheadReservation;
+    let (rig, session) = setup().await;
+    session
+        .reserve_overhead(
+            "snapshot-restart",
+            OverheadReservation {
+                host_id: "host".into(),
+                owner_sha256: "a".repeat(64),
+                resources: Resources {
+                    cpu_millis: 1,
+                    memory_bytes: 1,
+                    disk_bytes: 0,
+                },
+                retirement_proof_sha256: None,
+            },
+        )
+        .await
+        .unwrap();
+    let before = session.host_budget_snapshot().await.unwrap();
+    let current = rig.store().await.begin(1).await.unwrap();
+    assert!(
+        session.host_budget_snapshot().await.is_err(),
+        "superseded epoch cannot supply a budget frame"
+    );
+    let after = current.host_budget_snapshot().await.unwrap();
+    assert_eq!(after.epoch, before.epoch + 1);
+    assert!(after.revision > before.revision);
+    assert_eq!(
+        after.budgets, before.budgets,
+        "session replacement does not erase positive holds"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn host_budget_snapshot_versions_an_unconfigured_namespace_without_inventing_capacity() {
+    let rig = common::Redis::new().await;
+    let session = rig.store().await.begin(1).await.unwrap();
+    let value = session.host_budget_snapshot().await.unwrap();
+    assert_eq!(value.epoch, session.epoch());
+    assert!(value.revision > 0);
+    assert!(value.budgets.is_empty());
+}

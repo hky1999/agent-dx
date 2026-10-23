@@ -137,6 +137,15 @@ fn statuses(
     Ok(out)
 }
 
+/// One authoritative Redis read. The version and every scalar share the same
+/// control hash snapshot; callers must not attach a separately read revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostBudgetSnapshot {
+    pub epoch: u64,
+    pub revision: u64,
+    pub budgets: BTreeMap<String, HostBudgetStatus>,
+}
+
 impl Session {
     /// Install a trusted host budget once. Replays must match exactly.
     /// Existing holds must fit; changing or removing a published budget requires
@@ -178,12 +187,23 @@ impl Session {
     /// Read capacity and all durable holds from one Redis snapshot.
     /// An empty map means this namespace has no configured host budget.
     pub async fn host_budgets(&self) -> Result<BTreeMap<String, HostBudgetStatus>> {
+        Ok(self.host_budget_snapshot().await?.budgets)
+    }
+
+    /// Read budget values and their epoch/revision from one durable snapshot.
+    /// Storage errors, invalid holds and superseded sessions remain errors.
+    pub async fn host_budget_snapshot(&self) -> Result<HostBudgetSnapshot> {
         let raw = self.store.raw().await?;
         let header = self.header(&raw.get(HEADER).cloned())?;
-        match &header.host_budgets {
-            Some(budgets) => statuses(&raw, budgets, None),
-            None => Ok(BTreeMap::new()),
-        }
+        let budgets = match &header.host_budgets {
+            Some(budgets) => statuses(&raw, budgets, None)?,
+            None => BTreeMap::new(),
+        };
+        Ok(HostBudgetSnapshot {
+            epoch: header.epoch,
+            revision: header.revision,
+            budgets,
+        })
     }
 }
 

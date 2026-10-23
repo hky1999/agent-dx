@@ -170,12 +170,33 @@ impl Clients {
         )
         .await
     }
+    /// Read a new resource snapshot within one control RPC deadline.
+    /// The routing watch remains a placement hint, never a fallback budget.
     pub async fn nodes(&self) -> Result<pb::NodeDirectory, Status> {
-        self.directory
-            .lock()
-            .await
-            .snapshot()
-            .ok_or_else(|| Status::unavailable("node directory unavailable"))
+        self.rpc("apiserver.read_resource_snapshot", async {
+            let mut client = pb::coordinator_service_client::CoordinatorServiceClient::new(
+                self.coordinator().await?,
+            );
+            let mut request = trace::inject(pb::WatchNodesRequest {});
+            request.set_timeout(self.config.timeout());
+            let mut stream = client.watch_nodes(request).await?.into_inner();
+            let frame = stream
+                .message()
+                .await?
+                .ok_or_else(|| Status::unavailable("resource snapshot stream closed"))?;
+            if frame.control_revision == 0 {
+                return Err(Status::data_loss("resource snapshot version missing"));
+            }
+            // Use the same complete-frame validator without updating or reading
+            // the independently refreshed routing cache.
+            let mut directory = crate::directory::Directory::default();
+            directory.update(frame)?;
+            let snapshot = directory
+                .snapshot()
+                .ok_or_else(|| Status::unavailable("resource snapshot expired"))?;
+            Ok(Response::new(snapshot))
+        })
+        .await
     }
     pub async fn scheduling_queue(&self) -> Result<pb::GetSchedulingQueueResponse, Status> {
         let mut client = pb::coordinator_service_client::CoordinatorServiceClient::new(
@@ -643,3 +664,7 @@ mod tests {
         assert!(local_owner(&node, &result).unwrap().is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "clients/resource_snapshot.rs"]
+mod resource_snapshot_tests;

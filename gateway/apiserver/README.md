@@ -7,9 +7,10 @@ Requests are converted directly to the generated Environment RPC types. There is
 Sandbox management operations enter through `sandbox_service::SandboxService`; Platform remains the lifecycle authority. HTTP and embedded callers share `prepare_create`/`create_request` for Sandbox request validation, EnvironmentSpec conversion and deployment runtime injection. Agent-specific `CreateSandbox`/`ExecutionSpec` conversion lives in `adx_activator::sandbox_request`, shared by its HTTP and local adapters. The API Server implements the local `SandboxApplication` bridge over the same service `Arc`, without HTTP loopback. Ingress Sandbox v2 and Inline endpoints have been removed. Jiuwen downloads still use the old direct Platform runtime lookup pending a restricted API Server replacement; that lookup cannot read Execd credentials stored only in runtime_profile.env, so live download validation is required before deploying this refactor.
 
 The API Server also owns the legacy-compatible scheduler HTTP paths while
-Coordinator owns their state and decisions. `/global-scheduler/resources` reads the
-watched in-memory node directory and renders the legacy `resource.fragment`
-shape; `/api/sandbox/v1/resources` keeps the ADX `items` shape. Administrator-only
+Coordinator owns their state and decisions. `/global-scheduler/resources` reads a fresh Coordinator frame within a bounded
+RPC and renders the legacy `resource.fragment` shape;
+`/api/sandbox/v1/resources` uses the same fresh-read contract and keeps the ADX
+`items` shape. The watched in-memory directory remains a routing cache. Administrator-only
 `/global-scheduler/scheduling_queue` reads the bounded, memory-only central
 wait queue. `POST /global-scheduler/node/localschedulingstatus?node_id=...`
 pauses new allocation to a node and `DELETE` removes that pause. Existing
@@ -25,7 +26,7 @@ can use the same operations directly.
 
 兼容接口的集群 CPU、内存和磁盘 `capacity` 按宿主各计一次，包括暂时离线的宿主；新增 `held`、`available` 保留兼容资源格式。兼容格式的 MiB 值向下取整，精确守恒核对使用宿主字节字段。节点分片标记 `host_id`，同宿主分片不能相加当作独立容量。未配置宿主预算时保留原节点汇总，并将集群 `held`、`available` 标为 null。GPU／NPU 仍是节点整卡视图，不属于本轮宿主标量预算。
 
-Coordinator 每次从持久账本读取完整预算。存储失败、非法视图或缓存过期使资源查询返回不可用，不显示为预算归还。两端协议及程序须匹配部署；本模块测试不能替代实际节点和资源回读验收。
+Coordinator 每次查询从持久账本读取完整预算。存储失败、非法视图或首帧过期使资源查询返回结构化错误，不显示为预算归还。两端协议及程序须匹配部署；本模块测试不能替代实际节点和资源回读验收。
 
 ## Modules
 
@@ -56,3 +57,5 @@ The API Server's legacy `/api/agent` compatibility routes forward to `agent_addr
 See [HTTP contract](docs/sandbox-lifecycle-api.md), [failure behavior](docs/sandbox-runtime-failure.md), [deployment](../../docs/testing/process-deployment.md), and [Rust migration status](../../docs/testing/rust-apiserver.md).
 
 压力停车的暂停请求可以携带source对象，字段为runtimeId、assignmentGeneration及revision。该对象要求完整且只能用于pause；公开入口在派发前和再次读取归属后核对源运行实例及版本。重复完成操作只接受相同请求ID及原版本。不匹配返回冲突，不切换目标。带source的pause不进行网关内部未知结果重试，调用方必须持久对账；sandboxd仍执行自身resource generation条件检查及精确退役。原普通SDK接口可以省略source，但受控停车编排必须显式提供。
+
+资源查询在每次HTTP请求的控制RPC截止内重新读取一份权威预算，不使用节点路由推送缓存作为返回值或失败兜底。`budget_snapshot`包含同一次Redis原子读取的`epoch`与`revision`：标准接口位于顶层，兼容接口位于`resource`内。它标识请求期间的一个确定读取点，并不承诺响应送达时没有新的并发提交；只有版本相同的样本可以直接比较。节点`items`和`allocatable`仍是存活及调度策略视图，不是物理使用量采样。两个成功响应均使用`Cache-Control: no-store`。上游不可用、首帧缺失、版本缺失或完整帧不合法时返回结构化错误，不返回旧预算或将占用补零。

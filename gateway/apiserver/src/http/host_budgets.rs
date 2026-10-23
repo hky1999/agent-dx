@@ -133,3 +133,25 @@ fn host_budget_view_sums_distinct_hosts_and_excludes_unmapped_admission() {
     assert_eq!(value["items"][3]["allocatable"]["CPU"], 0);
     assert!(value["items"][3]["host_id"].is_null());
 }
+
+#[tokio::test]
+async fn both_resource_schemas_publish_snapshot_version_and_forbid_http_caching() {
+    for legacy in [false, true] {
+        let (nodes, hosts) = fixture();
+        let frame = pb::NodeDirectory {
+            epoch: 9,
+            control_revision: 123,
+            valid_for_millis: 1000,
+            nodes,
+            host_budgets: hosts,
+            host_budget_configured: true,
+        };
+        let response = resource_response(frame, legacy.then_some("request"));
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let view = if legacy { &body["resource"] } else { &body };
+        assert_eq!(view["budget_snapshot"], json!({"epoch":9,"revision":123}));
+        assert_eq!(view["host_budgets"][0]["held"]["cpu_millis"], 1000);
+    }
+}

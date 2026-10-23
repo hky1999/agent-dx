@@ -156,6 +156,8 @@ message NodeDirectory {
   uint64 valid_for_millis = 3;
   repeated HostBudgetStatus host_budgets = 4;
   bool host_budget_configured = 5;
+  // Epoch and revision identify the same atomic durable read as host_budgets.
+  uint64 control_revision = 6;
 }
 message GetSchedulingQueueRequest {}
 message PendingEnvironment { EnvironmentSpec spec = 1; uint64 enqueue_time_millis = 2; }

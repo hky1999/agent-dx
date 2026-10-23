@@ -185,19 +185,13 @@ impl Api {
         }
         if method == "GET" && path == "/api/sandbox/v1/resources" {
             return match self.clients.nodes().await {
-                Ok(nodes) => plain(
-                    StatusCode::OK.as_u16(),
-                    resource_view(nodes.nodes, &nodes.host_budgets),
-                ),
+                Ok(nodes) => resource_response(nodes, None),
                 Err(error) => error_response(error, &request_id, None, None, false),
             };
         }
         if method == "GET" && path == "/global-scheduler/resources" {
             return match self.clients.nodes().await {
-                Ok(nodes) => plain(
-                    StatusCode::OK.as_u16(),
-                    legacy_resource_view(nodes.nodes, &nodes.host_budgets, &request_id),
-                ),
+                Ok(nodes) => resource_response(nodes, Some(&request_id)),
                 Err(error) => error_response(error, &request_id, None, None, false),
             };
         }
@@ -1050,6 +1044,25 @@ fn host_allocatable(nodes: &[pb::NodeEndpoint], host: &pb::HostBudgetStatus) -> 
     }
     // 这里只是可调度上界；真正的每次分配仍须通过持久原子准入。
     resource_min(&online, &host.available.unwrap_or_default())
+}
+
+// Both public schemas expose the version of the very same budget values.
+fn resource_response(frame: pb::NodeDirectory, request_id: Option<&str>) -> Response<Body> {
+    let version = json!({"epoch": frame.epoch, "revision": frame.control_revision});
+    let mut value = match request_id {
+        Some(id) => legacy_resource_view(frame.nodes, &frame.host_budgets, id),
+        None => resource_view(frame.nodes, &frame.host_budgets),
+    };
+    match request_id {
+        Some(_) => value["resource"]["budget_snapshot"] = version,
+        None => value["budget_snapshot"] = version,
+    }
+    let mut response = plain(StatusCode::OK.as_u16(), value);
+    response.headers_mut().insert(
+        "cache-control",
+        hyper::header::HeaderValue::from_static("no-store"),
+    );
+    response
 }
 
 fn host_budget_views(nodes: &[pb::NodeEndpoint], hosts: &[pb::HostBudgetStatus]) -> Vec<Value> {
