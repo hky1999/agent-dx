@@ -412,6 +412,15 @@ capacity after scaling. A deliberate new create call can start a new queue wait.
 Unconfirmed runtime/transport results retain the same-operation retry policy.
 After retries, a complete service failure remains `EnvironmentHTTPError` with
 its status, payload and metadata; it is not labeled as a connection failure.
+When create or direct invoke fails after retrying, `error.first_error` retains the first attempt's
+exception, including its original request and retry metadata. The final exception
+still describes the authoritative final response; the first error is diagnostic
+context and does not authorize another create or change the final retry policy.
+Without a preceding failed attempt, this field is `None`.
+
+A failed `process.capabilities` query keeps its original transport or service
+exception. `UnsupportedFeature` is raised only when a successful capability
+response does not advertise the required command recovery protocol.
 
 `reload()` translates `EnvironmentError` into `False`; it does not normalize those
 other programming/shape exceptions.
