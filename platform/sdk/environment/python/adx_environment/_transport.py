@@ -58,6 +58,7 @@ class EnvironmentError(RuntimeError):
         failure: Optional[Dict[str, Any]] = None,
         scheduling_failure: Optional[Dict[str, Any]] = None,
         probe_failure: Optional[Dict[str, Any]] = None,
+        first_error: Optional[Exception] = None,
     ):
         super().__init__(message)
         self.request_id = request_id
@@ -70,6 +71,7 @@ class EnvironmentError(RuntimeError):
         self.failure = failure
         self.scheduling_failure = scheduling_failure
         self.probe_failure = probe_failure
+        self.first_error = first_error
 
 
 class EnvironmentNotFound(EnvironmentError):
@@ -119,6 +121,7 @@ class EnvironmentHTTPError(EnvironmentError):
         scheduling_failure: Optional[Dict[str, Any]] = None,
         probe_failure: Optional[Dict[str, Any]] = None,
         request_forwarded: Optional[bool] = None,
+        first_error: Optional[Exception] = None,
     ):
         super().__init__(
             message,
@@ -131,6 +134,7 @@ class EnvironmentHTTPError(EnvironmentError):
             scheduling_failure=scheduling_failure,
             probe_failure=probe_failure,
             request_forwarded=request_forwarded,
+            first_error=first_error,
         )
         self.status_code = status_code
         self.payload = payload
@@ -336,6 +340,7 @@ class EnvironmentClient:
         request_body["name"] = request_name
         deadline = time.monotonic() + request_timeout
         last_error: Optional[BaseException] = None
+        first_error: Optional[Exception] = None
         attempts = 0
 
         for attempt in range(1, _CREATE_MAX_ATTEMPTS + 1):
@@ -351,6 +356,8 @@ class EnvironmentClient:
                 )
             except _CREATE_RETRYABLE_ERRORS as exc:
                 last_error = exc
+                if first_error is None:
+                    first_error = exc
                 if attempt >= _CREATE_MAX_ATTEMPTS:
                     break
                 remaining = deadline - time.monotonic()
@@ -370,6 +377,11 @@ class EnvironmentClient:
                 )
                 time.sleep(backoff)
                 continue
+            except EnvironmentError as exc:
+                # Preserve the authoritative final contract. A terminal replay
+                # response must not erase the first failed create attempt.
+                exc.first_error = first_error
+                raise
 
             self._last_create = data
             return data
@@ -387,6 +399,7 @@ class EnvironmentClient:
                 scheduling_failure=last_error.scheduling_failure,
                 probe_failure=last_error.probe_failure,
                 request_forwarded=last_error.request_forwarded,
+                first_error=first_error,
             ) from last_error
         contract_error = last_error if isinstance(last_error, EnvironmentError) else None
         raise EnvironmentError(
@@ -400,6 +413,7 @@ class EnvironmentClient:
             outcome=(contract_error.outcome if contract_error else None) or "unknown",
             operation_id=contract_error.operation_id if contract_error else None,
             environment_id=(contract_error.environment_id if contract_error else None) or request_name,
+            first_error=first_error,
         ) from last_error
 
     def _create_info_attempt(
@@ -903,6 +917,7 @@ class EnvironmentClient:
         """
         url = f"{self._direct_base}/{self._safe_id(environment_id)}/invoke"
         last_error: Optional[BaseException] = None
+        first_error: Optional[Exception] = None
         last_failure_safe = False
         outcome_unknown = False
         attempts = 0
@@ -955,6 +970,7 @@ class EnvironmentClient:
                     outcome="unknown",
                     operation_id=request_id,
                     environment_id=environment_id,
+                    first_error=first_error or exc,
                 ) from exc
             else:
                 if resp.status_code == 404:
@@ -967,7 +983,9 @@ class EnvironmentClient:
                         # It is an authoritative result from the resolved
                         # Environment route, not evidence that /direct is absent.
                         self._direct_route_misses = 0
-                        raise self._http_error(resp, request_id=request_id)
+                        error = self._http_error(resp, request_id=request_id)
+                        error.first_error = first_error
+                        raise error
                     if outcome_unknown:
                         # An earlier attempt may already have executed. Route
                         # disappearance does not make Frontend replay safe.
@@ -991,6 +1009,8 @@ class EnvironmentClient:
                     return {}, True
                 self._direct_route_misses = 0
                 error = self._http_error(resp, request_id=request_id) if resp.status_code >= 400 else None
+                if error is not None:
+                    error.first_error = first_error
                 if error is not None and error.retry == "never":
                     raise error
                 if error is not None and self._is_resuming(resp, error, request_id):
@@ -1003,7 +1023,7 @@ class EnvironmentClient:
                     last_failure_safe = False
                     outcome_unknown = True
                 elif resp.status_code >= 400:
-                    raise self._http_error(resp, request_id=request_id)
+                    raise error
                 else:
                     try:
                         parsed = resp.json()
@@ -1019,6 +1039,8 @@ class EnvironmentClient:
                             parsed = {"value": parsed}
                         return parsed, False
 
+            if first_error is None and isinstance(last_error, Exception):
+                first_error = last_error
             if attempt >= attempt_limit:
                 break
             backoff = max(retry_after, _DIRECT_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)))
@@ -1044,6 +1066,7 @@ class EnvironmentClient:
         if pending_resume is not None and not outcome_unknown:
             # No attempt reached the application. Keep this authoritative outcome;
             # never turn demand waiting into a control-plane invocation fallback.
+            pending_resume.first_error = first_error if first_error is not pending_resume else None
             raise pending_resume
         if last_failure_safe and not outcome_unknown and last_error is not None:
             # Every attempt failed before request bytes could reach EXECD.
@@ -1067,6 +1090,7 @@ class EnvironmentClient:
                     "environment backend was OOM-killed",
                     request_id=request_id, code="ENVIRONMENT_OOM", retry="never", outcome="terminal",
                     operation_id=request_id, environment_id=environment_id, failure=failure,
+                    first_error=first_error,
                 ) from last_error
         raise EnvironmentError(
             (f"direct invoke outcome is unknown after {attempts} attempts (requestId={request_id}): {detail}"),
@@ -1076,6 +1100,7 @@ class EnvironmentClient:
             outcome="unknown",
             operation_id=request_id,
             environment_id=environment_id,
+            first_error=first_error,
         ) from last_error
 
     @staticmethod
