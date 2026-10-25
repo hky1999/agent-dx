@@ -87,7 +87,7 @@ impl OperationRecord {
             if uuid::Uuid::parse_str(&intent.id).is_err()
                 || !matches!(
                     intent.kind.as_str(),
-                    "start" | "start_operation" | "checkpoint" | "delete"
+                    "start" | "start_operation" | "seal_runtime" | "checkpoint" | "delete"
                 )
                 || intent.fingerprint.len() != 64
                 || intent.deadline_unix_millis == 0

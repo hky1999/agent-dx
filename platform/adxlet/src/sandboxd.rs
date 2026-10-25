@@ -755,7 +755,11 @@ impl Sandboxd {
                     operation_id: intent.id.clone(),
                     request_fingerprint: intent.fingerprint.clone(),
                     deadline_unix_millis: intent.deadline_unix_millis,
-                    seal_missing: intent.kind == "start_operation",
+                    seal_missing: matches!(
+                        intent.kind.as_str(),
+                        "start_operation" | "seal_runtime"
+                    ),
+                    seal_runtime: intent.kind == "seal_runtime",
                     history_identity: intent
                         .history_identity
                         .clone()
@@ -766,6 +770,13 @@ impl Sandboxd {
             .map_err(unavailable)?
             .into_inner();
         let outcome = start_operation_state(&intent, &response)?;
+        if intent.kind == "seal_runtime"
+            && (!response.runtime_fenced || outcome != proto::StartOperationState::NotCreated)
+        {
+            return Err(unavailable(
+                "missing local intent requires a durable Runtime-wide negative fence",
+            ));
+        }
         match outcome {
             proto::StartOperationState::NotCreated => {
                 *state = StartState::NotCreated;
@@ -1643,6 +1654,39 @@ impl RuntimeDriver for Sandboxd {
             return Ok(());
         }
 
+        // Missing local facts never prove non-creation. Ask the daemon to seal
+        // the complete Runtime against every fingerprint, before cleanup can
+        // observe a terminal negative. The original local and daemon journals
+        // remain intact, and older daemons cannot supply the required receipt.
+        if matches!(*state, StartState::Idle)
+            && self.journal.is_some()
+            && !self
+                .operations
+                .lock()
+                .map_err(unavailable)?
+                .contains_key(runtime_id)
+        {
+            let identity = self.history_identity(runtime_id)?.ok_or_else(|| {
+                unavailable("complete history identity required for missing-intent reconciliation")
+            })?;
+            let fingerprint =
+                operations::fingerprint(&("negative-runtime-reconciliation-v1", &identity))?;
+            let intent = OperationIntent {
+                id: identity.operation_id(&fingerprint)?,
+                kind: "seal_runtime".into(),
+                fingerprint,
+                deadline_unix_millis: operations::now_millis()?.saturating_sub(1).max(1),
+                history_identity: Some(identity),
+            };
+            self.operations
+                .lock()
+                .map_err(unavailable)?
+                .entry(runtime_id.into())
+                .or_default()
+                .start = Some(intent.clone());
+            *state = StartState::StartUncertain;
+            self.persist(runtime_id, &state, Some(intent)).await?;
+        }
         let failed_start = matches!(*state, StartState::Failed | StartState::StartUncertain);
         let mut physical = self.physical_identity(runtime_id).await?;
         if physical.is_some()

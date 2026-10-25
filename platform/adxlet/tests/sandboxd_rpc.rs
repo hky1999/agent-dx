@@ -216,6 +216,7 @@ impl sandbox_service_server::SandboxService for Server {
             return Err(Status::unavailable("request lost before durable admission"));
         }
         let mut outcome = StartOperationResponse {
+            runtime_fenced: false,
             operation_id: request.operation_id.clone(),
             request_fingerprint: request.request_fingerprint,
             deadline_unix_millis: request.deadline_unix_millis,
@@ -224,6 +225,7 @@ impl sandbox_service_server::SandboxService for Server {
         };
         if self.not_created_on_start {
             outcome.state = StartOperationState::NotCreated as i32;
+            outcome.runtime_fenced = false;
             self.start_outcomes
                 .lock()
                 .unwrap()
@@ -266,6 +268,7 @@ impl sandbox_service_server::SandboxService for Server {
             .get(&request.operation_id)
             .cloned()
             .unwrap_or(StartOperationResponse {
+                runtime_fenced: false,
                 operation_id: request.operation_id,
                 request_fingerprint: request.request_fingerprint,
                 deadline_unix_millis: request.deadline_unix_millis,
@@ -279,6 +282,7 @@ impl sandbox_service_server::SandboxService for Server {
             >= u128::from(request.deadline_unix_millis);
         if self.drop_before_admission && request.seal_missing && expired {
             outcome.state = StartOperationState::NotCreated as i32;
+            outcome.runtime_fenced = request.seal_runtime;
             self.start_outcomes
                 .lock()
                 .unwrap()
@@ -3080,4 +3084,60 @@ async fn durable_retirement_before_final_state_reopens_without_another_delete_rp
         1,
         "durable original retirement must not require a collected receipt or new delete"
     );
+}
+
+#[tokio::test]
+async fn missing_local_intent_requires_runtime_fence_and_survives_reopen() {
+    use adx_core::history::HistoryBoundary;
+    let server = Server {
+        drop_before_admission: true,
+        ..Default::default()
+    };
+    let (adapter, harness) = connect(server.clone()).await;
+    adapter
+        .collect_history(HistoryBoundary {
+            authority: "test-control".into(),
+            coordinator_epoch: 1,
+            assignment_generation: 0,
+            catalog_revision: 1,
+            protected: Default::default(),
+        })
+        .await
+        .unwrap();
+    adapter.remove("i-1").await.unwrap();
+    assert!(server.starts.lock().unwrap().is_empty());
+    assert!(server.start_operations.lock().unwrap().is_empty());
+    let queries = server.start_queries.lock().unwrap().clone();
+    assert_eq!(queries.len(), 1);
+    assert!(queries[0].seal_runtime && queries[0].seal_missing);
+    drop(adapter);
+    let adapter = reconnect_with_journal(&harness).await;
+    adapter.remove("i-1").await.unwrap();
+    assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
+}
+#[tokio::test]
+async fn missing_local_intent_keeps_unknown_when_daemon_cannot_seal_runtime() {
+    use adx_core::history::HistoryBoundary;
+    let server = Server::default();
+    let (adapter, harness) = connect(server.clone()).await;
+    adapter
+        .collect_history(HistoryBoundary {
+            authority: "test-control".into(),
+            coordinator_epoch: 1,
+            assignment_generation: 0,
+            catalog_revision: 1,
+            protected: Default::default(),
+        })
+        .await
+        .unwrap();
+    assert!(adapter.remove("i-1").await.is_err());
+    let first = server.start_queries.lock().unwrap()[0].clone();
+    drop(adapter);
+    let adapter = reconnect_with_journal(&harness).await;
+    assert!(adapter.remove("i-1").await.is_err());
+    let queries = server.start_queries.lock().unwrap();
+    assert_eq!(queries.len(), 2);
+    assert_eq!(queries[1].operation_id, first.operation_id);
+    assert_eq!(queries[1].deadline_unix_millis, first.deadline_unix_millis);
+    assert!(server.conditional_deletes.lock().unwrap().is_empty());
 }

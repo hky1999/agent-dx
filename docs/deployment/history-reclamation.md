@@ -88,3 +88,12 @@ They cover lost acknowledgments, repeated reopening, catalog reconciliation,
 bounded batches, durable retirement before final state, file identity,
 closed revisions and unresolved growth. These component tests are distinct
 from a matching deployment's physical fault acceptance.
+
+
+## 缺失本地创建条目时的负向对账
+
+节点重启可能收到已分配但尚未开始的Starting记录。本地SQLite缺少该Runtime的操作条目不能证明它从未创建。只有安装完整历史身份和持久操作日志时，节点才登记独立的`seal_runtime`负向查询意图，再调用sandboxd的`GetStartOperation`，同时设置`seal_missing`和`seal_runtime`。操作编号、完整历史身份、指纹和原查询期限先持久保存；中断后继续同一查询，不生成新期限或物理创建请求。
+
+匹配的daemon在创建准入互斥锁内核对全部已登记事实，并要求节点物理准备和原生运行时库存完整且为空。已有同Runtime的其他操作、已登记事实缺失或损坏、未知库存或超过4096条检查上限时均拒绝。成功围栏以`runtime_fenced=true`和`NOT_CREATED`确认；该围栏跨daemon重启，拒绝该完整Runtime使用其他指纹的新建。它不删除或重分类任何原操作。旧daemon只返回按操作编号封禁时，新增确认默认为false，节点继续保留占用。
+
+该接口只证明被封禁Runtime不能再开始物理执行。预算仍由节点后续正常生命周期结果提交与中央账目结算，围栏回执不能用于其他Assignment或Runtime。此能力要求匹配协议和程序；源码测试不替代目标部署的物理重启验收。
