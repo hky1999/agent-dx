@@ -400,13 +400,16 @@ fn request_fingerprint(kw: &BTreeMap<String, Value>) -> String {
         _ => Vec::new(),
     };
     let timeout_ms = kw_f64(kw, "timeout").map(|seconds| (seconds * 1000.0).round() as i64);
-    let canonical = serde_json::json!({
+    let mut canonical = serde_json::json!({
         "command": cmd,
         "cwd": cwd,
         "envs": envs,
         "timeout_ms": timeout_ms,
         "want_stdin": want_stdin,
     });
+    if let Some(user) = kw_str(kw, "user") {
+        canonical["user"] = serde_json::Value::String(user);
+    }
     let mut hasher = Sha256::new();
     hasher.update(b"adx-command-request-v1\0");
     hasher.update(serde_json::to_vec(&canonical).expect("canonical command JSON"));
@@ -651,6 +654,24 @@ pub fn cmd_start(kw: &BTreeMap<String, Value>) -> Value {
         .or_else(|| kw_str(kw, "cmd"))
         .unwrap_or_default();
     let cwd = kw_str(kw, "cwd");
+    let mut process = Command::new("/bin/sh");
+    if kw.contains_key("user") {
+        let Some(user) = kw_str(kw, "user").filter(|user| !user.trim().is_empty()) else {
+            return map_value(vec![
+                ("error_code", Value::from("INVALID_ARGUMENT")),
+                (
+                    "error",
+                    Value::from("user must be a non-empty username or UID"),
+                ),
+            ]);
+        };
+        if let Err(error) = super::entrypoint::apply_command_user(&mut process, &user) {
+            return map_value(vec![
+                ("error_code", Value::from("INVALID_ARGUMENT")),
+                ("error", Value::from(error)),
+            ]);
+        }
+    }
     let want_stdin = kw_bool(kw, "want_stdin").unwrap_or(false);
     let mut records = commands().lock().unwrap();
     cleanup_expired(&mut records);
@@ -720,7 +741,6 @@ pub fn cmd_start(kw: &BTreeMap<String, Value>) -> Value {
         },
     );
 
-    let mut process = Command::new("/bin/sh");
     super::child_env::apply(&mut process);
     // One command owns one process group. Timeout/kill therefore terminates
     // the shell and descendants instead of leaving detached workloads alive.
@@ -863,6 +883,102 @@ pub fn cmd_get(kw: &BTreeMap<String, Value>) -> Value {
     }
 }
 
+struct OutputChunk {
+    encoded: String,
+    next: u64,
+    has_more: bool,
+    truncated: bool,
+    finished: bool,
+}
+
+fn output_chunk(reader: &Reader, offset: u64, limit: usize) -> Result<OutputChunk, &'static str> {
+    use base64::Engine;
+    let buffer = reader
+        .buf
+        .lock()
+        .map_err(|_| "command output lock unavailable")?;
+    let start = usize::try_from(offset).map_err(|_| "output cursor is out of range")?;
+    if start > buffer.data.len() {
+        return Err("output cursor is beyond retained output");
+    }
+    let end = start.saturating_add(limit).min(buffer.data.len());
+    Ok(OutputChunk {
+        encoded: base64::engine::general_purpose::STANDARD.encode(&buffer.data[start..end]),
+        next: u64::try_from(end).map_err(|_| "output cursor overflow")?,
+        has_more: end < buffer.data.len(),
+        truncated: buffer.truncated,
+        finished: reader.finished.load(Ordering::Acquire),
+    })
+}
+
+/// Read bounded binary output chunks without consuming or restarting a command.
+/// Cursors are byte offsets and replaying a cursor returns the same prefix.
+pub fn cmd_output(kw: &BTreeMap<String, Value>) -> Value {
+    let invalid = |message| {
+        map_value(vec![
+            ("error_code", Value::from("INVALID_ARGUMENT")),
+            ("error", Value::from(message)),
+        ])
+    };
+    let cursor = |name: &str| match kw.get(name) {
+        None => Some(0),
+        Some(value) => value.as_u64(),
+    };
+    let (Some(stdout_offset), Some(stderr_offset)) =
+        (cursor("stdout_offset"), cursor("stderr_offset"))
+    else {
+        return invalid("output cursors must be non-negative integers");
+    };
+    let limit = kw.get("limit").map_or(Some(65536), Value::as_u64);
+    let Some(limit) = limit.filter(|limit| (1..=65536).contains(limit)) else {
+        return invalid("output limit must be from 1 through 65536 bytes");
+    };
+    let Ok(limit) = usize::try_from(limit) else {
+        return invalid("output limit is out of range");
+    };
+    let snapshot = {
+        let Ok(mut records) = commands().lock() else {
+            return map_value(vec![
+                ("error_code", Value::from("UNAVAILABLE")),
+                ("error", Value::from("command registry unavailable")),
+            ]);
+        };
+        cleanup_expired(&mut records);
+        resolve_key(&records, kw)
+            .and_then(|key| records.get(&key))
+            .map(CommandSnapshot::from)
+    };
+    let Some(record) = snapshot else {
+        return missing_command(kw);
+    };
+    let stdout = match output_chunk(&record.stdout, stdout_offset, limit) {
+        Ok(chunk) => chunk,
+        Err(message) => return invalid(message),
+    };
+    let stderr = match output_chunk(&record.stderr, stderr_offset, limit) {
+        Ok(chunk) => chunk,
+        Err(message) => return invalid(message),
+    };
+    let terminal = !matches!(snapshot_status(&record), "PENDING" | "RUNNING")
+        && stdout.finished
+        && stderr.finished;
+    map_value(vec![
+        ("command_id", Value::from(record.command_id)),
+        ("stdout_base64", Value::from(stdout.encoded)),
+        ("stderr_base64", Value::from(stderr.encoded)),
+        ("stdout_offset", Value::from(stdout.next)),
+        ("stderr_offset", Value::from(stderr.next)),
+        ("has_more", Value::from(stdout.has_more || stderr.has_more)),
+        (
+            "truncated",
+            Value::from(stdout.truncated || stderr.truncated),
+        ),
+        ("terminal", Value::from(terminal)),
+        ("error_code", nil()),
+        ("error", nil()),
+    ])
+}
+
 pub fn cmd_wait(kw: &BTreeMap<String, Value>) -> Value {
     let timeout = kw_f64(kw, "timeout").map(Duration::from_secs_f64);
     let exit = {
@@ -930,6 +1046,8 @@ pub fn cmd_capabilities(_kw: &BTreeMap<String, Value>) -> Value {
                     "recoverable-command-result",
                     "multiplexed-command-watch",
                     "bounded-command-output",
+                    "incremental-command-output-v1",
+                    "command-user-v1",
                     "command-activity-lease",
                 ]
                 .into_iter()
@@ -1132,6 +1250,96 @@ mod tests {
             .iter()
             .find_map(|(key, value)| (key.as_str() == Some(name)).then_some(value))
             .unwrap()
+    }
+
+    #[test]
+    fn incremental_output_is_readable_before_exit_and_cursors_are_replayable() {
+        use base64::Engine;
+        let id = format!("cmd-output-{}", now_ms());
+        let mut start = args(
+            &id,
+            "printf 'first'; printf 'err' >&2; read answer; printf 'last'",
+        );
+        start.insert("want_stdin".into(), Value::from(true));
+        let started = cmd_start(&start);
+        assert!(field(&started, "error").is_nil());
+        let request = BTreeMap::from([
+            ("command_id".into(), Value::from(id.clone())),
+            ("stdout_offset".into(), Value::from(0u64)),
+            ("stderr_offset".into(), Value::from(0u64)),
+            ("limit".into(), Value::from(65536u64)),
+        ]);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let first = loop {
+            let value = cmd_output(&request);
+            if field(&value, "stdout_offset").as_u64().unwrap() >= 5 {
+                break value;
+            }
+            assert!(Instant::now() < deadline, "output was withheld until exit");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(field(&first, "terminal").as_bool(), Some(false));
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(field(&first, "stdout_base64").as_str().unwrap())
+            .unwrap();
+        assert_eq!(decoded, b"first");
+        assert_eq!(
+            field(&cmd_output(&request), "stdout_base64"),
+            field(&first, "stdout_base64")
+        );
+        let mut remaining = request;
+        remaining.insert(
+            "stdout_offset".into(),
+            field(&first, "stdout_offset").clone(),
+        );
+        remaining.insert(
+            "stderr_offset".into(),
+            field(&first, "stderr_offset").clone(),
+        );
+        let sent = cmd_send_stdin(&BTreeMap::from([
+            ("command_id".into(), Value::from(id.clone())),
+            ("data".into(), Value::from("continue\n")),
+            ("eof".into(), Value::from(true)),
+        ]));
+        assert!(field(&sent, "error").is_nil());
+        let waited = cmd_wait(&BTreeMap::from([
+            ("command_id".into(), Value::from(id)),
+            ("timeout".into(), Value::from(5u64)),
+        ]));
+        assert_eq!(field(&waited, "exit_code").as_i64(), Some(0));
+        let last = cmd_output(&remaining);
+        assert_eq!(field(&last, "terminal").as_bool(), Some(true));
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(field(&last, "stdout_base64").as_str().unwrap())
+                .unwrap(),
+            b"last"
+        );
+    }
+
+    #[test]
+    fn explicit_command_user_participates_in_deduplication() {
+        use std::os::unix::fs::MetadataExt;
+        let uid = std::fs::metadata("/proc/self").unwrap().uid();
+        let id = format!("cmd-user-{}", now_ms());
+        let mut request = args(&id, "id -u");
+        request.insert("user".into(), Value::from(uid.to_string()));
+        let started = cmd_start(&request);
+        assert!(field(&started, "error").is_nil());
+        request.insert("user".into(), Value::from(format!("{uid}:1")));
+        let repeated = cmd_start(&request);
+        assert_eq!(
+            field(&repeated, "error_code").as_str(),
+            Some("COMMAND_CONFLICT")
+        );
+        let waited = cmd_wait(&BTreeMap::from([
+            ("command_id".into(), Value::from(id)),
+            ("timeout".into(), Value::from(5u64)),
+        ]));
+        assert_eq!(
+            field(&waited, "stdout").as_str().unwrap().trim(),
+            uid.to_string()
+        );
     }
 
     #[test]

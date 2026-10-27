@@ -22,6 +22,9 @@ struct Create {
     storage: Option<i64>,
     storage_limit_mb: i64,
     env: HashMap<String, String>,
+    metadata: HashMap<String, String>,
+    #[serde(rename = "lifetimeTimeoutSeconds")]
+    lifetime_timeout: Option<u64>,
     labels: HashMap<String, String>,
     #[serde(rename = "snapshotId")]
     snapshot_id: String,
@@ -656,6 +659,7 @@ pub fn create_spec_with_environment(
         return Err(invalid("timeouts cannot be negative"));
     }
     let lifecycle = adx_core::lifecycle::LifecyclePolicy {
+        lifetime_timeout_seconds: r.lifetime_timeout,
         idle_timeout_seconds: r.idle as u64,
         idle_action: r.idle_action,
         pause: r.pause.as_ref().map(|p| adx_core::lifecycle::PausePolicy {
@@ -666,6 +670,15 @@ pub fn create_spec_with_environment(
         restart: None,
     };
     lifecycle.validate().map_err(|e| invalid(&e.to_string()))?;
+    if r.metadata.len() > 64
+        || r.metadata
+            .iter()
+            .any(|(key, value)| key.is_empty() || key.len() > 256 || value.len() > 4096)
+    {
+        return Err(invalid(
+            "metadata requires at most 64 entries, keys 1..256 bytes and values up to 4096 bytes",
+        ));
+    }
     if r.storage.is_some_and(|v| v <= 0) || r.storage_limit_mb < 0 {
         return Err(invalid("storageMb must be positive"));
     }
@@ -903,6 +916,7 @@ pub fn create_spec_with_environment(
         None
     };
     Ok(pb::EnvironmentSpec {
+        metadata: r.metadata,
         runtime_profile,
         id: format!("{}-{}", r.namespace, r.name),
         tenant_id: caller.tenant_id.clone(),
@@ -917,6 +931,7 @@ pub fn create_spec_with_environment(
         scheduling: Some(policy),
         env: r.env,
         lifecycle: Some(pb::LifecyclePolicy {
+            lifetime_timeout_seconds: r.lifetime_timeout,
             idle_timeout_seconds: r.idle as u64,
             restart,
             idle_action: match r.idle_action {

@@ -412,6 +412,7 @@ pub(crate) fn normalize_environment_action(action: &str) -> Option<&'static str>
         "cmd_run" | "exec" | "process.exec" | "process.run" | "cmd.run" => Some("cmd_run"),
         "cmd_start" | "process.start" | "cmd.start" => Some("cmd_start"),
         "cmd_get" | "process.get" | "cmd.get" => Some("cmd_get"),
+        "cmd_output" | "process.output" | "cmd.output" => Some("cmd_output"),
         "cmd_poll" | "process.poll" | "cmd.poll" => Some("cmd_poll"),
         "cmd_wait" | "process.wait" | "cmd.wait" => Some("cmd_wait"),
         "cmd_kill" | "process.kill" | "cmd.kill" => Some("cmd_kill"),
@@ -484,9 +485,10 @@ pub(crate) fn dispatch_runtime_action_with_trace(
             _ => super::fs::fs_get_info(kw),
         }),
         "cmd_start" | "cmd_get" | "cmd_poll" | "cmd_wait" | "cmd_kill" | "cmd_list"
-        | "cmd_capabilities" | "cmd_send_stdin" => Some(match method {
+        | "cmd_capabilities" | "cmd_send_stdin" | "cmd_output" => Some(match method {
             "cmd_start" => super::cmd::cmd_start(kw),
             "cmd_get" => super::cmd::cmd_get(kw),
+            "cmd_output" => super::cmd::cmd_output(kw),
             "cmd_poll" => super::cmd::cmd_poll(kw),
             "cmd_wait" => super::cmd::cmd_wait(kw),
             "cmd_kill" => super::cmd::cmd_kill(kw),

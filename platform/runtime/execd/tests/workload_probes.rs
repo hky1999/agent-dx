@@ -96,8 +96,10 @@ fn start(config: ProbeConfig) -> Process {
         .process_group(0);
     let child = command.spawn().unwrap();
     let record = EnvironmentRecord {
+        expires_at_unix_seconds: None,
         failure: None,
         spec: EnvironmentSpec {
+            metadata: Default::default(),
             runtime_profile: None,
             snapshot_id: None,
             lifecycle: Default::default(),

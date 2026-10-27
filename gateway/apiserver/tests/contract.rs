@@ -409,3 +409,28 @@ fn constructor_cwd_is_preserved_and_invalid_paths_are_rejected() {
         .cwd
         .is_none());
 }
+
+#[test]
+fn metadata_and_running_lifetime_do_not_change_scheduler_or_idle_policy() {
+    let spec = create_spec(
+        json!({"image":"image", "metadata":{"task":"sdk-lifecycle"},
+        "lifetimeTimeoutSeconds":120, "idleTimeoutSeconds":0}),
+        &caller(),
+    )
+    .unwrap();
+    assert_eq!(
+        spec.metadata.get("task").map(String::as_str),
+        Some("sdk-lifecycle")
+    );
+    let policy = spec.lifecycle.unwrap();
+    assert_eq!(policy.lifetime_timeout_seconds, Some(120));
+    assert_eq!(policy.idle_timeout_seconds, 0);
+    assert!(spec.scheduling.unwrap().required_affinity.is_empty());
+    for value in [
+        json!({"image":"image","lifetimeTimeoutSeconds":0}),
+        json!({"image":"image","lifetimeTimeoutSeconds":-1}),
+        json!({"image":"image","metadata":{"task":42}}),
+    ] {
+        assert!(create_spec(value, &caller()).is_err());
+    }
+}

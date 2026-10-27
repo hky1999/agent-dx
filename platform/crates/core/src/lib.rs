@@ -105,6 +105,8 @@ impl Resources {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvironmentSpec {
     #[serde(default)]
+    pub metadata: BTreeMap<String, String>,
+    #[serde(default)]
     pub runtime_profile: Option<runtime_profile::RuntimeProfile>,
     #[serde(default)]
     pub snapshot_id: Option<String>,
@@ -126,6 +128,14 @@ pub struct EnvironmentSpec {
 
 impl EnvironmentSpec {
     pub fn validate(&self) -> Result<()> {
+        if self.metadata.len() > 64
+            || self
+                .metadata
+                .iter()
+                .any(|(key, value)| key.is_empty() || key.len() > 256 || value.len() > 4096)
+        {
+            return Err(Error::Invalid("metadata requires at most 64 entries, keys 1..256 bytes and values up to 4096 bytes".into()));
+        }
         for (name, value) in [
             ("id", &self.id),
             ("tenant", &self.tenant_id),
@@ -302,6 +312,9 @@ pub enum RuntimeFailureReason {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvironmentRecord {
+    /// Node-enforced running lifetime. Paused retention uses checkpoint expiry.
+    #[serde(default)]
+    pub expires_at_unix_seconds: Option<u64>,
     #[serde(default)]
     pub failure: Option<RuntimeFailure>,
     #[serde(default)]

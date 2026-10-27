@@ -90,6 +90,7 @@ impl Session {
                 });
             }
             stored_environment.result = Some(EnvironmentRecord {
+                expires_at_unix_seconds: None,
                 failure: None,
                 spec: stored_environment.spec.clone(),
                 assignment: replacement.clone(),

@@ -47,7 +47,7 @@ instead of inferring retry safety from HTTP status or message text. See the
 
 | Operation | Method and path | Request body | Decoded successful `data` |
 | --- | --- | --- | --- |
-| Probe capability | `GET /api/environment/v1/capabilities` | none | plain JSON `{"capabilities":["workload-probes-v1"]}` (authenticated; no envelope) |
+| Probe capability | `GET /api/environment/v1/capabilities` | none | plain JSON `{"capabilities":["workload-probes-v1","environment-metadata-v1","environment-lifetime-v1"]}` (authenticated; no envelope) |
 | Create environment | `POST /api/environment/v1/environments` | create fields, including optional `snapshotId` and `failover` | `{"environmentId":"default-name","environmentId":"default-name","status":"running","requestId":"..."}`; `tunnel` is included when requested |
 | Create reusable snapshot | `POST /api/environment/v1/environments/{environmentID}/snapshots` | `{"name":"optional","timeoutSeconds":300}` | `{"snapshotId":"...","names":["optional"]}` |
 | Get reusable snapshot | `GET /api/environment/v1/snapshots/{snapshotID}` | none | tenant-scoped catalog JSON returned by the Rust Coordinator SnapshotService |
@@ -56,6 +56,7 @@ instead of inferring retry safety from HTTP status or message text. See the
 | Pause | `POST /api/environment/v1/environments/{environmentID}/pause` | `{"retention":{"kind":"ttl","ttlSeconds":90000},"timeoutSeconds":300}` | `{"environmentId":"...","snapshotId":"...","size":8192,"state":"paused","expiresAt":...}` |
 | Resume | `POST /api/environment/v1/environments/{environmentID}/resume` | none | `{"environmentId":"...","state":"running","routeAddress":"host:port","functionProxyId":"...","nodeId":"...","portMappings":{}}` |
 | Reload latest recovery point | `POST /api/environment/v1/environments/{environmentID}/reload` | none | `{"success":true}` after a new backend execution reaches Running and is published |
+| Set running lifetime | `POST /api/environment/v1/environments/{environmentID}/timeout` | `{"lifetimeTimeoutSeconds":120}` and `X-ADX-Request-ID: timeout-...` | `{"success":true,"expiresAt":...}` after the node decision is published |
 | Replace network policy | `PUT /api/environment/v1/environments/{environmentID}/network` | complete network policy, or `{}` to clear it | `{"success":true}` after sandboxd accepts the replacement and the operation is published |
 
 `snapshotId` on the normal create route creates a new environment from a reusable
@@ -325,3 +326,29 @@ This option initializes the default directory used by SDK commands. It does not
 change Execd's process cwd or the inherited OCI entrypoint's WORKDIR. Per-command
 cwd overrides remain strict and never create directories implicitly; spawn errors
 use `SPAWN_FAILED` and `error_message`.
+
+## User metadata and running lifetime
+
+Create accepts optional `metadata` and `lifetimeTimeoutSeconds`, advertised by
+`environment-metadata-v1` and `environment-lifetime-v1`. Metadata is an immutable
+user string map (64 entries, UTF-8 keys 1..256 bytes, values up to 4096 bytes),
+separate from scheduling `labels`; `/api/instances` exposes it as `metadata`.
+Directory filtering remains a client operation over authorized bounded pages.
+
+`lifetimeTimeoutSeconds` is a positive running duration, independent of idle
+observation and create/initialization budgets. The node arms its persisted Unix
+deadline when Running is reached and deletes expired executions on its lifecycle
+tick even when traffic is active or idle policy is disabled. Serial operations
+can delay expiry; clock synchronization is an operational prerequisite. A failed
+execution pending restart keeps its existing deadline. Pause clears the active
+deadline and resume re-arms the configured duration. Paused checkpoint retention
+remains independently controlled by the pause request.
+
+The timeout endpoint requires Running state. The authenticated API Server forwards
+`UpdateEnvironmentTimeout` with assignment, operation ID and expected revision;
+Adxlet serializes and persists the deadline, and Coordinator stores that decision.
+Retry the same operation ID with identical inputs after an unknown outcome.
+A timeout update neither restarts the workload nor substitutes an idle timeout.
+The directory adds `expires_at_unix_seconds` and `lifetime_timeout_seconds`.
+Deploy a matching API Server, Coordinator/protocol and node release; installing a
+new client alone does not add these server capabilities.

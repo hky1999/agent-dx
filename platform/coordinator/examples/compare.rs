@@ -30,6 +30,7 @@ fn node(i: usize, capacity: u64, revision: usize) -> Node {
 }
 fn spec(i: usize) -> EnvironmentSpec {
     EnvironmentSpec {
+        metadata: Default::default(),
         runtime_profile: None,
         snapshot_id: None,
         lifecycle: Default::default(),

@@ -184,7 +184,10 @@ impl Api {
             };
         }
         if method == "GET" && path == "/api/environment/v1/capabilities" {
-            return plain(200, json!({"capabilities": ["workload-probes-v1"]}));
+            return plain(
+                200,
+                json!({"capabilities": ["workload-probes-v1", "environment-metadata-v1", "environment-lifetime-v1"]}),
+            );
         }
         if method == "GET" && path == "/api/environment/v1/resources" {
             return match self.clients.nodes().await {
@@ -397,6 +400,7 @@ impl Api {
                 ("POST", "snapshots") => Some(Kind::Snapshot),
                 ("PUT", "network") => Some(Kind::Network),
                 ("POST", "reload") => Some(Kind::Reload),
+                ("POST", "timeout") => Some(Kind::Timeout),
                 _ => None,
             };
             if let Some(kind) = kind {
@@ -977,6 +981,9 @@ pub(crate) fn instance_view(owner: pb::GetEnvironmentResponse) -> Result<Value, 
         "required_cpu": resource.cpu_millis,
         "required_mem": resource.memory_bytes / 1048576,
         "image": spec.image,
+        "metadata": spec.metadata,
+        "expires_at_unix_seconds": record.expires_at_unix_seconds,
+        "lifetime_timeout_seconds": spec.lifecycle.and_then(|p| p.lifetime_timeout_seconds),
     }))
 }
 fn state(value: i32) -> &'static str {

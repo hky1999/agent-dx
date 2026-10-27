@@ -293,6 +293,7 @@ fn fixture() -> (
     node.update_capacity(resources, Duration::from_secs(300))
         .unwrap();
     let spec = EnvironmentSpec {
+        metadata: Default::default(),
         runtime_profile: None,
         snapshot_id: None,
         lifecycle: Default::default(),
@@ -1293,6 +1294,7 @@ async fn recovery_with_unusable_checkpoint_settles_failed_without_image_start() 
     let (_temp, backend, node, spec, mut assignment) = fixture();
     assignment.generation = 2;
     let record = EnvironmentRecord {
+        expires_at_unix_seconds: None,
         failure: None,
         spec,
         assignment,
@@ -1371,6 +1373,7 @@ async fn recovery_retries_publication_without_repeating_backend_restore() {
         .unwrap();
     assignment.generation = 2;
     let seed = EnvironmentRecord {
+        expires_at_unix_seconds: None,
         failure: None,
         spec,
         assignment,
@@ -1961,5 +1964,30 @@ async fn object_pause_seeds_same_node_resume_without_remote_manifest() {
         .unwrap();
     let running = h.resume(resume(paused.record.revision)).await.unwrap();
     assert_eq!(running.record.state, EnvironmentState::Running);
+    h.delete().await.unwrap();
+}
+
+#[tokio::test]
+async fn pause_clears_running_lifetime_and_resume_rearms_it() {
+    let (_temp, _backend, node, mut spec, assignment) = fixture();
+    spec.lifecycle.lifetime_timeout_seconds = Some(100);
+    let h = node.environment(spec, assignment).unwrap();
+    let created = h.create().await.unwrap();
+    assert!(created.record.expires_at_unix_seconds.is_some());
+    let paused = h.pause(pause(created.record.revision)).await.unwrap();
+    assert_eq!(paused.record.expires_at_unix_seconds, None);
+    assert!(paused
+        .record
+        .checkpoint
+        .as_ref()
+        .unwrap()
+        .expires_at_unix_seconds
+        .is_some());
+    let running = h.resume(resume(paused.record.revision)).await.unwrap();
+    assert!(running.record.expires_at_unix_seconds.is_some());
+    assert_eq!(
+        running.record.spec.lifecycle.lifetime_timeout_seconds,
+        Some(100)
+    );
     h.delete().await.unwrap();
 }

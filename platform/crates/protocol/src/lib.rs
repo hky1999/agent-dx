@@ -28,6 +28,7 @@ impl TryFrom<control::EnvironmentSpec> for adx_core::EnvironmentSpec {
             .resources
             .ok_or_else(|| Error::Invalid("resources are required".into()))?;
         let spec = Self {
+            metadata: value.metadata.into_iter().collect(),
             runtime_profile: value.runtime_profile.map(TryInto::try_into).transpose()?,
             snapshot_id: value.snapshot_id,
             lifecycle: value
@@ -65,6 +66,7 @@ impl TryFrom<control::EnvironmentSpec> for adx_core::EnvironmentSpec {
 impl From<adx_core::EnvironmentSpec> for control::EnvironmentSpec {
     fn from(value: adx_core::EnvironmentSpec) -> Self {
         Self {
+            metadata: value.metadata.into_iter().collect(),
             runtime_profile: value.runtime_profile.map(Into::into),
             snapshot_id: value.snapshot_id,
             lifecycle: Some(value.lifecycle.into()),
@@ -136,7 +138,8 @@ mod tests {
 
     #[test]
     fn environment_spec_round_trip_preserves_units_and_priority() {
-        let value = adx_core::EnvironmentSpec {
+        let mut value = adx_core::EnvironmentSpec {
+            metadata: Default::default(),
             runtime_profile: None,
             snapshot_id: None,
             lifecycle: Default::default(),
@@ -154,6 +157,7 @@ mod tests {
             priority: -10,
             execution: Default::default(),
         };
+        value.metadata.insert("task".into(), "sdk-lifecycle".into());
         let bytes = control::EnvironmentSpec::from(value.clone()).encode_to_vec();
         let decoded = control::EnvironmentSpec::decode(bytes.as_slice()).unwrap();
         assert_eq!(adx_core::EnvironmentSpec::try_from(decoded).unwrap(), value);
@@ -214,6 +218,7 @@ impl TryFrom<control::EnvironmentRecord> for adx_core::EnvironmentRecord {
             spec,
             assignment,
             state,
+            expires_at_unix_seconds: v.expires_at_unix_seconds,
             revision: v.revision,
             restart_attempts: v.restart_attempts,
             restart_pending: v.restart_pending,
@@ -246,6 +251,7 @@ impl TryFrom<adx_core::EnvironmentRecord> for control::EnvironmentRecord {
             spec: Some(v.spec.into()),
             assignment: Some(v.assignment.try_into()?),
             state: state as i32,
+            expires_at_unix_seconds: v.expires_at_unix_seconds,
             revision: v.revision,
             restart_attempts: v.restart_attempts,
             restart_pending: v.restart_pending,
@@ -382,6 +388,7 @@ impl From<adx_core::CompletedOperation> for control::CompletedOperation {
                 adx_core::LifecycleKind::Snapshot => 3,
                 adx_core::LifecycleKind::Network => 4,
                 adx_core::LifecycleKind::Reload => 5,
+                adx_core::LifecycleKind::Timeout => 6,
             },
         }
     }
@@ -401,6 +408,7 @@ impl TryFrom<control::CompletedOperation> for adx_core::CompletedOperation {
                 3 => adx_core::LifecycleKind::Snapshot,
                 4 => adx_core::LifecycleKind::Network,
                 5 => adx_core::LifecycleKind::Reload,
+                6 => adx_core::LifecycleKind::Timeout,
                 _ => return Err(Error::Invalid("invalid lifecycle kind".into())),
             },
         })
@@ -435,6 +443,7 @@ impl TryFrom<control::LifecyclePolicy> for adx_core::lifecycle::LifecyclePolicy 
                     })
                 })
                 .transpose()?,
+            lifetime_timeout_seconds: v.lifetime_timeout_seconds,
             idle_timeout_seconds: v.idle_timeout_seconds,
             restart: v.restart.map(|r| adx_core::lifecycle::RestartPolicy {
                 max_attempts: r.max_attempts,
@@ -462,6 +471,7 @@ impl From<adx_core::lifecycle::LifecyclePolicy> for control::LifecyclePolicy {
                     adx_core::lifecycle::CheckpointStorage::Shared => 2,
                 },
             }),
+            lifetime_timeout_seconds: v.lifetime_timeout_seconds,
             idle_timeout_seconds: v.idle_timeout_seconds,
             restart: v.restart.map(|r| control::RestartPolicy {
                 max_attempts: r.max_attempts,

@@ -88,6 +88,7 @@ fn environment_roundtrip_preserves_oci_source() {
 #[test]
 fn record_roundtrip_preserves_identity_state_and_ownership() {
     let spec = EnvironmentSpec {
+        metadata: Default::default(),
         runtime_profile: Some(serde_json::from_value(serde_json::json!({
             "rootfs": {"runtime_class": "runc", "type": "local", "path": "/opt/adx/runtime/rootfs.img", "readonly": false},
             "bootstrap": {"type": "erofs", "root": "/opt/adx/runtime/rootfs.img", "target": "/__adx", "entrypoint": ["/__adx/usr/local/bin/adx-execd"]},
@@ -110,6 +111,7 @@ fn record_roundtrip_preserves_identity_state_and_ownership() {
     execution: Default::default(),
     };
     let r = EnvironmentRecord {
+        expires_at_unix_seconds: None,
         restart_attempts: 0,
         restart_pending: false,
         spec,

@@ -98,6 +98,7 @@ impl State {
             .get(&stored.assignment.node_id)
             .ok_or(Error::NotFound)?;
         let record = stored.result.clone().unwrap_or_else(|| EnvironmentRecord {
+            expires_at_unix_seconds: None,
             failure: None,
             spec: stored.spec.clone(),
             assignment: stored.assignment.clone(),

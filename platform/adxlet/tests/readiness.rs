@@ -42,10 +42,12 @@ impl RuntimeDriver for Runtime {
 }
 fn record() -> EnvironmentRecord {
     EnvironmentRecord {
+        expires_at_unix_seconds: None,
         failure: None,
         restart_attempts: 0,
         restart_pending: false,
         spec: EnvironmentSpec {
+            metadata: Default::default(),
             runtime_profile: None,
             snapshot_id: None,
             lifecycle: Default::default(),

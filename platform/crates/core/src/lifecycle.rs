@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LifecyclePolicy {
+    /// Maximum running lifetime, independent of the idle window.
+    pub lifetime_timeout_seconds: Option<u64>,
     /// Zero disables the idle action; this is not an Environment maximum lifetime.
     pub idle_timeout_seconds: u64,
     pub idle_action: IdleAction,
@@ -94,6 +96,9 @@ pub struct RestartPolicy {
 }
 impl LifecyclePolicy {
     pub fn validate(&self) -> Result<()> {
+        if self.lifetime_timeout_seconds == Some(0) {
+            return Err(Error::Invalid("lifetime timeout must be positive".into()));
+        }
         if let Some(p) = &self.pause {
             p.validate()?;
         }
@@ -126,6 +131,19 @@ impl RestartPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lifetime_timeout_is_independent_of_idle_and_pause_retention() {
+        let mut policy = LifecyclePolicy {
+            lifetime_timeout_seconds: Some(0),
+            ..Default::default()
+        };
+        assert!(policy.validate().is_err());
+        policy.lifetime_timeout_seconds = Some(60);
+        assert!(policy.validate().is_ok());
+        assert_eq!(policy.idle_timeout_seconds, 0);
+        assert!(policy.pause.is_none());
+    }
 
     #[test]
     fn idle_pause_policy_has_independent_retention_and_storage() {

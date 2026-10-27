@@ -7,6 +7,7 @@ fn snapshot() -> Snapshot {
         "snapshot-1".into(),
         vec!["base".into()],
         EnvironmentSpec {
+            metadata: Default::default(),
             runtime_profile: None,
             snapshot_id: None,
             id: "source".into(),

@@ -180,6 +180,7 @@ impl StoredEnvironment {
     }
     pub(crate) fn effective_record(&self) -> EnvironmentRecord {
         self.result.clone().unwrap_or_else(|| EnvironmentRecord {
+            expires_at_unix_seconds: None,
             failure: None,
             restart_attempts: 0,
             restart_pending: false,

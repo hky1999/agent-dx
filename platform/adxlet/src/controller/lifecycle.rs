@@ -4,6 +4,33 @@ use adx_core::{CompletedOperation, LifecycleKind, RestorePoint};
 use std::{path::Path, time::Duration};
 
 impl Controller {
+    pub(super) async fn set_timeout(
+        &mut self,
+        seconds: u64,
+        operation_id: String,
+        expected_revision: u64,
+    ) -> Result<OperationResult> {
+        if seconds == 0 {
+            return Err(Error::Invalid("lifetime timeout must be positive".into()));
+        }
+        if self.replay_operation(&operation_id, expected_revision, LifecycleKind::Timeout)? {
+            return self.replay_or_sync().await;
+        }
+        if self.record.state != EnvironmentState::Running {
+            return Err(Error::Conflict);
+        }
+        let expiry = now()?
+            .checked_add(seconds)
+            .ok_or_else(|| Error::Invalid("lifetime timeout overflow".into()))?;
+        let revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
+        self.record.spec.lifecycle.lifetime_timeout_seconds = Some(seconds);
+        self.record.expires_at_unix_seconds = Some(expiry);
+        self.record.revision = revision;
+        self.completed(operation_id, expected_revision, LifecycleKind::Timeout);
+        self.durability = None;
+        self.sync().await
+    }
+
     pub(super) async fn auto_pause(
         &mut self,
         request: PauseRequest,

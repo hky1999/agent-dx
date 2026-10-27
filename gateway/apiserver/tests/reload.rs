@@ -108,6 +108,20 @@ service_impl!(pb::node_service_server::NodeService, {
         }
         Ok(Response::new(result))
     }
+    async fn update_environment_timeout(&self, request: Request<pb::UpdateEnvironmentTimeoutRequest>) -> Result<Response<pb::EnvironmentResult>, Status> {
+        let request = request.into_inner();
+        assert_eq!(request.caller.as_ref().unwrap().tenant_id, "tenant");
+        assert_eq!(request.timeout_seconds, 120);
+        let mut state = self.0.lock().unwrap();
+        let record = state.owner.record.as_mut().unwrap();
+        assert_eq!(request.expected_revision, record.revision);
+        assert_eq!(request.assignment, record.assignment);
+        record.revision += 1;
+        record.expires_at_unix_seconds = Some(1120);
+        record.last_operation = Some(pb::CompletedOperation { id: request.operation_id,
+            kind: pb::LifecycleKind::Timeout as i32, expected_revision: request.expected_revision });
+        Ok(Response::new(pb::EnvironmentResult { record: Some(record.clone()), durability: pb::Durability::Published as i32 }))
+    }
     async fn delete_environment(&self, _: Request<pb::DeleteEnvironmentRequest>) -> Result<Response<pb::EnvironmentResult>, Status> {
         let mut record = self.0.lock().unwrap().owner.record.clone().unwrap();
         record.state = pb::EnvironmentState::Deleted as i32;
@@ -365,4 +379,39 @@ async fn coordinator_resume_failure_does_not_fall_back_to_direct_node_resume() {
         tonic::Code::Unavailable
     );
     assert_eq!(fixture.state.lock().unwrap().resumes, 1);
+}
+
+#[tokio::test]
+async fn timeout_update_forwards_lifetime_and_publishes_confirmed_deadline() {
+    let fixture = Fixture::new().await;
+    let owner = fixture.state.lock().unwrap().owner.clone();
+    fixture.clients.put_owner(owner).await.unwrap();
+    let result = fixture
+        .operations
+        .execute(
+            Kind::Timeout,
+            "environment",
+            "timeout-test",
+            json!({"lifetimeTimeoutSeconds":120}),
+            &pb::CallerContext {
+                tenant_id: "tenant".into(),
+                administrator: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(result, json!({"success":true,"expiresAt":1120}));
+    let owner = fixture
+        .clients
+        .owner(
+            "environment",
+            &pb::CallerContext {
+                tenant_id: "tenant".into(),
+                administrator: false,
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(owner.record.unwrap().expires_at_unix_seconds, Some(1120));
 }

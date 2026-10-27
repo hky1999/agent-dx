@@ -11,6 +11,7 @@ fn resources(cpu: u64) -> Resources {
 
 fn spec(id: &str, tenant: &str, priority: i32) -> EnvironmentSpec {
     EnvironmentSpec {
+        metadata: Default::default(),
         runtime_profile: None,
         snapshot_id: None,
         lifecycle: Default::default(),

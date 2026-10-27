@@ -321,6 +321,21 @@ fn apply_identity(command: &mut Command, identity: Option<Identity>) {
     }
 }
 
+pub(crate) fn apply_command_user(command: &mut Command, user: &str) -> Result<(), String> {
+    let identity = resolve_identity(user)?;
+    if let Some(identity) = &identity {
+        // SAFETY: these process credential queries take no pointers and do not
+        // mutate process state. Non-root callers can keep their own credentials
+        // without attempting privileged supplementary-group replacement.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        if uid != 0 && identity.uid == uid && identity.gid == gid {
+            return Ok(());
+        }
+    }
+    apply_identity(command, identity);
+    Ok(())
+}
+
 pub(crate) fn probe_command(argv: &[String]) -> Result<tokio::process::Command, String> {
     let spec = PROCESS_SPEC
         .get()

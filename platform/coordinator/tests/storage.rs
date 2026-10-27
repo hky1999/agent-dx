@@ -10,6 +10,7 @@ use adx_core::{
 
 fn spec(id: &str) -> EnvironmentSpec {
     EnvironmentSpec {
+        metadata: Default::default(),
         runtime_profile: None,
         snapshot_id: None,
         lifecycle: Default::default(),
@@ -46,6 +47,7 @@ fn node(id: &str) -> Node {
 }
 fn running(spec: EnvironmentSpec, assignment: Assignment) -> EnvironmentRecord {
     EnvironmentRecord {
+        expires_at_unix_seconds: None,
         failure: None,
         restart_attempts: 0,
         restart_pending: false,

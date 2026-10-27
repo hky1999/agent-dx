@@ -64,3 +64,26 @@ An internal phase epoch fences checks across same-identity pause/resume.
 `workload_probes.rs` verifies the production Execd process with Adxlet HTTP
 readiness and health-failure reporting; it does not run sandboxd or a kernel
 checkpoint.
+
+## Incremental command output and execution identity
+
+`process.capabilities` advertises `incremental-command-output-v1` and
+`command-user-v1`. `process.output` takes a stable `command_id`, nonnegative
+`stdout_offset`/`stderr_offset` byte cursors and a per-stream `limit` (1..65536).
+It returns base64 chunks, next cursors, `has_more`, `terminal` and `truncated`.
+Cursors are replayable and independent per observer; output is readable before
+process exit. Terminal requires both process completion and drained readers.
+The command retention window and output bounds still apply; truncation is
+explicit, and offsets beyond retained output are rejected.
+
+`process.start` optionally accepts `user` (username, uid or uid:gid). Resolution
+and identity setup are validated before registry reservation. The user is part
+of the stable-command fingerprint; requests without it retain their previous
+fingerprint. Root callers set supplementary groups, gid and uid using the
+existing workload identity path; an unprivileged caller can keep its own uid/gid.
+Invalid identity is an error, never an ignored hint.
+
+Focused runtime tests cover live output with an stdin handshake, cursor replay,
+and deduplication across different users. The AKernel SDK interop test can point
+at a separately owned candidate Execd endpoint without changing the cluster's
+control-plane deployment.

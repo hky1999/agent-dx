@@ -28,6 +28,11 @@ enum Command {
         operation_id: String,
         expected_revision: u64,
     },
+    Timeout {
+        seconds: u64,
+        operation_id: String,
+        expected_revision: u64,
+    },
     Reload {
         operation_id: String,
         expected_revision: u64,
@@ -130,6 +135,19 @@ impl EnvironmentHandle {
         expected_revision: u64,
     ) -> Result<OperationResult> {
         self.send(Command::Reload {
+            operation_id,
+            expected_revision,
+        })
+        .await
+    }
+    pub async fn set_timeout(
+        &self,
+        seconds: u64,
+        operation_id: String,
+        expected_revision: u64,
+    ) -> Result<OperationResult> {
+        self.send(Command::Timeout {
+            seconds,
             operation_id,
             expected_revision,
         })
@@ -245,6 +263,7 @@ pub(crate) fn spawn(
     let runtime_id = format!("{}-{}", spec.id, assignment.generation);
     spawn_restored(
         EnvironmentRecord {
+            expires_at_unix_seconds: None,
             failure: None,
             restart_attempts: 0,
             restart_pending: false,
@@ -376,6 +395,7 @@ impl Controller {
             Command::Resume(_) => "resume",
             Command::EnsureRunning(_) => "ensure_running",
             Command::Network { .. } => "network",
+            Command::Timeout { .. } => "timeout",
             Command::Reload { .. } => "reload",
             Command::Recover(_) => "recover",
             Command::Create(_) | Command::Clone(_, _) => "create",
@@ -418,6 +438,14 @@ impl Controller {
                 operation_id,
                 expected_revision,
             } => self.reload(operation_id, expected_revision).await,
+            Command::Timeout {
+                seconds,
+                operation_id,
+                expected_revision,
+            } => {
+                self.set_timeout(seconds, operation_id, expected_revision)
+                    .await
+            }
             Command::Recover(request) => self.recover(request).await,
             Command::Create(deadline) => {
                 self.create_deadline = deadline;
@@ -622,8 +650,25 @@ impl Controller {
 
     fn transition(&mut self, event: Event) -> Result<()> {
         let next = self.record.state.apply(event)?;
+        let expiry = if matches!(next, EnvironmentState::Paused | EnvironmentState::Deleted) {
+            None
+        } else if matches!(event, Event::Ready) && self.record.expires_at_unix_seconds.is_none() {
+            self.record
+                .spec
+                .lifecycle
+                .lifetime_timeout_seconds
+                .map(|seconds| {
+                    super::checkpoint::now()?
+                        .checked_add(seconds)
+                        .ok_or_else(|| Error::Invalid("lifetime timeout overflow".into()))
+                })
+                .transpose()?
+        } else {
+            self.record.expires_at_unix_seconds
+        };
         self.record.revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
         self.record.state = next;
+        self.record.expires_at_unix_seconds = expiry;
         if matches!(event, Event::Start | Event::Resume | Event::Ready) {
             self.record.failure = None;
         }

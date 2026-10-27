@@ -448,6 +448,9 @@ components:
     StartArgs:
       type: object
       properties:
+        user:
+          type: string
+          description: Username, numeric uid, or uid:gid; requires command-user-v1. Included in command deduplication.
         command_id:
           type: string
           minLength: 1
@@ -1335,6 +1338,35 @@ components:
           command: pwd
           cwd: /tmp
           want_stdin: false
+    ProcessOutputRequest:
+      type: object
+      additionalProperties: false
+      required: [action, args]
+      properties:
+        action: {type: string, const: process.output}
+        requestId: {type: string}
+        args:
+          type: object
+          required: [command_id]
+          properties:
+            command_id: {type: string}
+            stdout_offset: {type: integer, minimum: 0, default: 0}
+            stderr_offset: {type: integer, minimum: 0, default: 0}
+            limit: {type: integer, minimum: 1, maximum: 65536, default: 65536}
+      x-adx-result-schema: '#/components/schemas/CommandOutputChunk'
+    CommandOutputChunk:
+      type: object
+      required: [command_id, stdout_base64, stderr_base64, stdout_offset, stderr_offset, terminal, has_more, truncated]
+      properties:
+        command_id: {type: string}
+        stdout_base64: {type: string, contentEncoding: base64}
+        stderr_base64: {type: string, contentEncoding: base64}
+        stdout_offset: {type: integer, minimum: 0}
+        stderr_offset: {type: integer, minimum: 0}
+        terminal: {type: boolean}
+        has_more: {type: boolean}
+        truncated: {type: boolean}
+      description: Replayable byte cursors into retained command output; requires incremental-command-output-v1. No global consumption cursor.
     ProcessGetRequest:
       type: object
       properties:
@@ -1739,6 +1771,7 @@ components:
       - $ref: '#/components/schemas/ProcessExecRequest'
       - $ref: '#/components/schemas/ProcessStartRequest'
       - $ref: '#/components/schemas/ProcessGetRequest'
+      - $ref: '#/components/schemas/ProcessOutputRequest'
       - $ref: '#/components/schemas/ProcessPollRequest'
       - $ref: '#/components/schemas/ProcessWaitRequest'
       - $ref: '#/components/schemas/ProcessKillRequest'
@@ -1765,6 +1798,7 @@ components:
     InvokeResult:
       anyOf:
       - $ref: '#/components/schemas/CommandCapabilities'
+      - $ref: '#/components/schemas/CommandOutputChunk'
       - $ref: '#/components/schemas/CommandKillResult'
       - $ref: '#/components/schemas/CommandListResult'
       - $ref: '#/components/schemas/CommandRecord'

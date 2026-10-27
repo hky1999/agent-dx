@@ -8,6 +8,7 @@ use std::sync::{
 
 fn spec(id: &str) -> EnvironmentSpec {
     EnvironmentSpec {
+        metadata: Default::default(),
         runtime_profile: None,
         snapshot_id: None,
         lifecycle: Default::default(),

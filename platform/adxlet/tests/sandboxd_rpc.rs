@@ -293,6 +293,7 @@ async fn discovers_runtime_classes_from_sandboxd_uds() {
 }
 fn spec() -> EnvironmentSpec {
     EnvironmentSpec {
+        metadata: Default::default(),
         runtime_profile: None,
         snapshot_id: None,
         lifecycle: Default::default(),

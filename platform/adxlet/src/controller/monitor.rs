@@ -10,6 +10,18 @@ impl Controller {
     }
 
     async fn tick_inner(&mut self) -> Result<()> {
+        // Running lifetime is independent of traffic, keepalives and idle policy.
+        // Failed executions awaiting restart retain the same lifetime deadline.
+        if let Some(expiry) = self.record.expires_at_unix_seconds {
+            if matches!(
+                self.record.state,
+                EnvironmentState::Running | EnvironmentState::Failed
+            ) && crate::checkpoint::now()? >= expiry
+            {
+                self.delete().await?;
+                return Ok(());
+            }
+        }
         let demand = self.demand.load(std::sync::atomic::Ordering::Acquire);
         if demand != self.observed_demand {
             self.idle = None;

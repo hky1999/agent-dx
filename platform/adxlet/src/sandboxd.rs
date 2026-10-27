@@ -1331,6 +1331,7 @@ mod tests {
     #[test]
     fn request_preserves_execution_identity_image_and_resource_units() {
         let spec = EnvironmentSpec {
+            metadata: Default::default(),
             runtime_profile: None,
             snapshot_id: None,
             lifecycle: Default::default(),
@@ -1389,6 +1390,7 @@ mod tests {
     #[test]
     fn runtime_control_credentials_are_scoped_and_host_secret_is_not_injected() {
         let mut spec = EnvironmentSpec {
+            metadata: Default::default(),
             id: "i".into(),
             tenant_id: "t".into(),
             image: "image".into(),
@@ -1450,6 +1452,7 @@ mod tests {
     #[test]
     fn workload_probe_configuration_is_node_owned_and_preserves_init_budget() {
         let workload = EnvironmentSpec {
+            metadata: Default::default(),
             execution: adx_core::execution::ExecutionOptions {
                 inherit_entrypoint: true,
                 rootfs: Some(adx_core::execution::Rootfs {

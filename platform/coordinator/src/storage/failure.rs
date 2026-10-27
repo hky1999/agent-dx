@@ -28,6 +28,7 @@ impl Session {
                     .result
                     .clone()
                     .unwrap_or_else(|| EnvironmentRecord {
+                        expires_at_unix_seconds: None,
                         failure: None,
                         spec: environment.spec.clone(),
                         assignment: environment.assignment.clone(),

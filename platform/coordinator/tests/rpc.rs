@@ -97,6 +97,7 @@ async fn channel(address: std::net::SocketAddr, name: &str) -> Channel {
 }
 fn spec(id: &str) -> EnvironmentSpec {
     EnvironmentSpec {
+        metadata: Default::default(),
         runtime_profile: None,
         snapshot_id: None,
         lifecycle: Default::default(),
@@ -1003,6 +1004,7 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
         .await
         .unwrap();
     let running = EnvironmentRecord {
+        expires_at_unix_seconds: None,
         failure: None,
         restart_attempts: 0,
         restart_pending: false,
@@ -1419,6 +1421,7 @@ async fn coordinator_restart_bounds_re_registration_grace() {
             .await
             .unwrap();
         let running = EnvironmentRecord {
+            expires_at_unix_seconds: None,
             failure: None,
             spec: spec("held"),
             assignment,
@@ -1655,6 +1658,7 @@ async fn published_routes_drive_real_gateway_streams_and_reconnect_to_new_coordi
         .await
         .unwrap();
     let mut record = EnvironmentRecord {
+        expires_at_unix_seconds: None,
         failure: None,
         restart_attempts: 0,
         restart_pending: false,
@@ -2729,6 +2733,7 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
         .await
         .unwrap();
     let old = EnvironmentRecord {
+        expires_at_unix_seconds: None,
         failure: None,
         spec: spec("held"),
         assignment: previous,

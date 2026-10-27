@@ -8,6 +8,7 @@ use adx_core::{
 };
 fn saved() -> StoredSnapshot {
     let request = EnvironmentSpec {
+        metadata: Default::default(),
         runtime_profile: None,
         snapshot_id: None,
         lifecycle: Default::default(),

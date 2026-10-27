@@ -14,6 +14,7 @@ pub enum Kind {
     Snapshot,
     Network,
     Reload,
+    Timeout,
 }
 impl Kind {
     fn code(self) -> i32 {
@@ -23,6 +24,7 @@ impl Kind {
             Self::Snapshot => pb::LifecycleKind::Snapshot,
             Self::Network => pb::LifecycleKind::Network,
             Self::Reload => pb::LifecycleKind::Reload,
+            Self::Timeout => pb::LifecycleKind::Timeout,
             Self::Delete => pb::LifecycleKind::Unspecified,
         }) as i32
     }
@@ -330,6 +332,24 @@ impl Operations {
                         )
                         .await
                 }
+                Kind::Timeout => {
+                    let timeout_seconds =
+                        number(&operation.body, "lifetimeTimeoutSeconds", 0, u64::MAX)?;
+                    clients
+                        .rpc(
+                            "apiserver.update_environment_timeout",
+                            node.update_environment_timeout(trace::inject(
+                                pb::UpdateEnvironmentTimeoutRequest {
+                                    assignment,
+                                    caller: caller_context,
+                                    operation_id: request_id.into(),
+                                    expected_revision: operation.expected,
+                                    timeout_seconds,
+                                },
+                            )),
+                        )
+                        .await
+                }
             };
             match result {
                 Ok(result) => {
@@ -400,6 +420,9 @@ impl Operations {
                         }
                         Kind::Network => json!({"success": true}),
                         Kind::Reload => json!({"success": true}),
+                        Kind::Timeout => {
+                            json!({"success": true, "expiresAt": record.expires_at_unix_seconds})
+                        }
                     };
                     owner.record = result.record;
                     clients.put_owner(owner).await?;

@@ -79,8 +79,10 @@ fn start(address: &str) -> Process {
 }
 fn record() -> EnvironmentRecord {
     EnvironmentRecord {
+        expires_at_unix_seconds: None,
         failure: None,
         spec: EnvironmentSpec {
+            metadata: Default::default(),
             id: "i".into(),
             tenant_id: "t".into(),
             runtime_profile: None,

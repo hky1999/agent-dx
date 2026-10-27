@@ -39,6 +39,7 @@ service NodeService {
   rpc ResumeEnvironment(ResumeEnvironmentRequest) returns (EnvironmentResult);
   rpc EnsureEnvironmentRunning(EnsureEnvironmentRunningRequest) returns (EnvironmentResult);
   rpc UpdateNetworkPolicy(UpdateNetworkPolicyRequest) returns (EnvironmentResult);
+  rpc UpdateEnvironmentTimeout(UpdateEnvironmentTimeoutRequest) returns (EnvironmentResult);
   rpc ReloadEnvironment(ReloadEnvironmentRequest) returns (EnvironmentResult);
   rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
   rpc CollectSnapshot(CollectSnapshotRequest) returns (CollectSnapshotResponse);
@@ -135,6 +136,14 @@ message ReloadEnvironmentRequest {
   CallerContext caller = 2;
   string operation_id = 3;
   uint64 expected_revision = 4;
+}
+
+message UpdateEnvironmentTimeoutRequest {
+  Assignment assignment = 1;
+  CallerContext caller = 2;
+  string operation_id = 3;
+  uint64 expected_revision = 4;
+  uint64 timeout_seconds = 5;
 }
 
 

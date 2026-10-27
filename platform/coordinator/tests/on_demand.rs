@@ -28,6 +28,7 @@ use tonic::transport::{Channel, Server};
 
 fn spec() -> EnvironmentSpec {
     EnvironmentSpec {
+        metadata: Default::default(),
         id: "sleep".into(),
         tenant_id: "tenant".into(),
         image: "image".into(),
@@ -462,6 +463,7 @@ async fn coordinator_autoscaling_http_queries_authoritative_node_ownership_witho
     let mut rig = Rig::new(Duration::from_secs(2)).await;
     let pending = spec();
     let mut pending = EnvironmentSpec {
+        metadata: Default::default(),
         id: "a-pending".into(),
         ..pending
     };

@@ -161,6 +161,7 @@ fn resources() -> Resources {
 }
 fn spec(id: &str) -> EnvironmentSpec {
     EnvironmentSpec {
+        metadata: Default::default(),
         runtime_profile: None,
         snapshot_id: None,
         lifecycle: Default::default(),
@@ -1258,4 +1259,69 @@ async fn healthcheck_failure_uses_existing_cold_restart_policy() {
     assert_eq!(restarted.restart_attempts, 1);
     assert_ne!(restarted.runtime.id, created.record.runtime.id);
     assert!(restarted.failure.is_none());
+}
+
+#[tokio::test]
+async fn lifetime_is_independent_of_idle_and_timeout_updates_are_fenced() {
+    let deps = Dependencies::new(false);
+    let node = node(&deps);
+    let mut value = spec("lifetime");
+    value.lifecycle.lifetime_timeout_seconds = Some(100);
+    assert_eq!(value.lifecycle.idle_timeout_seconds, 0);
+    let environment = node.environment(value, assignment("lifetime")).unwrap();
+    let created = environment.create().await.unwrap();
+    assert!(created.record.expires_at_unix_seconds.is_some());
+    assert!(environment
+        .set_timeout(0, "timeout-invalid".into(), created.record.revision)
+        .await
+        .is_err());
+    let shortened = environment
+        .set_timeout(1, "timeout-one".into(), created.record.revision)
+        .await
+        .unwrap();
+    assert!(shortened.record.expires_at_unix_seconds < created.record.expires_at_unix_seconds);
+    let replay = environment
+        .set_timeout(1, "timeout-one".into(), created.record.revision)
+        .await
+        .unwrap();
+    assert_eq!(replay.record, shortened.record);
+    assert_eq!(
+        environment
+            .set_timeout(20, "timeout-stale".into(), created.record.revision)
+            .await
+            .unwrap_err(),
+        Error::Conflict
+    );
+    environment.tick().await.unwrap();
+    assert!(deps.actual.load(std::sync::atomic::Ordering::SeqCst));
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let deleted = environment.tick().await.unwrap().unwrap();
+    assert_eq!(deleted.record.state, EnvironmentState::Deleted);
+    assert!(!deps.actual.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(node.used(), Resources::default());
+}
+
+#[tokio::test]
+async fn extending_lifetime_does_not_restart_runtime() {
+    let deps = Dependencies::new(false);
+    let node = node(&deps);
+    let mut value = spec("extend-lifetime");
+    value.lifecycle.lifetime_timeout_seconds = Some(1);
+    let environment = node
+        .environment(value, assignment("extend-lifetime"))
+        .unwrap();
+    let created = environment.create().await.unwrap();
+    let extended = environment
+        .set_timeout(100, "timeout-extend".into(), created.record.revision)
+        .await
+        .unwrap();
+    assert!(extended.record.expires_at_unix_seconds > created.record.expires_at_unix_seconds);
+    assert_eq!(extended.record.runtime.id, created.record.runtime.id);
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(environment.tick().await.unwrap().is_none());
+    assert_eq!(
+        environment.sync().await.unwrap().record.state,
+        EnvironmentState::Running
+    );
+    environment.delete().await.unwrap();
 }

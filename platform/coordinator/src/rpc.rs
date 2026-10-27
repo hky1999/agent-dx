@@ -1152,6 +1152,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                     .map(|i| {
                         i.result
                             .unwrap_or_else(|| EnvironmentRecord {
+                                expires_at_unix_seconds: None,
                                 failure: None,
                                 restart_attempts: 0,
                                 restart_pending: false,
@@ -1520,6 +1521,7 @@ mod reconciliation_tests {
             spec: spec.clone(),
             assignment: assignment.clone(),
             result: Some(EnvironmentRecord {
+                expires_at_unix_seconds: None,
                 failure: None,
                 spec,
                 assignment,

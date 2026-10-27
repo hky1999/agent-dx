@@ -549,8 +549,10 @@ mod tests {
 
     fn record(port: u16) -> (EnvironmentRecord, RuntimeControlClient) {
         let record = EnvironmentRecord {
+            expires_at_unix_seconds: None,
             failure: None,
             spec: EnvironmentSpec {
+                metadata: Default::default(),
                 runtime_profile: None,
                 snapshot_id: None,
                 lifecycle: LifecyclePolicy::default(),

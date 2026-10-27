@@ -98,3 +98,22 @@ Rust 用例位于 adxlet 的 `journal.rs`、`resources.rs`、`pause_resume.rs` �
 
 同一轮最终目录中实例全部 Deleted，资源已释放，sandboxd 清单与 checkpoint 目录为空，服务正常停止。
 证据位于 `out/ci/pause-resume/fc-r7/evidence/`，包括 `sdk/result.json`、`lifecycle/result.json`、`catalog-final.json`、`inventory-final.txt` 和 `result.json`；构建/部署完整日志位于 `out/ci/stage-2/{linux-2,package-2,fc-r7}.log`。回归日志为 `rust-5.log`（141 项测试，Clippy 通过）及 `clients-4.log`（Go 检查及 138 项 SDK 测试）。这些是本地证据，Kubernetes 验收尚未包含新增生命周期场景。
+
+## Absolute running lifetime
+
+`EnvironmentSpec.lifecycle.lifetime_timeout_seconds` is an optional positive
+running duration, independent of `idle_timeout_seconds`. HTTP create uses
+`lifetimeTimeoutSeconds`; the authenticated `/timeout` lifecycle operation updates
+the remaining duration through `NodeService.UpdateEnvironmentTimeout`. The node
+serial controller owns the timer and persists `expires_at_unix_seconds` in its
+Environment record. Coordinator persists the decision; API Server does not run a
+client or gateway timer. Traffic, keepalives and disabled idle policy cannot
+extend this deadline. Expiry is processed on a lifecycle tick, and a long serial
+operation can delay deletion. Failed executions awaiting restart retain their
+deadline. Paused state clears the active deadline; resume arms the configured
+duration again. Checkpoint retention remains independent.
+
+`platform/adxlet/tests/lifecycle.rs` covers disabled idle policy, shortening,
+extension, stale revisions and idempotent retries; `pause_resume.rs` verifies
+pause/resume re-arming. These are controller component tests, not evidence that a
+particular deployed cluster has been upgraded.

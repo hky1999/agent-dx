@@ -7,8 +7,10 @@ fn environment_identity_survives_runtime_replacement() {
     }
 
     let mut record = EnvironmentRecord {
+        expires_at_unix_seconds: None,
         failure: None,
         spec: EnvironmentSpec {
+            metadata: Default::default(),
             id: "environment-a".into(),
             tenant_id: "tenant-a".into(),
             image: "image-a".into(),

@@ -154,7 +154,7 @@ paths:
                   capabilities:
                     type: array
                     items: {type: string}
-              example: {capabilities: [workload-probes-v1]}
+              example: {capabilities: [workload-probes-v1, environment-metadata-v1, environment-lifetime-v1]}
         default: {$ref: "#/components/responses/Error"}
   /global-scheduler/resources:
     get:
@@ -441,6 +441,33 @@ paths:
           $ref: "#/components/responses/Error"
         default:
           $ref: "#/components/responses/Error"
+  /api/environment/v1/environments/{environmentId}/timeout:
+    post:
+      tags: [Environments]
+      operationId: updateEnvironmentTimeout
+      summary: Set remaining running lifetime without restarting execution
+      parameters:
+        - $ref: "#/components/parameters/EnvironmentId"
+        - $ref: "#/components/parameters/TimeoutOperationId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [lifetimeTimeoutSeconds]
+              properties:
+                lifetimeTimeoutSeconds: {type: integer, format: int64, minimum: 1}
+      responses:
+        "200":
+          description: Node-owned deadline durably published; decoded data contains success and expiresAt.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Envelope"}
+        "4XX":
+          $ref: "#/components/responses/Error"
+        default:
+          $ref: "#/components/responses/Error"
   /api/environment/v1/environments/{environmentId}/network:
     put:
       tags: [Environments]
@@ -630,6 +657,13 @@ components:
       schema:
         type: string
         pattern: "^reload-[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    TimeoutOperationId:
+      name: X-ADX-Request-ID
+      in: header
+      required: true
+      schema:
+        type: string
+        pattern: "^timeout-[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
     NetworkOperationId:
       name: X-ADX-Request-ID
       in: header
@@ -847,6 +881,17 @@ components:
         snapshotId:
           type: string
           description: Tenant-scoped reusable snapshot used to create a new Environment.
+        metadata:
+          type: object
+          maxProperties: 64
+          propertyNames: {type: string, minLength: 1, maxLength: 256}
+          additionalProperties: {type: string, maxLength: 4096}
+          description: Immutable user metadata, separate from scheduling labels. Key/value limits use UTF-8 bytes.
+        lifetimeTimeoutSeconds:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Node-enforced running lifetime. Omission disables it. Independent of create and idle timeouts.
         idleTimeoutSeconds:
           type: integer
           format: int64
@@ -1160,6 +1205,17 @@ components:
         required_cpu: {type: integer, format: int64, description: CPU millicores}
         required_mem: {type: integer, format: int64, description: Memory MiB}
         image: {type: string}
+        metadata:
+          type: object
+          additionalProperties: {type: string}
+        expires_at_unix_seconds:
+          type: [integer, "null"]
+          format: int64
+          description: Active running deadline; paused environments have null.
+        lifetime_timeout_seconds:
+          type: [integer, "null"]
+          format: int64
+          description: Configured duration rearmed on resume.
         failure:
           oneOf:
             - type: "null"
