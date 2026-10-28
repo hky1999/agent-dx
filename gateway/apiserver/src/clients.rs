@@ -130,7 +130,8 @@ impl Clients {
         budget: Duration,
     ) -> Result<pb::EnvironmentResult, Status> {
         let budget = adx_transport::deadline::create_response_timeout(budget);
-        if request.expected_assignment.is_none()
+        if request.template_id.is_empty()
+            && request.expected_assignment.is_none()
             && self.config.create_mode == crate::config::CreateMode::LocalFirst
             // Only the Coordinator can resolve a Snapshot's source-node hint
             // and compare eligible nodes across shards before admission.

@@ -244,7 +244,10 @@ impl Api {
             return response(result, &request_id, None, None, method == "DELETE");
         }
         if method == "GET" && path == "/api/environment/v1/capabilities" {
-            return plain(200, json!({"capabilities": ["workload-probes-v1"]}));
+            return plain(
+                200,
+                json!({"capabilities": ["workload-probes-v1", "environment-templates-v1"]}),
+            );
         }
         if method == "GET" && path == "/api/environment/v1/resources" {
             return match self.clients.nodes().await {
@@ -419,6 +422,18 @@ impl Api {
                 None,
                 Some(&environment_id),
                 true,
+            );
+        }
+        if path == "/api/environment/v1/templates"
+            || path.starts_with("/api/environment/v1/templates/")
+        {
+            let id = path.strip_prefix("/api/environment/v1/templates/");
+            return response(
+                Box::pin(self.templates(&method, id, &query, &input, &caller)).await,
+                &request_id,
+                None,
+                None,
+                method != "GET",
             );
         }
         if let Some(id) = path.strip_prefix("/api/environment/v1/snapshots/") {
@@ -1075,6 +1090,8 @@ fn route_name(path: &str) -> &'static str {
         "/api/admin/*"
     } else if path.starts_with("/api/agent") {
         "/api/agent/*"
+    } else if path.contains("/templates") {
+        "/api/environment/v1/templates/*"
     } else if path.contains("/snapshots") {
         "/api/environment/v1/snapshots/*"
     } else if path.starts_with("/api/environment") {

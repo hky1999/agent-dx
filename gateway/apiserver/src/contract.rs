@@ -28,6 +28,8 @@ struct Create {
     labels: HashMap<String, String>,
     #[serde(rename = "snapshotId")]
     snapshot_id: String,
+    #[serde(rename = "templateId")]
+    template_id: String,
     #[serde(rename = "idleTimeoutSeconds")]
     idle: i64,
     #[serde(rename = "idleAction")]
@@ -669,14 +671,19 @@ pub fn create_spec_with_environment(
         root.r#type = "image".into();
     }
     let snapshot = (!r.snapshot_id.trim().is_empty()).then(|| r.snapshot_id.trim().to_string());
+    let template = !r.template_id.trim().is_empty();
+    if template && snapshot.is_some() {
+        return Err(invalid("templateId and snapshotId are mutually exclusive"));
+    }
     if snapshot.is_none()
+        && !template
         && runtime_profile.is_none()
         && root.imageurl.trim().is_empty()
         && root.r#type != "s3"
     {
         return Err(invalid("image required"));
     }
-    if snapshot.is_none() && root.runtime.is_empty() {
+    if snapshot.is_none() && !template && root.runtime.is_empty() {
         root.runtime = runtime_profile
             .map(|e| e.rootfs.runtime_class.clone())
             .unwrap_or_else(|| "runsc".into());
@@ -700,7 +707,7 @@ pub fn create_spec_with_environment(
         return Err(invalid("storageMb must be positive"));
     }
     let cpu = positive(
-        if r.cpu == 0 && snapshot.is_none() {
+        if r.cpu == 0 && snapshot.is_none() && !template {
             1000
         } else {
             r.cpu
@@ -708,7 +715,7 @@ pub fn create_spec_with_environment(
         1,
     )?;
     let memory = positive(
-        if r.memory == 0 && snapshot.is_none() {
+        if r.memory == 0 && snapshot.is_none() && !template {
             2048
         } else {
             r.memory
@@ -922,7 +929,7 @@ pub fn create_spec_with_environment(
                 .unwrap_or(default.into()),
         );
     }
-    let runtime_profile = if snapshot.is_none() {
+    let runtime_profile = if snapshot.is_none() && !template {
         runtime_profile.cloned().map(|mut value| {
             value.rootfs.runtime_class.clone_from(&root.runtime);
             if let Some(readonly) = root.readonly {

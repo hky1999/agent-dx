@@ -395,6 +395,7 @@ impl Rig {
         );
         let created = client
             .create_environment(pb::CreateEnvironmentRequest {
+                template_id: String::new(),
                 request_id: String::new(),
                 spec: Some(spec().into()),
                 caller: caller(),
@@ -630,6 +631,7 @@ async fn coordinator_autoscaling_http_queries_authoritative_node_ownership_witho
                     channel(&rpc_address, Principal::ApiServer).await,
                 )
                 .create_environment(pb::CreateEnvironmentRequest {
+                    template_id: String::new(),
                     request_id: String::new(),
                     spec: Some(queued.into()),
                     caller: caller(),
@@ -1889,6 +1891,7 @@ async fn local_checkpoint_waits_for_volume_without_rejecting_its_owner_node() {
         channel(&address, Principal::ApiServer).await,
     );
     let request = |spec: EnvironmentSpec| pb::CreateEnvironmentRequest {
+        template_id: String::new(),
         request_id: String::new(),
         spec: Some(spec.into()),
         caller: caller(),

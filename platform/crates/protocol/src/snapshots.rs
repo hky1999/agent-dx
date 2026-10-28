@@ -29,6 +29,9 @@ impl TryFrom<Snapshot> for pb::ReusableSnapshot {
                 .into_iter()
                 .map(|r| pb::SnapshotReference {
                     owner: Some(match r {
+                        Reference::CatalogTemplate { template_id } => {
+                            pb::snapshot_reference::Owner::CatalogTemplateId(template_id)
+                        }
                         Reference::Restore { environment_id } => {
                             pb::snapshot_reference::Owner::RestoreEnvironmentId(environment_id)
                         }
@@ -60,6 +63,9 @@ impl TryFrom<pb::ReusableSnapshot> for Snapshot {
         let mut references = std::collections::BTreeSet::new();
         for r in s.references {
             let owner = match r.owner {
+                Some(pb::snapshot_reference::Owner::CatalogTemplateId(template_id)) => {
+                    Reference::CatalogTemplate { template_id }
+                }
                 Some(pb::snapshot_reference::Owner::RestoreEnvironmentId(environment_id)) => {
                     Reference::Restore { environment_id }
                 }
@@ -93,5 +99,35 @@ impl TryFrom<pb::ReusableSnapshot> for Snapshot {
         };
         result.validate()?;
         Ok(result)
+    }
+}
+
+impl From<adx_core::templates::Template> for pb::EnvironmentTemplate {
+    fn from(t: adx_core::templates::Template) -> Self {
+        Self {
+            id: t.id,
+            tenant_id: t.tenant_id,
+            snapshot_id: t.snapshot_id,
+            name: t.name,
+            deleted: t.state == adx_core::templates::TemplateState::Deleted,
+        }
+    }
+}
+impl TryFrom<pb::EnvironmentTemplate> for adx_core::templates::Template {
+    type Error = Error;
+    fn try_from(t: pb::EnvironmentTemplate) -> Result<Self> {
+        let item = Self {
+            id: t.id,
+            tenant_id: t.tenant_id,
+            snapshot_id: t.snapshot_id,
+            name: t.name,
+            state: if t.deleted {
+                adx_core::templates::TemplateState::Deleted
+            } else {
+                adx_core::templates::TemplateState::Ready
+            },
+        };
+        item.validate()?;
+        Ok(item)
     }
 }

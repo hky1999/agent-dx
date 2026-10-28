@@ -280,6 +280,7 @@ async fn snapshot_create_uses_coordinator_even_with_a_live_local_first_entry() {
     let mut spec = spec("snapshot-clone");
     spec.snapshot_id = Some("snapshot".into());
     let request = pb::CreateEnvironmentRequest {
+        template_id: String::new(),
         request_id: String::new(),
         spec: Some(spec),
         caller: Some(caller()),

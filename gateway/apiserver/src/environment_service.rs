@@ -20,6 +20,7 @@ use tonic::{Code, Status};
 type CreateKey = (String, String);
 
 struct CreateOperation {
+    template_id: String,
     spec: pb::EnvironmentSpec,
     result: Option<Result<Value, Status>>,
     created_at: Instant,
@@ -256,6 +257,11 @@ impl EnvironmentService {
                 (operation, false)
             } else {
                 let operation = Arc::new(Mutex::new(CreateOperation {
+                    template_id: input
+                        .get("templateId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
                     spec,
                     result: None,
                     created_at: Instant::now(),
@@ -395,6 +401,7 @@ impl EnvironmentService {
         // embedded HTTP/Activator polling stack while preserving cancellation.
         let result = Box::pin(self.clients.create_environment(
             pb::CreateEnvironmentRequest {
+                template_id: operation.template_id.clone(),
                 request_id: request_id.to_owned(),
                 spec: Some(spec.clone()),
                 caller: Some(caller.clone()),
@@ -607,6 +614,7 @@ mod tests {
         let old = now - Duration::from_secs(30);
         let key = ("tenant".into(), "request".into());
         let operation = Arc::new(Mutex::new(CreateOperation {
+            template_id: String::new(),
             spec: pb::EnvironmentSpec {
                 id: "environment".into(),
                 ..Default::default()
@@ -641,6 +649,7 @@ mod tests {
             pending: HashMap::from([(
                 key.clone(),
                 Arc::new(Mutex::new(CreateOperation {
+                    template_id: String::new(),
                     spec: pb::EnvironmentSpec {
                         id: "environment".into(),
                         ..Default::default()

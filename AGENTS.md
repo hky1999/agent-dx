@@ -3,7 +3,7 @@
 ## Boundaries
 
 - `agent/` owns Template/AgentBinding APIs and stateless Activators. Platform lifecycle access goes through the Environment capability interface; user Harness traffic uses shared Gateway forwarding.
-- `platform/` owns Environment scheduling and execution, the Environment SDK, Coordinator, adxlet and Execd.
+- `platform/` owns Environment scheduling and execution, the Environment SDK, Coordinator, adxlet and Execd. Environment template registrations are part of the reusable snapshot domain, separate from Agent TemplateVersion; the gateway exposes their transport. See `gateway/apiserver/docs/environment-templates.md` for atomic catalog pins and restore admission.
 - `gateway/` owns the public Environment API Server, shared entrypoints, routing and node forwarding; it does not own Environment lifecycle.
 - Root `crates/` owns product-wide error semantics, observability, process bootstrap support and transport mechanics. Platform domain models, protocol, scheduling and discovery remain under `platform/crates/`.
 - Environment SDK uses adx-environment / adx_environment / ADX_ naming. Owned Agent namespaces use adx, Gateway commands use adx-, and config/headers use ADX. External runtime dependencies require functional replacement, not fabricated import renames. `docs/migration/sources.json` records exact provenance.

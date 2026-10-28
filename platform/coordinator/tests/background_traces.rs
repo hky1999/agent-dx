@@ -131,6 +131,7 @@ async fn routine_reports_and_inspection_are_silent_but_failures_and_requests_kee
         create_timeout_seconds: 0,
         create_deadline_unix_millis: 0,
         expected_assignment: None,
+        template_id: String::new(),
     });
     request
         .metadata_mut()

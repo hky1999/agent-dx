@@ -9,6 +9,10 @@ service SnapshotService {
   rpc GetSnapshot(GetSnapshotRequest) returns (ReusableSnapshot);
   rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
   rpc DeleteSnapshot(DeleteSnapshotRequest) returns (ReusableSnapshot);
+  rpc ImportTemplate(ImportTemplateRequest) returns (EnvironmentTemplate);
+  rpc GetTemplate(GetTemplateRequest) returns (EnvironmentTemplate);
+  rpc ListTemplates(ListTemplatesRequest) returns (ListTemplatesResponse);
+  rpc DeleteTemplate(GetTemplateRequest) returns (EnvironmentTemplate);
 }
 
 enum SnapshotState {
@@ -22,6 +26,7 @@ message SnapshotReference {
   oneof owner {
     string restore_environment_id = 1;
     TemplateReference template = 2;
+    string catalog_template_id = 3;
   }
 }
 
@@ -59,3 +64,13 @@ message CreateSnapshotRequest {
 message CreateSnapshotResponse { ReusableSnapshot snapshot = 1; EnvironmentResult environment = 2; }
 
 message TemplateReference { string node_id = 1; string template_id = 2; }
+
+// Immutable registration, distinct from Agent TemplateVersion and node-local seeds.
+message EnvironmentTemplate {
+  string id = 1; string tenant_id = 2; string snapshot_id = 3;
+  string name = 4; bool deleted = 5;
+}
+message ImportTemplateRequest { EnvironmentTemplate template = 1; CallerContext caller = 2; }
+message GetTemplateRequest { string id = 1; CallerContext caller = 2; }
+message ListTemplatesRequest { CallerContext caller = 1; string name = 2; string page_token = 3; uint32 page_size = 4; }
+message ListTemplatesResponse { repeated EnvironmentTemplate templates = 1; string next_page_token = 2; }

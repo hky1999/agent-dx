@@ -98,6 +98,8 @@ message CreateEnvironmentRequest {
   Assignment expected_assignment = 6;
   // Stable public operation identity, preserved on every hop and retry.
   string request_id = 7;
+  // Explicit catalog lookup, mutually exclusive with spec.snapshot_id.
+  string template_id = 8;
 }
 
 message GetEnvironmentRequest { string environment_id = 1; CallerContext caller = 2; }

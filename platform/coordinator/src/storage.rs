@@ -17,6 +17,7 @@ pub use observability::{
 };
 mod resume;
 mod snapshots;
+mod templates;
 mod volumes;
 use crate::Node;
 use adx_core::{

@@ -392,3 +392,5 @@ mod tests {
         );
     }
 }
+
+pub mod templates;

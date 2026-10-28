@@ -685,6 +685,7 @@ impl CoordinatorRpc {
             return Err(Status::invalid_argument("request ID too long"));
         }
         let request_id = r.request_id.clone();
+        let template_id = r.template_id.clone();
         let expected_assignment = r
             .expected_assignment
             .clone()
@@ -735,36 +736,43 @@ impl CoordinatorRpc {
                 }));
             }
             Ok(_) | Err(Error::NotFound) => {
-                cloning::normalize(&session, raw).await.map_err(status)?
+                if template_id.is_empty() {
+                    cloning::normalize(&session, raw).await.map_err(status)?
+                } else {
+                    Box::pin(cloning::normalize_template(&session, raw, &template_id))
+                        .await
+                        .map_err(status)?
+                }
             }
             Err(error) => return Err(status(error)),
         };
         let service = self.clone();
         tokio::spawn(
             adx_observability::trace::Trace::child("coordinator.create").run(async move {
-                service
-                    .create(
-                        spec,
-                        schedule_timeout,
-                        deadline,
-                        expected_assignment,
-                        request_id,
-                    )
-                    .await
-                    .map(Response::new)
+                Box::pin(service.create_with_template(
+                    spec,
+                    schedule_timeout,
+                    deadline,
+                    expected_assignment,
+                    request_id,
+                    template_id,
+                ))
+                .await
+                .map(Response::new)
             }),
         )
         .await
         .map_err(|_| Status::internal("creation task failed"))?
     }
 
-    async fn create(
+    async fn create_with_template(
         &self,
         spec: EnvironmentSpec,
         schedule_timeout: Duration,
         create_deadline: adx_transport::deadline::Deadline,
         _expected_assignment: Option<adx_core::Assignment>,
         request_id: String,
+        template_id: String,
     ) -> std::result::Result<pb::EnvironmentResult, Status> {
         // Lock identities before selecting an execution. No scheduler lock is
         // held while another operation, storage, or a remote node is awaited.
@@ -789,7 +797,14 @@ impl CoordinatorRpc {
         .map_err(|_| Status::deadline_exceeded("create deadline waiting for environment"))?;
         let outcome = match tokio::time::timeout_at(
             create_deadline.instant() + adx_transport::deadline::CREATE_RESPONSE_GRACE,
-            self.create_attempt(spec.clone(), schedule_timeout, create_deadline, request_id),
+            // Keep the extended catalog-admission future off nested RPC stacks.
+            Box::pin(self.create_attempt(
+                spec.clone(),
+                schedule_timeout,
+                create_deadline,
+                request_id,
+                template_id,
+            )),
         )
         .await
         {
@@ -868,6 +883,7 @@ impl CoordinatorRpc {
         schedule_timeout: Duration,
         create_deadline: adx_transport::deadline::Deadline,
         request_id: String,
+        template_id: String,
     ) -> std::result::Result<pb::EnvironmentResult, Status> {
         let inspection = self.create_guard(format!("publication:{}", spec.id)).await;
         let session = { self.0.state.lock().await.session.clone() };
@@ -932,6 +948,22 @@ impl CoordinatorRpc {
         // Snapshot reference IO is serialized by this Environment's lock rather
         // than the scheduler mutex. The reference keeps the prepared descriptor
         // stable until the create operation completes or is cancelled.
+        // Catalog delete and new admission share this epoch-fenced boundary.
+        // Acquire the durable Restore owner before allowing delete to release its pin.
+        let catalog_guard = if template_id.is_empty() {
+            None
+        } else {
+            let state = self.0.state.lock().await;
+            state.healthy().map_err(status)?;
+            let item = session
+                .get_template(&template_id, &spec.tenant_id)
+                .await
+                .map_err(status)?;
+            if spec.snapshot_id.as_deref() != Some(item.snapshot_id.as_str()) {
+                return Err(Status::failed_precondition("template source changed"));
+            }
+            Some(state)
+        };
         let prepared_snapshot = if let Some(id) = &spec.snapshot_id {
             session
                 .acquire_snapshot(
@@ -954,6 +986,7 @@ impl CoordinatorRpc {
         } else {
             None
         };
+        drop(catalog_guard);
         self.0
             .state
             .lock()

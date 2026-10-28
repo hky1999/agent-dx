@@ -3,6 +3,36 @@
 use super::*;
 use adx_core::snapshots::{Reference, Snapshot, SnapshotState};
 
+/// Resolve an immutable registration. Host ACLs are reapplied, not inferred from saved RAM.
+pub(super) async fn normalize_template(
+    session: &Session,
+    mut request: pb::EnvironmentSpec,
+    id: &str,
+) -> Result<EnvironmentSpec> {
+    if request.snapshot_id.is_some() {
+        return Err(Error::Invalid(
+            "template and snapshot are mutually exclusive".into(),
+        ));
+    }
+    let item = session.get_template(id, &request.tenant_id).await?;
+    let snapshot = session.get_snapshot(&item.snapshot_id).await?;
+    let mut execution: adx_core::execution::ExecutionOptions = request
+        .execution
+        .take()
+        .map(TryInto::try_into)
+        .transpose()?
+        .unwrap_or_default();
+    if execution.network.is_some() && execution.network != snapshot.template.execution.network {
+        return Err(Error::Invalid(
+            "template network policy cannot be overridden".into(),
+        ));
+    }
+    execution.network = snapshot.template.execution.network.clone();
+    request.execution = Some(execution.into());
+    request.snapshot_id = Some(item.snapshot_id);
+    normalize(session, request).await
+}
+
 pub(super) async fn normalize(
     session: &Session,
     request: pb::EnvironmentSpec,

@@ -391,6 +391,9 @@ impl pb::snapshot_service_server::SnapshotService for CoordinatorRpc {
                         adx_core::snapshots::Reference::Restore { environment_id } => {
                             users.insert(environment_id.clone());
                         }
+                        adx_core::snapshots::Reference::CatalogTemplate { template_id } => {
+                            templates.insert(template_id.clone());
+                        }
                         adx_core::snapshots::Reference::Template {
                             node_id,
                             template_id,
@@ -429,5 +432,122 @@ impl pb::snapshot_service_server::SnapshotService for CoordinatorRpc {
                 Ok(Response::new(deleted.try_into().map_err(status)?))
             })
             .await
+    }
+    async fn import_template(
+        &self,
+        request: Request<pb::ImportTemplateRequest>,
+    ) -> std::result::Result<Response<pb::EnvironmentTemplate>, Status> {
+        if self.0.peers.authenticate(&request)? != Principal::ApiServer {
+            return Err(Status::permission_denied("API Server identity required"));
+        }
+        let r = request.into_inner();
+        let item: adx_core::templates::Template = r
+            .template
+            .ok_or_else(|| Status::invalid_argument("template required"))?
+            .try_into()
+            .map_err(status)?;
+        tenant(r.caller.as_ref(), &item.tenant_id)?;
+        let state = self.0.state.lock().await;
+        state.healthy().map_err(status)?;
+        let item = state.session.import_template(item).await.map_err(status)?;
+        Ok(Response::new(item.into()))
+    }
+
+    async fn get_template(
+        &self,
+        request: Request<pb::GetTemplateRequest>,
+    ) -> std::result::Result<Response<pb::EnvironmentTemplate>, Status> {
+        if self.0.peers.authenticate(&request)? != Principal::ApiServer {
+            return Err(Status::permission_denied("API Server identity required"));
+        }
+        let r = request.into_inner();
+        let caller = r
+            .caller
+            .as_ref()
+            .ok_or_else(|| Status::unauthenticated("caller required"))?;
+        tenant(Some(caller), &caller.tenant_id)?;
+        let state = self.0.state.lock().await;
+        state.healthy().map_err(status)?;
+        Ok(Response::new(
+            state
+                .session
+                .get_template(&r.id, &caller.tenant_id)
+                .await
+                .map_err(status)?
+                .into(),
+        ))
+    }
+
+    async fn list_templates(
+        &self,
+        request: Request<pb::ListTemplatesRequest>,
+    ) -> std::result::Result<Response<pb::ListTemplatesResponse>, Status> {
+        if self.0.peers.authenticate(&request)? != Principal::ApiServer {
+            return Err(Status::permission_denied("API Server identity required"));
+        }
+        let r = request.into_inner();
+        let caller = r
+            .caller
+            .as_ref()
+            .ok_or_else(|| Status::unauthenticated("caller required"))?;
+        tenant(Some(caller), &caller.tenant_id)?;
+        if r.page_size > 1000
+            || r.page_token.len() > 256
+            || r.page_token.chars().any(char::is_control)
+            || r.name.len() > 256
+        {
+            return Err(Status::invalid_argument("invalid template page"));
+        }
+        let size = if r.page_size == 0 { 100 } else { r.page_size } as usize;
+        let state = self.0.state.lock().await;
+        state.healthy().map_err(status)?;
+        let mut page: Vec<_> = state
+            .session
+            .list_templates(&caller.tenant_id)
+            .await
+            .map_err(status)?
+            .into_iter()
+            .filter(|t| t.id > r.page_token && (r.name.is_empty() || t.name == r.name))
+            .take(size + 1)
+            .collect();
+        let next_page_token = if page.len() > size {
+            page.pop();
+            page.last().map(|t| t.id.clone()).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        Ok(Response::new(pb::ListTemplatesResponse {
+            templates: page.into_iter().map(Into::into).collect(),
+            next_page_token,
+        }))
+    }
+
+    async fn delete_template(
+        &self,
+        request: Request<pb::GetTemplateRequest>,
+    ) -> std::result::Result<Response<pb::EnvironmentTemplate>, Status> {
+        if self.0.peers.authenticate(&request)? != Principal::ApiServer {
+            return Err(Status::permission_denied("API Server identity required"));
+        }
+        let r = request.into_inner();
+        let caller = r
+            .caller
+            .as_ref()
+            .ok_or_else(|| Status::unauthenticated("caller required"))?;
+        tenant(Some(caller), &caller.tenant_id)?;
+        let state = self.0.state.lock().await;
+        state.healthy().map_err(status)?;
+        state
+            .session
+            .delete_template(&r.id, &caller.tenant_id)
+            .await
+            .map_err(status)?;
+        // Only return the confirmed identity. Deleted registrations are tombstoned.
+        Ok(Response::new(pb::EnvironmentTemplate {
+            id: r.id,
+            tenant_id: caller.tenant_id.clone(),
+            deleted: true,
+            ..Default::default()
+        }))
     }
 }

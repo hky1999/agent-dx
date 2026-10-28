@@ -254,6 +254,7 @@ async fn environment_identity_precedes_new_snapshot_normalization() {
             create_timeout_seconds: 90,
             create_deadline_unix_millis: 0,
             expected_assignment: None,
+            template_id: String::new(),
         })
         .await;
     server.abort();

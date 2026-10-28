@@ -125,6 +125,7 @@ fn caller() -> Option<pb::CallerContext> {
 }
 fn create(id: &str) -> pb::CreateEnvironmentRequest {
     pb::CreateEnvironmentRequest {
+        template_id: String::new(),
         request_id: String::new(),
         spec: Some(spec(id).into()),
         caller: caller(),

@@ -11,6 +11,9 @@ pub enum SnapshotState {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Reference {
+    CatalogTemplate {
+        template_id: String,
+    },
     Restore {
         environment_id: String,
     },
@@ -22,6 +25,7 @@ pub enum Reference {
 impl Reference {
     pub fn validate(&self) -> Result<()> {
         match self {
+            Self::CatalogTemplate { template_id } if valid_id(template_id) => Ok(()),
             Self::Restore { environment_id } if valid_id(environment_id) => Ok(()),
             Self::Template {
                 node_id,
@@ -156,6 +160,7 @@ impl Snapshot {
                         .references
                         .iter()
                         .filter_map(|r| match r {
+                            Reference::CatalogTemplate { template_id } => Some(template_id.clone()),
                             Reference::Template {
                                 node_id,
                                 template_id,

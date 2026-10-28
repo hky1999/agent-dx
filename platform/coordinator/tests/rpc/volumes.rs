@@ -415,6 +415,7 @@ async fn release_volume_owner_rejects_foreign_pending_requests_before_cancellati
     let pending = tokio::spawn(async move {
         create_client
             .create_environment(pb::CreateEnvironmentRequest {
+                template_id: String::new(),
                 request_id: String::new(),
                 spec: Some(source.into()),
                 caller: Some(pb::CallerContext {
