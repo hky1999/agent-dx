@@ -44,3 +44,10 @@ reload/failover. A success response requires backend handoff and Adxlet's
 persistent result acknowledgement. The optional JSON body
 `{"timeoutSeconds": 120}` bounds the complete operation. An empty body or `{}`
 uses the 600-second default. See the [runtime control contract](../../api/http/runtime-control.md#workload-local-checkpoint).
+
+
+## 恢复后的子命令环境
+
+检查点保留原应用的子命令环境。恢复上下文中明确提供的非 ADX_ 字段覆盖原值，包括明确的空值；未提供的原镜像和应用字段继续保留。ADX_ 身份字段仍由运行时控制逻辑消费，不进入子命令环境。缓存以一次写锁更新，命令并发读取不会观察到先清空再逐项加入的中间状态。
+
+此契约不提供删除原环境字段的新接口，单次命令的显式环境覆盖继续沿原路径处理。源码组件验证、静态构建、实际引导文件和恢复后的原评分链路分别验收；具体候选和未覆盖范围以外层版本台账及不可变证据为准。
