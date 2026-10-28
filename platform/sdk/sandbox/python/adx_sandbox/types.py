@@ -18,9 +18,10 @@ ADX_GET_TIMEOUT_BUFFER = 30
 
 @dataclass(frozen=True)
 class ElasticMemoryPolicy:
-    """显式启用内存弹性；high_per_mille 必须与节点的软节流比例一致。"""
+    """显式启用内存弹性；minimum_mib 独立指定缩容下界，省略时使用出生内存。"""
 
     high_per_mille: int = 750
+    minimum_mib: Optional[int] = None
 
     def __post_init__(self) -> None:
         if isinstance(self.high_per_mille, bool) or not isinstance(self.high_per_mille, int):
@@ -28,8 +29,17 @@ class ElasticMemoryPolicy:
         if not 1 <= self.high_per_mille <= 999:
             raise ValueError("high_per_mille must be between 1 and 999")
 
+        if self.minimum_mib is not None:
+            if isinstance(self.minimum_mib, bool) or not isinstance(self.minimum_mib, int):
+                raise TypeError("minimum_mib must be an integer or None")
+            if not 1 <= self.minimum_mib <= 1 << 33:
+                raise ValueError("minimum_mib must be positive and within 2^53 bytes")
+
     def to_dict(self) -> Dict[str, int]:
-        return {"high_per_mille": self.high_per_mille}
+        value = {"high_per_mille": self.high_per_mille}
+        if self.minimum_mib is not None:
+            value["minimum_bytes"] = self.minimum_mib << 20
+        return value
 
 
 @dataclass(frozen=True)

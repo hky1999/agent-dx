@@ -61,6 +61,7 @@ fn sandbox_options_roundtrip_preserves_backend_contract() {
         },
         elastic_memory: Some(adx_core::memory::ElasticMemoryPolicy {
             high_per_mille: 750,
+            minimum_bytes: None,
         }),
         extra_config: r#"{"networkStack":"netstack"}"#.into(),
     };
@@ -164,8 +165,32 @@ fn elastic_memory_wire_ratio_does_not_truncate() {
     let wire = control::SandboxOptions {
         elastic_memory: Some(control::ElasticMemoryPolicy {
             high_per_mille: 65536,
+            minimum_bytes: None,
         }),
         ..Default::default()
     };
     assert!(adx_core::sandbox::SandboxOptions::try_from(wire).is_err());
+}
+
+#[test]
+fn independent_memory_minimum_survives_protocol_and_persistent_roundtrips() {
+    let options = adx_core::sandbox::SandboxOptions {
+        elastic_memory: Some(adx_core::memory::ElasticMemoryPolicy {
+            high_per_mille: 750,
+            minimum_bytes: Some(640 << 20),
+        }),
+        ..Default::default()
+    };
+    let wire: control::SandboxOptions = options.clone().into();
+    assert_eq!(
+        wire.elastic_memory.as_ref().unwrap().minimum_bytes,
+        Some(640 << 20)
+    );
+    let decoded = adx_core::sandbox::SandboxOptions::try_from(wire).unwrap();
+    assert_eq!(decoded, options);
+    let bytes = serde_json::to_vec(&decoded).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<adx_core::sandbox::SandboxOptions>(&bytes).unwrap(),
+        options
+    );
 }

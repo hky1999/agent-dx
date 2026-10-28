@@ -146,6 +146,7 @@ async fn memory_rpc_authenticates_owner_reserves_settles_and_retires_without_sta
     };
     environment.sandbox.elastic_memory = Some(adx_core::memory::ElasticMemoryPolicy {
         high_per_mille: 750,
+        minimum_bytes: None,
     });
     request.spec = Some(environment.into());
     let created: EnvironmentRecord = client

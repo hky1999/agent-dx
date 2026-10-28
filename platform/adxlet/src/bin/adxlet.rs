@@ -329,7 +329,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (Some(root), None) => Some(adxlet::checkpoint::StorageConfig::Local { root }),
         (None, storage) => storage,
         (Some(_), Some(_)) => {
-            return Err("configure only one of checkpoint_dir and checkpoint_storage".into())
+            return Err("configure only one of checkpoint_dir and checkpoint_storage".into());
         }
     };
     if let Some(storage) = checkpoint_storage {
@@ -385,7 +385,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         heartbeat_sequence: 0,
         reconciling: true,
         runtime_classes: vec![],
-        memory_control_version: 1,
+        memory_control_version: 2,
     };
     // Bind before registration so dispatch cannot race an unbound address.
     let node_rpc = NodeRpc::new(manager.clone(), peers, session_id.clone())
@@ -558,9 +558,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 };
                             }
                             if config.history_reclamation {
-                                let boundary:adx_core::history::HistoryBoundary=catalog.history_boundary.clone().ok_or("Coordinator omitted history authority")?.try_into()?;
-                                if let Err(error)=manager.collect_history(boundary).await {
-                                    adx_observability::warn!("history authority installation incomplete: {error}");
+                                let boundary: adx_core::history::HistoryBoundary = catalog
+                                    .history_boundary
+                                    .clone()
+                                    .ok_or("Coordinator omitted history authority")?
+                                    .try_into()?;
+                                if let Err(error) = manager.collect_history(boundary).await {
+                                    adx_observability::warn!(
+                                        "history authority installation incomplete: {error}"
+                                    );
                                     continue;
                                 }
                             }

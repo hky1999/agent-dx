@@ -49,27 +49,44 @@ pub struct MemoryAuthorization {
     pub deadline_unix_millis: u64,
 }
 
-/// Explicit opt-in for elastic memory. The request is the initial allocation and
-/// floor; SandboxOptions::limits remains the immutable allowed ceiling. The node
+/// Explicit opt-in for elastic memory. The request is the initial allocation;
+/// an omitted minimum keeps that allocation as the floor. SandboxOptions::limits
+/// remains the immutable allowed ceiling. The node
 /// must verify the configured sandboxd soft-limit ratio before authorizing changes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ElasticMemoryPolicy {
     pub high_per_mille: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum_bytes: Option<u64>,
 }
 
 impl ElasticMemoryPolicy {
+    /// The immutable shrink floor; omitted policies preserve birth semantics.
+    pub fn minimum(&self, initial_bytes: u64) -> u64 {
+        self.minimum_bytes.unwrap_or(initial_bytes)
+    }
+
+    /// Only explicitly known node contracts can enforce this policy.
+    pub fn supports_node_version(&self, version: u32) -> bool {
+        matches!(version, 1 | 2) && (self.minimum_bytes.is_none() || version == 2)
+    }
+
     pub fn validate(&self, initial_bytes: u64, ceiling_bytes: u64) -> Result<()> {
         const MIB: u64 = 1_048_576;
+        let minimum = self.minimum(initial_bytes);
         if !(1..1000).contains(&self.high_per_mille)
             || initial_bytes == 0
             || !initial_bytes.is_multiple_of(MIB)
             || !ceiling_bytes.is_multiple_of(MIB)
+            || minimum == 0
+            || !minimum.is_multiple_of(MIB)
+            || minimum > initial_bytes
             || ceiling_bytes < initial_bytes
             || ceiling_bytes > 1 << 53
-            || (u128::from(initial_bytes) * u128::from(self.high_per_mille)).div_ceil(1000) < 4096
+            || (u128::from(minimum) * u128::from(self.high_per_mille)).div_ceil(1000) < 4096
         {
-            return Err(Error::Invalid("elastic memory requires whole MiB bounds and a soft-limit ratio between 0 and 1000 exclusive that yields at least one 4096-byte page".into()));
+            return Err(Error::Invalid("elastic memory requires whole MiB bounds, a positive minimum no greater than birth, and a soft-limit ratio between 0 and 1000 exclusive that yields at least one 4096-byte page at the minimum".into()));
         }
         Ok(())
     }

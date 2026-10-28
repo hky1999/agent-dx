@@ -18,6 +18,15 @@ async fn fixture_with_timeout(
     elastic: bool,
     timeout: std::time::Duration,
 ) -> (common::Redis, Session, EnvironmentRecord, MemoryObservation) {
+    fixture_with_minimum(elastic, timeout, None, 1).await
+}
+
+async fn fixture_with_minimum(
+    elastic: bool,
+    timeout: std::time::Duration,
+    minimum: Option<u64>,
+    node_version: u32,
+) -> (common::Redis, Session, EnvironmentRecord, MemoryObservation) {
     let rig = common::Redis::new().await;
     let session = adx_coordinator::storage::RedisStore::connect(&rig.url, "test", timeout)
         .await
@@ -26,7 +35,7 @@ async fn fixture_with_timeout(
         .await
         .unwrap();
     let mut n = node("first");
-    n.memory_control_version = 1;
+    n.memory_control_version = node_version;
     n.capacity = Resources {
         cpu_millis: 2000,
         memory_bytes: 512 * MIB,
@@ -62,7 +71,8 @@ async fn fixture_with_timeout(
     if elastic {
         s.runtime_class = "runsc".into();
         let mut value = serde_json::to_value(s).unwrap();
-        value["sandbox"]["elastic_memory"] = serde_json::json!({"high_per_mille":750});
+        value["sandbox"]["elastic_memory"] =
+            serde_json::json!({"high_per_mille":750,"minimum_bytes":minimum});
         s = serde_json::from_value(value).unwrap();
     }
     let assignment = Assignment {
@@ -1881,8 +1891,11 @@ async fn memory_control_reconciliation_keeps_progress_after_history_floor_and_re
                 assert_eq!(held(&session).await, reservation);
                 panic!(
                     "automatic completion {index} must settle through reconcile_memory: source={}, completion={}, retained={}, floor={:?}, held={}, error={error:?}",
-                    observation.resource_revision, finished.resource_revision,
-                    stuck.completed.len(), stuck.closed_source_revision, reservation
+                    observation.resource_revision,
+                    finished.resource_revision,
+                    stuck.completed.len(),
+                    stuck.closed_source_revision,
+                    reservation
                 );
             }
         };
@@ -2290,4 +2303,98 @@ async fn memory_pressure_blocks_restore_and_preserves_existing_restore_reservati
         384 * MIB,
         "unknown restore remains reserved when observation disappears"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn independent_minimum_budget_settles_only_after_exact_physical_completion() {
+    let (_rig, s, record, mut observation) = fixture_with_minimum(
+        true,
+        std::time::Duration::from_millis(300),
+        Some(64 * MIB),
+        2,
+    )
+    .await;
+    observation.memory_limit_bytes = 128 * MIB;
+    observation.memory_high_bytes = 96 * MIB;
+    assert_eq!(record.spec.execution_resources().memory_bytes, 128 * MIB);
+    assert_eq!(record.spec.memory_floor_bytes(), 64 * MIB);
+    s.initialize_memory(observation.clone(), "boot-first")
+        .await
+        .unwrap();
+    assert_eq!(held(&s).await, 128 * MIB);
+    let shrink = s
+        .authorize_memory(
+            request(&observation, "shrink-independent", 64),
+            "boot-first",
+            1000,
+        )
+        .await
+        .unwrap();
+    assert_eq!(held(&s).await, 128 * MIB);
+    let mut unknown = completed(&shrink);
+    unknown.resource_revision -= 1;
+    assert!(s
+        .complete_memory(shrink.clone(), unknown, "boot-first")
+        .await
+        .is_err());
+    assert_eq!(held(&s).await, 128 * MIB);
+    let after = completed(&shrink);
+    s.complete_memory(shrink, after.clone(), "boot-first")
+        .await
+        .unwrap();
+    assert_eq!(held(&s).await, 64 * MIB);
+    assert!(s
+        .authorize_memory(request(&after, "below-independent", 32), "boot-first", 2000)
+        .await
+        .is_err());
+    assert_eq!(held(&s).await, 64 * MIB);
+    let grow = s
+        .authorize_memory(request(&after, "grow-independent", 256), "boot-first", 3000)
+        .await
+        .unwrap();
+    assert_eq!(held(&s).await, 256 * MIB);
+    s.complete_memory(grow.clone(), completed(&grow), "boot-first")
+        .await
+        .unwrap();
+    assert_eq!(held(&s).await, 256 * MIB);
+}
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn independent_minimum_persistent_admission_rejects_a_version_one_node() {
+    let (_rig, s, record, _) = fixture_with_elastic(true).await;
+    let mut next = record.spec.clone();
+    next.id = "independent-next".into();
+    next.sandbox.elastic_memory.as_mut().unwrap().minimum_bytes = Some(64 * MIB);
+    let mut assignment = record.assignment.clone();
+    assignment.environment_id = next.id.clone();
+    // A fresh allocation generation keeps the capability check from being masked by an older generation fence.
+    assignment.generation += 1;
+    let prior = held(&s).await;
+    assert_eq!(
+        s.reserve(next.clone(), assignment.clone()).await,
+        Err(Error::Conflict)
+    );
+    assert_eq!(held(&s).await, prior);
+    let mut upgraded = node("first");
+    upgraded.memory_control_version = 2;
+    upgraded.capacity = Resources {
+        cpu_millis: 2000,
+        memory_bytes: 512 * MIB,
+        disk_bytes: 0,
+    };
+    s.register_session(
+        upgraded,
+        "first:1".into(),
+        "first:2".into(),
+        Some(NodeSession {
+            id: "boot-first".into(),
+            sequence: 1,
+            routable: true,
+        }),
+    )
+    .await
+    .unwrap();
+    s.reserve(next, assignment).await.unwrap();
+    assert_eq!(held(&s).await, prior + 128 * MIB);
 }

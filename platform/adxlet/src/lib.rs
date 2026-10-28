@@ -6,6 +6,8 @@ pub mod checkpoint;
 pub mod control_stream;
 mod controller;
 mod local;
+#[cfg(test)]
+mod memory_hold_tests;
 pub use local::LocalReservation;
 pub mod journal;
 pub mod metrics;
@@ -336,11 +338,13 @@ impl Admission {
                 .is_some_and(|source| source.check_now().is_err())
     }
 
+    // Birth remains immutable evidence; the local hold follows the same persisted
+    // memory floor as central admission and physical resource validation.
     fn memory_hold(&mut self, record: &EnvironmentRecord, target: Resources) -> Result<()> {
         let ceiling = record.spec.execution_ceiling();
         if target.cpu_millis != ceiling.cpu_millis
             || target.disk_bytes != ceiling.disk_bytes
-            || target.memory_bytes < record.spec.resources.memory_bytes
+            || target.memory_bytes < record.spec.memory_floor_bytes()
             || target.memory_bytes > ceiling.memory_bytes
         {
             return Err(Error::Conflict);

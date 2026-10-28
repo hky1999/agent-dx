@@ -92,7 +92,7 @@ fn high(record: &EnvironmentRecord, limit: u64) -> Result<u64> {
         .elastic_memory
         .as_ref()
         .ok_or(Error::Conflict)?;
-    if limit < record.spec.resources.memory_bytes
+    if limit < record.spec.memory_floor_bytes()
         || limit > record.spec.execution_ceiling().memory_bytes
         || !limit.is_multiple_of(1_048_576)
     {
@@ -111,11 +111,7 @@ fn check_physical_stats(
     value: &proto::StatsResponse,
 ) -> Result<()> {
     let ceiling = record.spec.execution_ceiling();
-    let expected_policy = serde_json::json!({
-        "version":1,
-        "CPU":{"initial":ceiling.cpu_millis,"ceiling":ceiling.cpu_millis},
-        "Memory":{"initial":record.spec.resources.memory_bytes / 1_048_576,"ceiling":ceiling.memory_bytes / 1_048_576}
-    });
+    let expected_policy = super::elastic_resource_policy(&record.spec);
     if !value.cpu_limits_known
         || !value.memory_usage_known
         || !value.memory_limit_known

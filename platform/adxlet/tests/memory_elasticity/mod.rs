@@ -1025,3 +1025,49 @@ async fn fixed_restore_keeps_its_original_requested_bound() {
         .labels
         .contains_key("akernel.scheduler/elastic-resources"));
 }
+
+#[tokio::test]
+async fn independent_minimum_keeps_birth_and_authorizes_a_lower_physical_limit() {
+    let memory = MemoryServer::default();
+    let mut stats = physical_stats();
+    stats.elastic_policy = json!({"version":2,"CPU":{"initial":500,"ceiling":500},
+        "Memory":{"initial":128,"ceiling":512},"memory_minimum_mib":64})
+    .to_string();
+    *memory.stats.lock().unwrap() = Some(stats);
+    let mut record = running_record();
+    record
+        .spec
+        .sandbox
+        .elastic_memory
+        .as_mut()
+        .unwrap()
+        .minimum_bytes = Some(64 * MIB);
+    let (adapter, _harness) = connect(Server {
+        memory: memory.clone(),
+        ..Default::default()
+    })
+    .await;
+    adapter
+        .start(
+            &record.spec,
+            &record.runtime.id,
+            record.assignment.generation,
+            &[],
+        )
+        .await
+        .unwrap();
+    let birth = adapter.observe_memory(&record).await.unwrap();
+    assert_eq!(birth.observation.memory_limit_bytes, 128 * MIB);
+    let shrink = grant(&birth, 64 * MIB);
+    let after = adapter
+        .apply_memory(&record, &shrink, "session-1", 2)
+        .await
+        .unwrap();
+    assert_eq!(after.observation, shrink.request.completion().unwrap());
+    let below = grant(&after, 32 * MIB);
+    assert!(adapter
+        .apply_memory(&record, &below, "session-1", 2)
+        .await
+        .is_err());
+    assert_eq!(memory.shrinks.lock().unwrap().len(), 1);
+}

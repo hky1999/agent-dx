@@ -241,3 +241,49 @@ fn high_weights_accumulate_without_wrapping_and_zero_disk_is_supported() {
         );
     }
 }
+
+#[test]
+fn runtime_filter_requires_the_known_independent_minimum_contract() {
+    for minimum in [None, Some(640_u64 << 20)] {
+        let mut request = request();
+        request.resources = Resources {
+            cpu_millis: 500,
+            memory_bytes: 2048 << 20,
+            disk_bytes: 0,
+        };
+        request.sandbox.elastic_memory = Some(adx_core::memory::ElasticMemoryPolicy {
+            high_per_mille: 750,
+            minimum_bytes: minimum,
+        });
+        let snapshot = Default::default();
+        let framework = Framework::builtin(Placement::Pack);
+        for version in [0, 1, 2, 3] {
+            let node = Node {
+                id: "node".into(),
+                capacity: request.resources,
+                available: true,
+                runtime_classes: vec!["runsc".into()],
+                labels: Default::default(),
+                devices: vec![],
+                memory_control_version: version,
+            };
+            let eligible = framework
+                .select(
+                    &request,
+                    [Candidate {
+                        prepared: None,
+                        devices: &[],
+                        snapshot: &snapshot,
+                        node: &node,
+                        available: node.capacity,
+                    }],
+                )
+                .unwrap()
+                .is_some();
+            assert_eq!(
+                eligible,
+                version == 2 || (version == 1 && minimum.is_none())
+            );
+        }
+    }
+}

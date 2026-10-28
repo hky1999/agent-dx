@@ -97,6 +97,32 @@ class CreateRequestTests(unittest.TestCase):
                 Sandbox(connection=self.connection, **options)
         self.assert_no_transport_setup()
 
+
+    def test_independent_memory_minimum_preserves_birth_request(self):
+        import adx_sandbox as sdk
+
+        body = self.capture_create(
+            cpu=500, memory=2048, mem_limit=2048,
+            elastic_memory=sdk.ElasticMemoryPolicy(minimum_mib=640),
+        )
+        self.assertEqual(body["elastic_memory"],
+                         {"high_per_mille": 750, "minimum_bytes": 640 << 20})
+        self.assertEqual((body["memory"], body["mem_limit"]), (2048, 2048))
+
+    def test_independent_memory_minimum_rejects_invalid_inputs_before_transport(self):
+        import adx_sandbox as sdk
+
+        for minimum in (True, 640.5, "640", 0, -1, 8589934593):
+            with self.subTest(minimum=minimum), self.assertRaises((ValueError, TypeError)):
+                sdk.ElasticMemoryPolicy(minimum_mib=minimum)
+        for memory, minimum, ratio in ((2048, 2049, 750), (2048, 1, 1)):
+            with self.subTest(minimum=minimum), self.assertRaises((ValueError, TypeError)):
+                Sandbox(
+                    connection=self.connection, cpu=500, memory=memory, mem_limit=2048,
+                    elastic_memory=sdk.ElasticMemoryPolicy(high_per_mille=ratio, minimum_mib=minimum),
+                )
+        self.assert_no_transport_setup()
+
     def test_omitted_options_inherit_cluster_defaults(self):
         body = self.capture_create()
         self.assertTrue({"network", "xpu", "storageMb", "extra_config"}.isdisjoint(body))

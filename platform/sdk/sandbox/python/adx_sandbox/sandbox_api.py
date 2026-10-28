@@ -415,7 +415,10 @@ class Sandbox:
                 raise ValueError("elastic memory requires at least 10 CPU millicores")
             if (mem_limit or memory) > (1 << 33):
                 raise ValueError("elastic memory ceiling exceeds 2^53 bytes")
-            if (memory * (1 << 20) * elastic_memory.high_per_mille + 999) // 1000 < 4096:
+            minimum_mib = memory if elastic_memory.minimum_mib is None else elastic_memory.minimum_mib
+            if minimum_mib > memory:
+                raise ValueError("elastic memory minimum cannot exceed the birth request")
+            if (minimum_mib * (1 << 20) * elastic_memory.high_per_mille + 999) // 1000 < 4096:
                 raise ValueError("elastic memory.high must span at least one 4096-byte page")
         if not isinstance(failover, bool):
             raise TypeError("failover must be a boolean")

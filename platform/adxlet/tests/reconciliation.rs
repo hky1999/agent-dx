@@ -433,6 +433,7 @@ async fn elastic_memory_restart_keeps_ceiling_without_authoritative_memory_accou
     running.spec.sandbox.limits.memory_bytes = 512 * MIB;
     running.spec.sandbox.elastic_memory = Some(adx_core::memory::ElasticMemoryPolicy {
         high_per_mille: 750,
+        minimum_bytes: None,
     });
     node.reconcile(vec![running]).await.unwrap();
     assert_eq!(

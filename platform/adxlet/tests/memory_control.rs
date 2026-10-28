@@ -322,6 +322,7 @@ async fn rig_with_source(
             },
             elastic_memory: Some(ElasticMemoryPolicy {
                 high_per_mille: 750,
+                minimum_bytes: None,
             }),
             ..Default::default()
         },

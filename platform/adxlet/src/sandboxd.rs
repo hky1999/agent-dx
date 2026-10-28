@@ -408,7 +408,7 @@ impl Sandboxd {
                     || execution_deadline
                         .is_some_and(|deadline| intent.deadline_unix_millis > deadline) =>
             {
-                return Err(Error::Conflict)
+                return Err(Error::Conflict);
             }
             Some(intent) => intent,
             None => {
@@ -888,6 +888,25 @@ fn start_operation_state(
     proto::StartOperationState::try_from(response.state).map_err(unavailable)
 }
 
+fn elastic_resource_policy(spec: &EnvironmentSpec) -> serde_json::Value {
+    let ceiling = spec.execution_ceiling();
+    let mut policy = serde_json::json!({
+        "version": 1,
+        "CPU": {"initial": ceiling.cpu_millis, "ceiling": ceiling.cpu_millis},
+        "Memory": {"initial": spec.resources.memory_bytes / 1_048_576, "ceiling": ceiling.memory_bytes / 1_048_576},
+    });
+    if let Some(minimum) = spec
+        .sandbox
+        .elastic_memory
+        .as_ref()
+        .and_then(|memory| memory.minimum_bytes)
+    {
+        policy["version"] = serde_json::json!(2);
+        policy["memory_minimum_mib"] = serde_json::json!(minimum / 1_048_576);
+    }
+    policy
+}
+
 pub fn start_request(
     spec: &EnvironmentSpec,
     runtime_id: &str,
@@ -1037,12 +1056,10 @@ pub fn start_request(
         ("adx.generation".into(), ownership_generation.to_string()),
     ]);
     if options.elastic_memory.is_some() {
-        let ceiling = spec.execution_ceiling();
-        labels.insert("akernel.scheduler/elastic-resources".into(), serde_json::json!({
-            "version": 1,
-            "CPU": { "initial": execution.cpu_millis, "ceiling": execution.cpu_millis },
-            "Memory": { "initial": execution.memory_bytes / 1_048_576, "ceiling": ceiling.memory_bytes / 1_048_576 },
-        }).to_string());
+        labels.insert(
+            "akernel.scheduler/elastic-resources".into(),
+            elastic_resource_policy(spec).to_string(),
+        );
     }
     Ok(proto::StartRequest {
         xpu_allocations: xpu

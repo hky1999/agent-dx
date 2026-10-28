@@ -83,7 +83,7 @@ impl MemoryControlPolicy {
             .div_ceil(u128::from(MIB))
             * u128::from(MIB);
         let desired = u64::try_from(desired).unwrap_or(u64::MAX).clamp(
-            env.spec.resources.memory_bytes,
+            env.spec.memory_floor_bytes(),
             env.spec.execution_ceiling().memory_bytes,
         );
         let desired = if growing {
@@ -136,12 +136,20 @@ impl Session {
                 false,
             )?;
             let node: StoredNode = decode(raw.get(&node_field).ok_or(Error::NotFound)?)?;
-            if node.node.memory_control_version != 1 {
-                return Err(Error::Conflict);
-            }
             let mut env: StoredEnvironment = decode(raw.get(&field).ok_or(Error::NotFound)?)?;
             check_live(&env)?;
             check_observation(&env, observation)?;
+            if env
+                .spec
+                .sandbox
+                .elastic_memory
+                .as_ref()
+                .is_none_or(|policy| {
+                    !policy.supports_node_version(node.node.memory_control_version)
+                })
+            {
+                return Err(Error::Conflict);
+            }
             let high_per_mille = env
                 .spec
                 .sandbox

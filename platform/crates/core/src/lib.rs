@@ -107,6 +107,16 @@ impl EnvironmentSpec {
         resources
     }
 
+    /// Immutable memory shrink floor, independent of the birth allocation.
+    pub fn memory_floor_bytes(&self) -> u64 {
+        self.sandbox
+            .elastic_memory
+            .as_ref()
+            .map_or(self.resources.memory_bytes, |policy| {
+                policy.minimum(self.resources.memory_bytes)
+            })
+    }
+
     /// Immutable permitted bounds, with zero limits inheriting requests.
     pub fn execution_ceiling(&self) -> Resources {
         Resources {

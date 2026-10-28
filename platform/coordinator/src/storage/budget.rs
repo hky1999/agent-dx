@@ -233,7 +233,13 @@ pub(super) fn check_admission(
             raw.get(&format!("node:{}", record.assignment.node_id))
                 .ok_or(Error::NotFound)?,
         )?;
-        if record.spec.sandbox.elastic_memory.is_some() && node.node.memory_control_version != 1 {
+        if record
+            .spec
+            .sandbox
+            .elastic_memory
+            .as_ref()
+            .is_some_and(|policy| !policy.supports_node_version(node.node.memory_control_version))
+        {
             return Err(Error::Conflict);
         }
         if !node.node.available

@@ -1817,6 +1817,7 @@ async fn elastic_memory_resume_reserves_ceiling_before_physical_dispatch() {
     spec.sandbox.limits.memory_bytes = 256 * MIB;
     spec.sandbox.elastic_memory = Some(adx_core::memory::ElasticMemoryPolicy {
         high_per_mille: 750,
+        minimum_bytes: None,
     });
     let mut capacity = spec.resources;
     capacity.memory_bytes = 512 * MIB;

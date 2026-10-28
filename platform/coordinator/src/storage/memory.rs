@@ -67,7 +67,7 @@ fn check_observation(
     if observation.identity.assignment != environment.assignment
         || observation.identity.runtime_id != result.runtime.id
         || !result.resources_held
-        || observation.memory_limit_bytes < environment.spec.resources.memory_bytes
+        || observation.memory_limit_bytes < environment.spec.memory_floor_bytes()
         || observation.memory_limit_bytes > ceiling.memory_bytes
         || u128::from(observation.cpu_quota_usec) * 1000
             != u128::from(ceiling.cpu_millis) * u128::from(observation.cpu_period_usec)

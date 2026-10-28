@@ -993,9 +993,7 @@ fn snapshot(raw: &BTreeMap<String, String>) -> Result<StoredSnapshot> {
             .ok_or_else(|| Error::Unavailable("control metadata missing".into()))?,
     )?;
     h.validate()?;
-    if raw.keys().filter(|k| k.starts_with("parking:")).count() > 16 {
-        return Err(Error::NoCapacity);
-    }
+    parking::check_journal_capacity(raw, None)?;
     let mut out = StoredSnapshot {
         shard_count: h.shards,
         generation: h.generation,
