@@ -1,5 +1,21 @@
 //! Portable restore-point metadata. Artifacts stay behind a storage backend.
+use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CheckpointResources {
+    pub generation: String,
+    pub revision: u64,
+}
+impl CheckpointResources {
+    pub fn validate(&self) -> Result<()> {
+        if self.generation.trim().is_empty() || self.generation.len() > 256 || self.revision == 0 {
+            return Err(Error::Invalid(
+                "complete positive physical checkpoint resource condition required".into(),
+            ));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointArtifact {
@@ -9,6 +25,8 @@ pub struct CheckpointArtifact {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestorePoint {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_resources: Option<CheckpointResources>,
     #[serde(default)]
     pub origin: Option<crate::runtime::RuntimeIdentity>,
     pub id: String,

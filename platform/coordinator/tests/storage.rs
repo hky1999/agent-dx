@@ -876,6 +876,7 @@ async fn pause_resume_persists_recovery_point_fences_old_results_and_restores_ca
     paused.resources_held = false;
     paused.runtime.ip = None;
     paused.checkpoint = Some(RestorePoint {
+        source_resources: None,
         origin: None,
         id: "pause".into(),
         source_runtime_id: initial.runtime.id.clone(),
@@ -976,6 +977,7 @@ async fn sqlite_replays_pause_and_resume_after_redis_and_node_sink_restart() {
     paused.resources_held = false;
     paused.runtime.ip = None;
     paused.checkpoint = Some(RestorePoint {
+        source_resources: None,
         origin: None,
         id: "cp".into(),
         source_runtime_id: initial.runtime.id.clone(),
@@ -1230,6 +1232,7 @@ async fn recovery_assignment_is_durable_and_old_generation_cannot_publish() {
         .unwrap();
     let mut r = running(spec("held"), previous.clone());
     r.checkpoint = Some(adx_core::RestorePoint {
+        source_resources: None,
         id: "pause".into(),
         origin: None,
         expires_at_unix_seconds: u64::MAX,
@@ -1341,6 +1344,7 @@ async fn recovery_never_uses_missing_local_or_expired_checkpoint() {
         let mut r = running(spec("held"), previous.clone());
         if kind != "missing" {
             r.checkpoint = Some(adx_core::RestorePoint {
+                source_resources: None,
                 id: "pause".into(),
                 origin: None,
                 expires_at_unix_seconds: if kind == "expired" { 1 } else { u64::MAX },

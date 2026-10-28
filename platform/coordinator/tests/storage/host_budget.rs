@@ -242,6 +242,7 @@ async fn host_budget_replacement_and_recovery_reserve_target_before_dispatch() {
         if recovering {
             let mut running = running(spec("source"), original.clone());
             running.checkpoint = Some(adx_core::RestorePoint {
+                source_resources: None,
                 id: "shared".into(),
                 origin: None,
                 expires_at_unix_seconds: u64::MAX,
@@ -404,6 +405,7 @@ async fn host_budget_result_commit_cannot_silently_reacquire_capacity() {
     result.resources_held = false;
     result.runtime.ip = None;
     result.checkpoint = Some(adx_core::RestorePoint {
+        source_resources: None,
         id: "checkpoint".into(),
         origin: None,
         expires_at_unix_seconds: u64::MAX,
@@ -503,6 +505,7 @@ async fn paused_execution(session: &Session, id: &str) -> EnvironmentRecord {
     result.resources_held = false;
     result.runtime.ip = None;
     result.checkpoint = Some(adx_core::RestorePoint {
+        source_resources: None,
         id: "checkpoint".into(),
         origin: None,
         expires_at_unix_seconds: u64::MAX,
@@ -948,6 +951,7 @@ async fn execution_authorization_restart_policy_and_checkpoint_replacement_are_d
         source.resources_held = false;
         source.restart_pending = kind == ExecutionKind::Restart;
         source.checkpoint = Some(adx_core::RestorePoint {
+            source_resources: None,
             id: "checkpoint".into(),
             origin: None,
             expires_at_unix_seconds: u64::MAX,

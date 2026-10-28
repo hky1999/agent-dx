@@ -24,6 +24,8 @@ struct Server {
     checkpoints: Arc<Mutex<Vec<CheckpointRequest>>>,
     conditional_deletes: Arc<Mutex<Vec<DeleteIfGenerationRequest>>>,
     conditional_checkpoints: Arc<Mutex<Vec<CheckpointIfGenerationRequest>>>,
+    resource_checkpoints: Arc<Mutex<Vec<CheckpointIfResourcesRequest>>>,
+    resource_reply_revision: Option<u64>,
     legacy_deletes: Arc<std::sync::atomic::AtomicUsize>,
     legacy_checkpoints: Arc<std::sync::atomic::AtomicUsize>,
     resource_generation: Arc<Mutex<String>>,
@@ -70,6 +72,8 @@ impl Default for Server {
             checkpoints: Arc::default(),
             conditional_deletes: Arc::default(),
             conditional_checkpoints: Arc::default(),
+            resource_checkpoints: Arc::default(),
+            resource_reply_revision: None,
             legacy_deletes: Arc::default(),
             legacy_checkpoints: Arc::default(),
             resource_generation: Arc::new(Mutex::new("physical-generation-1".into())),
@@ -452,6 +456,41 @@ impl sandbox_service_server::SandboxService for Server {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.save_checkpoint(request.into_inner())
             .map_err(|error| *error)
+    }
+    async fn checkpoint_if_resources(
+        &self,
+        request: Request<CheckpointIfResourcesRequest>,
+    ) -> Result<Response<CheckpointResponse>, Status> {
+        let request = request.into_inner();
+        self.resource_checkpoints
+            .lock()
+            .unwrap()
+            .push(request.clone());
+        if let Some(code) = self.checkpoint_error {
+            return Err(Status::new(
+                code,
+                "resource-conditioned checkpoint unavailable",
+            ));
+        }
+        if request.expected_generation != *self.resource_generation.lock().unwrap()
+            || request.expected_revision == 0
+        {
+            return Err(Status::failed_precondition(
+                "original physical resource condition changed",
+            ));
+        }
+        let mut response = self
+            .save_checkpoint(
+                request
+                    .checkpoint
+                    .ok_or_else(|| Status::invalid_argument("checkpoint required"))?,
+            )
+            .map_err(|error| *error)?;
+        response.get_mut().source_generation = request.expected_generation;
+        response.get_mut().source_resource_revision = self
+            .resource_reply_revision
+            .unwrap_or(request.expected_revision);
+        Ok(response)
     }
     async fn checkpoint_if_generation(
         &self,
@@ -3140,4 +3179,116 @@ async fn missing_local_intent_keeps_unknown_when_daemon_cannot_seal_runtime() {
     assert_eq!(queries[1].operation_id, first.operation_id);
     assert_eq!(queries[1].deadline_unix_millis, first.deadline_unix_millis);
     assert!(server.conditional_deletes.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn resource_condition_uses_separate_rpc_and_never_falls_back() {
+    let server = Server {
+        checkpoint_error: Some(tonic::Code::Unimplemented),
+        ..Default::default()
+    };
+    let (adapter, _harness) = connect(server.clone()).await;
+    adapter.start(&spec(), "i-1", 1, &[]).await.unwrap();
+    let path = tempfile::tempdir().unwrap();
+    let condition = adx_core::CheckpointResources {
+        generation: "physical-generation-1".into(),
+        revision: 7,
+    };
+    assert!(adapter
+        .checkpoint_with_resources(
+            "i-1",
+            path.path(),
+            Duration::from_secs(60),
+            Some(&condition)
+        )
+        .await
+        .is_err());
+    assert_eq!(server.resource_checkpoints.lock().unwrap().len(), 1);
+    assert!(server.conditional_checkpoints.lock().unwrap().is_empty());
+    assert!(server.checkpoints.lock().unwrap().is_empty());
+    assert_eq!(
+        server
+            .legacy_checkpoints
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert!(*server.running.lock().unwrap());
+    adapter.remove("i-1").await.unwrap();
+}
+
+#[tokio::test]
+async fn resource_condition_and_complete_reply_survive_the_actual_rpc() {
+    let server = Server::default();
+    let (adapter, _harness) = connect(server.clone()).await;
+    adapter.start(&spec(), "i-1", 1, &[]).await.unwrap();
+    let path = tempfile::tempdir().unwrap();
+    let condition = adx_core::CheckpointResources {
+        generation: "physical-generation-1".into(),
+        revision: 7,
+    };
+    adapter
+        .checkpoint_with_resources(
+            "i-1",
+            path.path(),
+            Duration::from_secs(60),
+            Some(&condition),
+        )
+        .await
+        .unwrap();
+    {
+        let calls = server.resource_checkpoints.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].expected_generation, condition.generation);
+        assert_eq!(calls[0].expected_revision, condition.revision);
+    }
+    assert!(server.conditional_checkpoints.lock().unwrap().is_empty());
+    assert_eq!(
+        server
+            .legacy_checkpoints
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    adapter.remove("i-1").await.unwrap();
+}
+
+#[tokio::test]
+async fn wrong_captured_resource_reply_remains_unknown_and_is_not_recaptured() {
+    let server = Server {
+        resource_reply_revision: Some(8),
+        ..Default::default()
+    };
+    let (adapter, _harness) = connect(server.clone()).await;
+    adapter.start(&spec(), "i-1", 1, &[]).await.unwrap();
+    let path = tempfile::tempdir().unwrap();
+    let condition = adx_core::CheckpointResources {
+        generation: "physical-generation-1".into(),
+        revision: 7,
+    };
+    assert!(adapter
+        .checkpoint_with_resources(
+            "i-1",
+            path.path(),
+            Duration::from_secs(60),
+            Some(&condition)
+        )
+        .await
+        .is_err());
+    assert!(adapter
+        .checkpoint_with_resources(
+            "i-1",
+            path.path(),
+            Duration::from_secs(60),
+            Some(&condition)
+        )
+        .await
+        .is_err());
+    assert_eq!(server.resource_checkpoints.lock().unwrap().len(), 1);
+    assert!(server.conditional_checkpoints.lock().unwrap().is_empty());
+    assert_eq!(
+        server
+            .legacy_checkpoints
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    adapter.remove("i-1").await.unwrap();
 }

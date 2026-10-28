@@ -194,3 +194,40 @@ fn independent_memory_minimum_survives_protocol_and_persistent_roundtrips() {
         options
     );
 }
+
+#[test]
+fn checkpoint_resource_condition_roundtrips_and_rejects_an_incomplete_pair() {
+    let condition = adx_core::CheckpointResources {
+        generation: "original".into(),
+        revision: 7,
+    };
+    let point = adx_core::RestorePoint {
+        source_resources: Some(condition.clone()),
+        origin: None,
+        id: "capture".into(),
+        source_runtime_id: "source".into(),
+        expires_at_unix_seconds: 10,
+        artifact: adx_core::CheckpointArtifact {
+            storage: "local".into(),
+            location: "/original/capture".into(),
+            size_bytes: 8,
+        },
+    };
+    let wire: control::RestorePoint = point.clone().into();
+    assert_eq!(wire.source_resources.as_ref().unwrap().revision, 7);
+    assert_eq!(adx_core::RestorePoint::try_from(wire).unwrap(), point);
+    assert!(
+        adx_core::CheckpointResources::try_from(control::CheckpointResources {
+            generation: "original".into(),
+            revision: 0
+        })
+        .is_err()
+    );
+    assert!(
+        adx_core::CheckpointResources::try_from(control::CheckpointResources {
+            generation: "".into(),
+            revision: 7
+        })
+        .is_err()
+    );
+}

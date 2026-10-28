@@ -130,11 +130,28 @@ impl Controller {
         });
     }
     pub(super) async fn pause(&mut self, request: PauseRequest) -> Result<OperationResult> {
+        if let Some(resources) = &request.resources {
+            resources.validate()?;
+        }
         if self.replay_operation(
             &request.operation_id,
             request.expected_revision,
             LifecycleKind::Pause,
         )? {
+            let checkpoint = self.record.checkpoint.as_ref().ok_or(Error::Conflict)?;
+            if checkpoint.source_resources.as_ref() != request.resources.as_ref() {
+                return Err(Error::Conflict);
+            }
+            let store = self
+                .services
+                .checkpoint
+                .as_ref()
+                .ok_or_else(|| Error::Invalid("checkpoint storage is not configured".into()))?;
+            let materialized = store.store.materialize(&checkpoint.artifact).await?;
+            self.services
+                .runtime
+                .verify_checkpoint_resources(&materialized, request.resources.as_ref())
+                .await?;
             return self.replay_or_sync().await;
         }
         if self.record.state != EnvironmentState::Running {
@@ -215,10 +232,11 @@ impl Controller {
         if let Err(error) = self
             .services
             .runtime
-            .checkpoint(
+            .checkpoint_with_resources(
                 &self.record.runtime.id,
                 &staged,
                 Duration::from_secs(request.timeout_seconds),
+                request.resources.as_ref(),
             )
             .await
         {
@@ -262,6 +280,7 @@ impl Controller {
                     self.obsolete_checkpoints.push(old.artifact);
                 }
                 self.record.checkpoint = Some(RestorePoint {
+                    source_resources: request.resources.clone(),
                     origin: None,
                     id: request.operation_id.clone(),
                     artifact,
@@ -288,6 +307,7 @@ impl Controller {
             self.obsolete_checkpoints.push(previous.artifact);
         }
         self.record.checkpoint = Some(RestorePoint {
+            source_resources: request.resources.clone(),
             origin: None,
             id: request.operation_id.clone(),
             artifact,
@@ -313,13 +333,7 @@ impl Controller {
             .await?;
         let attempt = async {
             let checkpoint = self.record.checkpoint.as_ref().ok_or(Error::Conflict)?;
-            let store = &self
-                .services
-                .checkpoint
-                .as_ref()
-                .ok_or(Error::Conflict)?
-                .store;
-            self.recovery_files = Some(store.materialize(&checkpoint.artifact).await?);
+            self.recovery_files = Some(self.materialize_checkpoint(checkpoint).await?);
             self.services.readiness.expect_runtime(&self.record)?;
             self.record.runtime.ip = Some(
                 self.services

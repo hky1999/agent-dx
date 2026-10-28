@@ -9,7 +9,8 @@ pub mod pressure;
 pub mod runtime_profile;
 pub mod snapshots;
 pub use checkpoint::{
-    valid_runtime_id, CheckpointArtifact, CompletedOperation, LifecycleKind, RestorePoint,
+    valid_runtime_id, CheckpointArtifact, CheckpointResources, CompletedOperation, LifecycleKind,
+    RestorePoint,
 };
 pub mod runtime;
 pub mod sandbox;

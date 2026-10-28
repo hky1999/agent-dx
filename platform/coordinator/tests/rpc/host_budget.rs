@@ -237,6 +237,7 @@ async fn host_budget_rpc_rejects_before_execution_and_recovers_after_release() {
             expected_revision: first.revision,
             ttl_seconds: 600,
             timeout_seconds: 30,
+            resources: None,
         })
         .await
         .unwrap()
@@ -361,6 +362,7 @@ async fn host_budget_rpc_rejects_before_execution_and_recovers_after_release() {
             expected_revision: lost.revision,
             ttl_seconds: 600,
             timeout_seconds: 30,
+            resources: None,
         })
         .await
         .unwrap()

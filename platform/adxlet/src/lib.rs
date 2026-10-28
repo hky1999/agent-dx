@@ -184,6 +184,34 @@ pub trait RuntimeDriver: Send + Sync {
     ) -> Result<()> {
         Err(Error::Invalid("runtime does not support checkpoint".into()))
     }
+    /// Capture with a required physical resource condition; unsupported conditions never fall back.
+    async fn checkpoint_with_resources(
+        &self,
+        runtime_id: &str,
+        path: &std::path::Path,
+        timeout: Duration,
+        resources: Option<&crate::checkpoint::CheckpointResources>,
+    ) -> Result<()> {
+        if resources.is_some() {
+            return Err(Error::Invalid(
+                "resource-conditioned checkpoint is unsupported".into(),
+            ));
+        }
+        self.checkpoint(runtime_id, path, timeout).await
+    }
+    /// Check the original condition on an already completed artifact without recapture.
+    async fn verify_checkpoint_resources(
+        &self,
+        _path: &std::path::Path,
+        resources: Option<&crate::checkpoint::CheckpointResources>,
+    ) -> Result<()> {
+        if resources.is_some() {
+            return Err(Error::Invalid(
+                "resource-conditioned checkpoint replay is unsupported".into(),
+            ));
+        }
+        Ok(())
+    }
     /// Capture a local recovery point while keeping the same execution alive.
     async fn checkpoint_running(
         &self,

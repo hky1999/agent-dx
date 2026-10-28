@@ -180,6 +180,7 @@ impl Operations {
                                 expected_revision: operation.expected,
                                 ttl_seconds: ttl,
                                 timeout_seconds: seconds,
+                                resources: parking_resources(&body)?,
                             })),
                         )
                         .await
@@ -385,6 +386,37 @@ struct ParkingSource {
     revision: u64,
     #[serde(default)]
     checkpoint_id: Option<String>,
+    #[serde(default)]
+    resource_generation: Option<String>,
+    #[serde(default)]
+    resource_revision: Option<u64>,
+}
+
+fn parking_resources(body: &Value) -> Result<Option<pb::CheckpointResources>, Status> {
+    let Some(value) = body.get("source") else {
+        return Ok(None);
+    };
+    let source: ParkingSource = serde_json::from_value(value.clone())
+        .map_err(|_| Status::invalid_argument("complete parking source required"))?;
+    match (source.resource_generation, source.resource_revision) {
+        (None, None)
+            if value.get("resourceGeneration").is_none()
+                && value.get("resourceRevision").is_none() =>
+        {
+            Ok(None)
+        }
+        (Some(generation), Some(revision))
+            if !generation.trim().is_empty() && generation.len() <= 256 && revision > 0 =>
+        {
+            Ok(Some(pb::CheckpointResources {
+                generation,
+                revision,
+            }))
+        }
+        _ => Err(Status::invalid_argument(
+            "complete positive original physical resource condition required",
+        )),
+    }
 }
 
 /// Explicit source fencing for the trusted parking controller. Existing lifecycle
@@ -405,6 +437,11 @@ fn validate_parking_source(
     }
     let source: ParkingSource = serde_json::from_value(value.clone())
         .map_err(|_| Status::invalid_argument("complete parking source required"))?;
+    if parking_resources(body)?.is_some() && kind != Kind::Pause {
+        return Err(Status::invalid_argument(
+            "physical capture condition only supports pause",
+        ));
+    }
     let replay = record.last_operation.as_ref().is_some_and(|op| {
         op.id == request_id && op.kind == kind.code() && op.expected_revision == source.revision
     });
@@ -541,6 +578,7 @@ mod recovery_source_tests {
                 ..Default::default()
             }),
             checkpoint: Some(pb::RestorePoint {
+                source_resources: None,
                 id: "park-original".into(),
                 source_runtime_id: "source".into(),
                 ..Default::default()
@@ -550,5 +588,45 @@ mod recovery_source_tests {
         };
         let body = json!({"source":{"runtimeId":"source","assignmentGeneration":7,"revision":9,"checkpointId":"park-original"}});
         assert!(validate_parking_source(Kind::Resume, &body, &record, "resume-once").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod parking_resource_condition_tests {
+    use super::*;
+
+    #[test]
+    fn original_physical_resource_pair_is_accepted_and_partial_pairs_are_rejected() {
+        let record = pb::EnvironmentRecord {
+            runtime: Some(pb::Runtime {
+                id: "source".into(),
+                ..Default::default()
+            }),
+            assignment: Some(pb::Assignment {
+                generation: 7,
+                ..Default::default()
+            }),
+            revision: 9,
+            ..Default::default()
+        };
+        let source = json!({"runtimeId":"source","assignmentGeneration":7,"revision":9,
+                            "resourceGeneration":"original-physical","resourceRevision":2});
+        assert!(
+            validate_parking_source(Kind::Pause, &json!({"source":source}), &record, "park")
+                .is_ok(),
+            "a complete original physical resource condition must reach the node"
+        );
+        for bad in [
+            json!({"runtimeId":"source","assignmentGeneration":7,"revision":9,"resourceGeneration":"original-physical"}),
+            json!({"runtimeId":"source","assignmentGeneration":7,"revision":9,"resourceRevision":2}),
+            json!({"runtimeId":"source","assignmentGeneration":7,"revision":9,"resourceGeneration":"","resourceRevision":2}),
+            json!({"runtimeId":"source","assignmentGeneration":7,"revision":9,"resourceGeneration":"original-physical","resourceRevision":0}),
+            json!({"runtimeId":"source","assignmentGeneration":7,"revision":9,"resourceGeneration":null,"resourceRevision":null}),
+        ] {
+            assert!(
+                validate_parking_source(Kind::Pause, &json!({"source":bad}), &record, "park")
+                    .is_err()
+            );
+        }
     }
 }

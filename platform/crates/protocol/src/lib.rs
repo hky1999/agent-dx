@@ -274,9 +274,29 @@ pub fn dependency_status(status: tonic::Status) -> Error {
     }
 }
 
+impl From<adx_core::CheckpointResources> for control::CheckpointResources {
+    fn from(value: adx_core::CheckpointResources) -> Self {
+        Self {
+            generation: value.generation,
+            revision: value.revision,
+        }
+    }
+}
+impl TryFrom<control::CheckpointResources> for adx_core::CheckpointResources {
+    type Error = Error;
+    fn try_from(value: control::CheckpointResources) -> Result<Self> {
+        let condition = Self {
+            generation: value.generation,
+            revision: value.revision,
+        };
+        condition.validate()?;
+        Ok(condition)
+    }
+}
 impl From<adx_core::RestorePoint> for control::RestorePoint {
     fn from(v: adx_core::RestorePoint) -> Self {
         Self {
+            source_resources: v.source_resources.map(Into::into),
             id: v.id,
             expires_at_unix_seconds: v.expires_at_unix_seconds,
             origin: v.origin.map(Into::into),
@@ -305,6 +325,7 @@ impl TryFrom<control::RestorePoint> for adx_core::RestorePoint {
             return Err(Error::Invalid("invalid checkpoint metadata".into()));
         }
         Ok(Self {
+            source_resources: v.source_resources.map(TryInto::try_into).transpose()?,
             id: v.id,
             expires_at_unix_seconds: v.expires_at_unix_seconds,
             origin: v.origin.map(TryInto::try_into).transpose()?,

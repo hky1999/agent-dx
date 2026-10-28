@@ -401,6 +401,24 @@ struct Controller {
 }
 
 impl Controller {
+    async fn materialize_checkpoint(
+        &self,
+        checkpoint: &adx_core::RestorePoint,
+    ) -> Result<super::checkpoint::MaterializedCheckpoint> {
+        let store = &self
+            .services
+            .checkpoint
+            .as_ref()
+            .ok_or(Error::Conflict)?
+            .store;
+        let materialized = store.materialize(&checkpoint.artifact).await?;
+        self.services
+            .runtime
+            .verify_checkpoint_resources(&materialized, checkpoint.source_resources.as_ref())
+            .await?;
+        Ok(materialized)
+    }
+
     async fn reconcile(&mut self) -> Result<OperationResult> {
         if self.record.state == EnvironmentState::Running
             && self
@@ -422,10 +440,8 @@ impl Controller {
                 return self.sync().await;
             }
             if self.recovery_files.is_none() {
-                if let (Some(cp), Some(services)) =
-                    (&self.record.checkpoint, &self.services.checkpoint)
-                {
-                    self.recovery_files = Some(services.store.materialize(&cp.artifact).await?);
+                if let (Some(cp), Some(_)) = (&self.record.checkpoint, &self.services.checkpoint) {
+                    self.recovery_files = Some(self.materialize_checkpoint(cp).await?);
                 }
             }
             tokio::time::timeout(self.services.operation_timeout, async {
@@ -599,13 +615,7 @@ impl Controller {
                     .run_result(async {
                         if restore_checkpoint || self.record.spec.snapshot_id.is_some() {
                             let cp = self.record.checkpoint.as_ref().ok_or(Error::Conflict)?;
-                            let store = &self
-                                .services
-                                .checkpoint
-                                .as_ref()
-                                .ok_or(Error::Conflict)?
-                                .store;
-                            let path = store.materialize(&cp.artifact).await?;
+                            let path = self.materialize_checkpoint(cp).await?;
                             // Firecracker reads restore files after the RPC has returned.
                             self.recovery_files = Some(path);
                             if let Some(grant) = &authorization {

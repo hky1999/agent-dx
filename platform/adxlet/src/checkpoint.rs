@@ -11,8 +11,11 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+pub use adx_core::CheckpointResources;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PauseRequest {
+    pub resources: Option<CheckpointResources>,
     pub operation_id: String,
     pub expected_revision: u64,
     pub ttl_seconds: u64,

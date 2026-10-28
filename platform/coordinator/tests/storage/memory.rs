@@ -487,6 +487,7 @@ async fn memory_elastic_birth_and_recovery_reserve_different_bounds() {
     record.resources_held = false;
     record.runtime.ip = None;
     record.checkpoint = Some(adx_core::RestorePoint {
+        source_resources: None,
         id: "checkpoint".into(),
         origin: None,
         expires_at_unix_seconds: u64::MAX,
@@ -2244,6 +2245,7 @@ async fn memory_pressure_blocks_restore_and_preserves_existing_restore_reservati
     record.resources_held = false;
     record.runtime.ip = None;
     record.checkpoint = Some(adx_core::RestorePoint {
+        source_resources: None,
         id: "checkpoint-pressure".into(),
         origin: None,
         expires_at_unix_seconds: u64::MAX,

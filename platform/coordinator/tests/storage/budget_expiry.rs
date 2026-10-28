@@ -114,6 +114,7 @@ async fn node_expiry_budget_blocks_recovery_until_source_retires() {
         .unwrap();
     let mut record = running(spec("unknown"), assignment.clone());
     record.checkpoint = Some(adx_core::RestorePoint {
+        source_resources: None,
         id: "shared-point".into(),
         origin: None,
         expires_at_unix_seconds: u64::MAX,

@@ -530,6 +530,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
         expected_revision: 2,
         ttl_seconds: 600,
         timeout_seconds: 60,
+        resources: None,
     };
     assert_eq!(
         stale_coordinator
@@ -2786,6 +2787,7 @@ async fn shared_checkpoint_recovers_only_after_source_cleanup_and_keeps_artifact
         },
         resources_held: true,
         checkpoint: Some(RestorePoint {
+            source_resources: None,
             id: "pause".into(),
             artifact: artifact.clone(),
             expires_at_unix_seconds: u64::MAX,

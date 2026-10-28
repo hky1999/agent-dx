@@ -443,6 +443,7 @@ mod queued_publication_tests {
             restart_pending: false,
             last_operation: None,
             checkpoint: Some(adx_core::RestorePoint {
+                source_resources: None,
                 id: "checkpoint".into(),
                 origin: None,
                 source_runtime_id: "queue-1".into(),

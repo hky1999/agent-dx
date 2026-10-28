@@ -25,6 +25,7 @@ struct Backend {
     unavailable_commit: Mutex<bool>,
     unavailable_running_commit: Mutex<bool>,
     fail_restore: Mutex<bool>,
+    captured_resources: Mutex<Option<adx_core::CheckpointResources>>,
     fail_start: Mutex<bool>,
     activity: Mutex<Option<(u64, u64)>>,
     fail_prepare: Mutex<bool>,
@@ -88,6 +89,26 @@ impl RuntimeDriver for Backend {
         Ok(())
     }
     async fn checkpoint_supported(&self, _: &str) -> Result<()> {
+        Ok(())
+    }
+    async fn checkpoint_with_resources(
+        &self,
+        id: &str,
+        path: &Path,
+        timeout: Duration,
+        resources: Option<&adx_core::CheckpointResources>,
+    ) -> Result<()> {
+        *self.captured_resources.lock().unwrap() = resources.cloned();
+        self.checkpoint(id, path, timeout).await
+    }
+    async fn verify_checkpoint_resources(
+        &self,
+        _: &Path,
+        resources: Option<&adx_core::CheckpointResources>,
+    ) -> Result<()> {
+        if self.captured_resources.lock().unwrap().as_ref() != resources {
+            return Err(Error::Conflict);
+        }
         Ok(())
     }
     async fn checkpoint(&self, id: &str, path: &Path, _: Duration) -> Result<()> {
@@ -331,6 +352,7 @@ fn pause(revision: u64) -> PauseRequest {
         expected_revision: revision,
         ttl_seconds: 600,
         timeout_seconds: 60,
+        resources: None,
     }
 }
 fn resume(revision: u64) -> ResumeRequest {
@@ -1284,6 +1306,7 @@ async fn recovery_with_unusable_checkpoint_settles_failed_without_image_start() 
         revision: 1,
         resources_held: false,
         checkpoint: Some(adx_core::RestorePoint {
+            source_resources: None,
             id: "recovery".into(),
             source_runtime_id: "environment-1".into(),
             expires_at_unix_seconds: u64::MAX,
@@ -1361,6 +1384,7 @@ async fn recovery_retries_publication_without_repeating_backend_restore() {
         revision: 1,
         resources_held: false,
         checkpoint: Some(adx_core::RestorePoint {
+            source_resources: None,
             id: "recovery".into(),
             source_runtime_id: "environment-1".into(),
             expires_at_unix_seconds: u64::MAX,
@@ -1851,6 +1875,135 @@ async fn elastic_memory_resume_reserves_ceiling_before_physical_dispatch() {
         node.used().memory_bytes,
         256 * MIB,
         "unknown checkpoint limit keeps the conservative reservation"
+    );
+    handle.delete().await.unwrap();
+    assert_eq!(node.used(), Resources::default());
+}
+
+#[tokio::test]
+async fn paused_resource_condition_is_persistent_and_cannot_be_replaced_on_replay() {
+    let (_temp, backend, node, spec, assignment) = fixture();
+    let handle = node.environment(spec, assignment).unwrap();
+    let created = handle.create().await.unwrap();
+    let mut request = pause(created.record.revision);
+    let condition = adx_core::CheckpointResources {
+        generation: "physical-source".into(),
+        revision: 7,
+    };
+    request.resources = Some(condition.clone());
+    let paused = handle.pause(request.clone()).await.unwrap();
+    let bytes = serde_json::to_vec(&paused.record).unwrap();
+    let retained: EnvironmentRecord = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        retained.checkpoint.unwrap().source_resources,
+        Some(condition.clone())
+    );
+    let mut different = request.clone();
+    different.resources = Some(adx_core::CheckpointResources {
+        revision: 8,
+        ..condition
+    });
+    assert!(handle.pause(different).await.is_err());
+    let mut absent = request.clone();
+    absent.resources = None;
+    assert!(handle.pause(absent).await.is_err());
+    handle.pause(request).await.unwrap();
+    assert_eq!(
+        backend
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|value| value.as_str() == "checkpoint")
+            .count(),
+        1
+    );
+}
+
+async fn resume_refuses_changed_original_resources(actual: Option<adx_core::CheckpointResources>) {
+    let (_temp, backend, node, spec, assignment) = fixture();
+    let handle = node.environment(spec, assignment).unwrap();
+    let created = handle.create().await.unwrap();
+    let mut request = pause(created.record.revision);
+    let condition = adx_core::CheckpointResources {
+        generation: "original-source".into(),
+        revision: 7,
+    };
+    request.resources = Some(condition.clone());
+    let paused = handle.pause(request).await.unwrap();
+    assert_eq!(
+        paused.record.checkpoint.as_ref().unwrap().source_resources,
+        Some(condition)
+    );
+    *backend.captured_resources.lock().unwrap() = actual;
+    backend.events.lock().unwrap().clear();
+    let result = handle.resume(resume(paused.record.revision)).await;
+    assert!(
+        result.is_err(),
+        "a restore must verify its persisted original resource condition before physical dispatch"
+    );
+    let events = backend.events.lock().unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|event| event == "restore" || event == "start"),
+        "a mismatched artifact must never start an execution: {events:?}"
+    );
+    assert!(backend.running.lock().unwrap().is_empty());
+    assert_eq!(node.used(), Resources::default());
+}
+#[tokio::test]
+async fn resume_refuses_artifact_with_changed_original_revision() {
+    resume_refuses_changed_original_resources(Some(adx_core::CheckpointResources {
+        generation: "original-source".into(),
+        revision: 8,
+    }))
+    .await;
+}
+#[tokio::test]
+async fn resume_refuses_artifact_with_changed_original_generation() {
+    resume_refuses_changed_original_resources(Some(adx_core::CheckpointResources {
+        generation: "replacement-source".into(),
+        revision: 7,
+    }))
+    .await;
+}
+#[tokio::test]
+async fn resume_refuses_artifact_missing_original_condition() {
+    resume_refuses_changed_original_resources(None).await;
+}
+#[tokio::test]
+async fn resume_preserves_matching_original_resource_condition() {
+    let (_temp, backend, node, spec, assignment) = fixture();
+    let handle = node.environment(spec, assignment).unwrap();
+    let created = handle.create().await.unwrap();
+    let mut request = pause(created.record.revision);
+    let condition = adx_core::CheckpointResources {
+        generation: "original-source".into(),
+        revision: 7,
+    };
+    request.resources = Some(condition.clone());
+    let paused = handle.pause(request).await.unwrap();
+    backend.events.lock().unwrap().clear();
+    let restored = handle.resume(resume(paused.record.revision)).await.unwrap();
+    assert_eq!(
+        restored
+            .record
+            .checkpoint
+            .as_ref()
+            .unwrap()
+            .source_resources,
+        Some(condition)
+    );
+    assert_eq!(
+        backend
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.as_str() == "restore")
+            .count(),
+        1
     );
     handle.delete().await.unwrap();
     assert_eq!(node.used(), Resources::default());

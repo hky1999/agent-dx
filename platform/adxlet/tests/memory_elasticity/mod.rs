@@ -882,6 +882,7 @@ fn elastic_restore_permission() -> adx_core::execution::ExecutionAuthorization {
     request.source.state = EnvironmentState::Paused;
     request.source.restart_pending = false;
     request.source.checkpoint = Some(adx_core::RestorePoint {
+        source_resources: None,
         origin: None,
         id: "elastic-checkpoint".into(),
         artifact: adx_core::CheckpointArtifact {

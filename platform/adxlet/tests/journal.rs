@@ -198,6 +198,7 @@ async fn local_result_journal_never_authorizes_a_new_execution_during_outage() {
     source.resources_held = false;
     source.runtime.ip = None;
     source.checkpoint = Some(adx_core::RestorePoint {
+        source_resources: None,
         id: "checkpoint".into(),
         origin: None,
         source_runtime_id: "i-1".into(),

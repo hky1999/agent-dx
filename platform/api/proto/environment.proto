@@ -104,7 +104,7 @@ message InspectNodeRequest { string node_id = 1; string session_id = 2; bool his
 
 message InspectNodeResponse { repeated EnvironmentRecord records = 1; uint64 coordinator_epoch = 2; repeated ReusableSnapshot snapshots = 3; repeated RestorePoint retained_checkpoints = 4; HistoryBoundary history_boundary = 5; }
 
-message PauseEnvironmentRequest { Assignment assignment = 1; CallerContext caller = 2; string operation_id = 3; uint64 expected_revision = 4; uint64 ttl_seconds = 5; uint64 timeout_seconds = 6; }
+message PauseEnvironmentRequest { Assignment assignment = 1; CallerContext caller = 2; string operation_id = 3; uint64 expected_revision = 4; uint64 ttl_seconds = 5; uint64 timeout_seconds = 6; CheckpointResources resources = 7; }
 
 message ResumeEnvironmentRequest { Assignment assignment = 1; CallerContext caller = 2; string operation_id = 3; uint64 expected_revision = 4; }
 

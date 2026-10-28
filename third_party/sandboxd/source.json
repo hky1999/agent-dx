@@ -6,7 +6,7 @@
     {
       "source": "api/runtime/v1/sandbox-api.proto",
       "vendored": "sandbox-api.proto",
-      "sha256": "f207777e2116ee1c89232b77d6b07ff91b1b10ac4ed160f548546db05018964b",
+      "sha256": "7e2d61826f6b08747003c2777fd6b348a74303ad10d7fa99aabc2a11d0e40f86",
       "upstream_sha256": "a0053b7d6b5f9f4ce1e344e96741192a98a11e79d6b1cac4d17fea5a36b716ab"
     },
     {
@@ -17,9 +17,9 @@
   ],
   "scheduler_extensions": {
     "repository": "https://github.com/hky1999/sandboxd.git",
-    "revision": "52126a4ee79a93073beb5ddc433ac71da9c48283",
+    "revision": "162f1042fe89c51af5fe8ce122a65f8d9a613e45",
     "source": "api/runtime/v1/sandbox-api.proto",
-    "sha256": "f207777e2116ee1c89232b77d6b07ff91b1b10ac4ed160f548546db05018964b",
+    "sha256": "7e2d61826f6b08747003c2777fd6b348a74303ad10d7fa99aabc2a11d0e40f86",
     "fields": [
       "CheckpointRequest.checkpoint_id=7",
       "CheckpointRequest.include_filesystem=8",
@@ -40,10 +40,16 @@
       "HistoryProtection",
       "HistoryCandidate",
       "CollectHistoryRequest",
-      "CollectHistoryResponse"
+      "CollectHistoryResponse",
+      "SandboxService.CheckpointIfResources",
+      "CheckpointIfResourcesRequest.checkpoint=1",
+      "CheckpointIfResourcesRequest.expected_generation=2",
+      "CheckpointIfResourcesRequest.expected_revision=3",
+      "CheckpointResponse.source_resource_revision=7"
     ],
-    "revision_scope": "此提交是冻结候选的基础提交；历史回收协议来自下列尚未提交的snapshot_tree，不能只凭revision归属新能力。",
-    "snapshot_tree": "93cf457b9ef5595f4e7e53b2a8c5f46df5a031ba",
-    "source_state": "frozen_uncommitted_snapshot"
+    "revision_scope": "此提交包含已通过完整Go及协议生成检查的条件资源检查点修订，个人远端已推送回读；尚未构建部署或完成本轮物理验收。",
+    "source_state": "published_source_pending_build",
+    "predecessor_snapshot_tree": "93cf457b9ef5595f4e7e53b2a8c5f46df5a031ba",
+    "snapshot_tree": "5911d632f332cf2a629fcc7f107abaa8a9e8850c"
   }
 }

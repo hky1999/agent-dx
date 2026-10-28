@@ -82,6 +82,7 @@ impl Controller {
                 expected_revision: request.expected_revision,
                 ttl_seconds: 86400,
                 timeout_seconds: request.timeout_seconds,
+                resources: None,
             })
             .await;
         let paused = match paused {
@@ -207,6 +208,7 @@ impl super::Controller {
             }
         };
         self.record.checkpoint = Some(adx_core::RestorePoint {
+            source_resources: None,
             id: format!("clone-{}", self.record.spec.id),
             artifact,
             expires_at_unix_seconds: u64::MAX,

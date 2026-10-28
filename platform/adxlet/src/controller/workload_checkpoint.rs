@@ -228,6 +228,7 @@ impl Controller {
             self.obsolete_checkpoints.push(previous.artifact);
         }
         self.record.checkpoint = Some(RestorePoint {
+            source_resources: None,
             id: id.clone(),
             artifact,
             origin: None,

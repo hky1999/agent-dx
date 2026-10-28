@@ -15,6 +15,7 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Request};
 use tower::service_fn;
 
+mod checkpoint_resources;
 mod history;
 mod memory;
 mod operations;
@@ -1541,8 +1542,25 @@ impl RuntimeDriver for Sandboxd {
         }
     }
     async fn checkpoint(&self, runtime_id: &str, path: &Path, duration: Duration) -> Result<()> {
-        self.capture_checkpoint(runtime_id, path, duration, false)
+        self.capture_checkpoint(runtime_id, path, duration, false, None)
             .await
+    }
+    async fn checkpoint_with_resources(
+        &self,
+        runtime_id: &str,
+        path: &Path,
+        duration: Duration,
+        resources: Option<&crate::checkpoint::CheckpointResources>,
+    ) -> Result<()> {
+        self.capture_checkpoint(runtime_id, path, duration, false, resources)
+            .await
+    }
+    async fn verify_checkpoint_resources(
+        &self,
+        path: &Path,
+        resources: Option<&crate::checkpoint::CheckpointResources>,
+    ) -> Result<()> {
+        checkpoint_resources::verify(path, resources).await
     }
     async fn checkpoint_running(
         &self,
@@ -1550,7 +1568,7 @@ impl RuntimeDriver for Sandboxd {
         path: &Path,
         duration: Duration,
     ) -> Result<()> {
-        self.capture_checkpoint(runtime_id, path, duration, true)
+        self.capture_checkpoint(runtime_id, path, duration, true, None)
             .await
     }
     async fn restore(
@@ -1829,6 +1847,7 @@ impl Sandboxd {
         path: &Path,
         duration: Duration,
         leave_running: bool,
+        resources: Option<&crate::checkpoint::CheckpointResources>,
     ) -> Result<()> {
         if !path.is_absolute() || duration.is_zero() {
             return Err(Error::Invalid(
@@ -1862,6 +1881,14 @@ impl Sandboxd {
             .physical_identity(runtime_id)
             .await?
             .ok_or(Error::NotFound)?;
+        let resource_condition = resources.cloned();
+        if let Some(condition) = &resource_condition {
+            condition.validate()?;
+            if condition.generation != physical.resource_generation {
+                return Err(Error::Conflict);
+            }
+        }
+        let source_generation = physical.resource_generation.clone();
         // Local storage reserves an empty directory. Managed sandboxd publishes
         // a fully synced staging directory by rename into an absent destination.
         // Remove only that empty reservation; never discard a partial artifact
@@ -1908,9 +1935,19 @@ impl Sandboxd {
             include_filesystem: true,
             ..Default::default()
         };
+        let mut resource_request = resource_condition.as_ref().map(|condition| {
+            Request::new(proto::CheckpointIfResourcesRequest {
+                checkpoint: Some(checkpoint.clone()),
+                expected_generation: condition.generation.clone(),
+                expected_revision: condition.revision,
+            })
+        });
+        if let Some(request) = &mut resource_request {
+            request.set_timeout(duration);
+        }
         let mut request = Request::new(proto::CheckpointIfGenerationRequest {
             checkpoint: Some(checkpoint),
-            expected_generation: physical.resource_generation,
+            expected_generation: source_generation,
         });
         // The caller passes the remaining operation budget. Do not add a new
         // transport allowance that would extend the user-visible deadline.
@@ -1920,15 +1957,28 @@ impl Sandboxd {
         *state = StartState::CheckpointUncertain;
         let action = OperationIntent::new(
             "checkpoint",
-            operations::fingerprint(request.get_ref())?,
+            match &resource_request {
+                Some(value) => operations::fingerprint(value.get_ref())?,
+                None => operations::fingerprint(request.get_ref())?,
+            },
             duration,
         )?;
         self.persist(runtime_id, &state, Some(action)).await?;
         let adapter = self.clone();
         let logical_id = runtime_id.to_owned();
         tokio::spawn(async move {
-            match client.checkpoint_if_generation(request).await {
-                Ok(response) if response.get_ref().success => {
+            let response = match resource_request {
+                Some(value) => client.checkpoint_if_resources(value).await,
+                None => client.checkpoint_if_generation(request).await,
+            };
+            match response {
+                Ok(response)
+                    if response.get_ref().success
+                        && resource_condition.as_ref().is_none_or(|condition| {
+                            response.get_ref().source_generation == condition.generation
+                                && response.get_ref().source_resource_revision == condition.revision
+                        }) =>
+                {
                     *state = StartState::Settled;
                     adapter.persist(&logical_id, &state, None).await?;
                     Ok(())

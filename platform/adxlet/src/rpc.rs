@@ -282,6 +282,12 @@ impl pb::node_service_server::NodeService for NodeRpc {
                             expected_revision: r.expected_revision,
                             ttl_seconds: r.ttl_seconds,
                             timeout_seconds: r.timeout_seconds,
+                            resources: r.resources.map(|value| {
+                                crate::checkpoint::CheckpointResources {
+                                    generation: value.generation,
+                                    revision: value.revision,
+                                }
+                            }),
                         })
                         .await
                         .map_err(status)?,

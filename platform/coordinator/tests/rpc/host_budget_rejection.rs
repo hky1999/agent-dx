@@ -176,6 +176,7 @@ impl Fixture {
                 expected_revision: record.revision,
                 ttl_seconds: 600,
                 timeout_seconds: 30,
+                resources: None,
             })
             .await
             .unwrap();
