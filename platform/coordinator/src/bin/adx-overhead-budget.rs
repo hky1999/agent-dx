@@ -1,8 +1,9 @@
 //! Private host administration; never expose the Redis configuration to tasks.
-use adx_coordinator::storage::{OverheadReservation, RedisStore};
+use adx_coordinator::storage::{OverheadArchive, OverheadReservation, RedisStore};
 use adx_core::execution::{ExecutionKind, ExecutionRequest};
 use serde::Deserialize;
 use std::{
+    collections::BTreeSet,
     io::Read,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -26,6 +27,12 @@ struct QueuedResume {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Command {
+    #[serde(default)]
+    archive: Option<OverheadArchive>,
+    #[serde(default)]
+    protected_ids: BTreeSet<String>,
+    #[serde(default)]
+    acceptance_sha256: String,
     #[serde(default)]
     queued_resume: Option<QueuedResume>,
     #[serde(default)]
@@ -56,6 +63,29 @@ async fn execute() -> Result<(), Box<dyn std::error::Error>> {
     let store =
         RedisStore::connect(&config.redis_url, &config.namespace, Duration::from_secs(5)).await?;
     let session = store.attach_overhead_session(command.epoch).await?;
+    if command.op == "archive_prepare" {
+        let archive = session
+            .prepare_overhead_archive(&command.protected_ids)
+            .await?;
+        println!(
+            "{}",
+            serde_json::json!({"archive_sha256":archive.sha256()?, "archive_json":archive.canonical_json()?, "archive":archive})
+        );
+        return Ok(());
+    }
+    if command.op == "archive_commit" {
+        let history = session
+            .archive_overhead(
+                command.archive.ok_or("archive required")?,
+                &command.acceptance_sha256,
+            )
+            .await?;
+        println!(
+            "{}",
+            serde_json::json!({"epoch":session.epoch(), "history":history})
+        );
+        return Ok(());
+    }
     if command.op == "queued_reserve" {
         let queued = command
             .queued_resume
@@ -149,7 +179,7 @@ async fn execute() -> Result<(), Box<dyn std::error::Error>> {
     };
     println!(
         "{}",
-        serde_json::json!({"environment":environment,"epoch":session.epoch(),"hosts":session.host_budgets().await?,"reservations":session.overhead_reservations().await?})
+        serde_json::json!({"environment":environment,"epoch":session.epoch(),"hosts":session.host_budgets().await?,"reservations":session.overhead_reservations().await?,"history":session.overhead_history().await?})
     );
     Ok(())
 }

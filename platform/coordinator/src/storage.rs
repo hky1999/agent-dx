@@ -2,6 +2,8 @@
 //! atomic hash writes; JSON and u64 counters are validated in Rust, never Lua doubles.
 mod budget;
 mod overhead;
+mod overhead_history;
+pub use overhead_history::{OverheadArchive, OverheadHistory};
 mod parking;
 pub use budget::{HostBudget, HostBudgetSnapshot, HostBudgetStatus, HostMemoryAccounts};
 pub use overhead::OverheadReservation;
@@ -82,6 +84,8 @@ struct Header {
     host_budgets: Option<BTreeMap<String, HostBudget>>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     overhead_budget: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    overhead_history: Option<OverheadHistory>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     parking_journals: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -91,6 +95,9 @@ struct Header {
 }
 impl Header {
     fn advance(&mut self) -> Result<()> {
+        if self.overhead_history.is_some() {
+            self.schema = self.schema.max(13);
+        }
         if self.queued_recovery {
             self.schema = self.schema.max(12);
         }
@@ -124,6 +131,7 @@ impl Header {
                 | (10, true)
                 | (11, true)
                 | (12, true)
+                | (13, true)
         ) || self.shards == 0
             || self.next_node_shard >= self.shards
             || self.epoch == 0
@@ -131,6 +139,14 @@ impl Header {
             return Err(Error::Unavailable(
                 "unsupported or corrupt control metadata".into(),
             ));
+        }
+        if let Some(history) = &self.overhead_history {
+            history.validate()?;
+            if self.schema < 13 || !self.overhead_budget {
+                return Err(Error::Conflict);
+            }
+        } else if self.schema == 13 {
+            return Err(Error::Conflict);
         }
         if self.queued_recovery && self.schema < 12 {
             return Err(Error::Conflict);
@@ -864,6 +880,7 @@ impl RedisStore {
                     next_node_shard: 0,
                     host_budgets: None,
                     overhead_budget: false,
+                    overhead_history: None,
                     parking_journals: false,
                     queued_recovery: false,
                     host_pressure_admission: BTreeMap::new(),

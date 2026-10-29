@@ -1432,3 +1432,82 @@ async fn host_budget_snapshot_versions_an_unconfigured_namespace_without_inventi
     assert!(value.revision > 0);
     assert!(value.budgets.is_empty());
 }
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn queued_restore_peak_rejects_archived_and_old_generation_ids_atomically() {
+    let (_rig, session) = queued_setup().await;
+    session
+        .reserve_overhead("old-peak", restore_peak())
+        .await
+        .unwrap();
+    session
+        .retire_overhead("old-peak", &"a".repeat(64), &"b".repeat(64))
+        .await
+        .unwrap();
+    let archive = session
+        .prepare_overhead_archive(&Default::default())
+        .await
+        .unwrap();
+    session
+        .archive_overhead(archive, &"c".repeat(64))
+        .await
+        .unwrap();
+    let request = execution_request(paused_execution(&session, "new").await);
+    let before = session.host_budgets().await.unwrap();
+    for id in ["old-peak", "unprefixed-new", "oh-0-new", "oh-2-new"] {
+        assert_eq!(
+            session
+                .authorize_execution_with_peak(
+                    request.clone(),
+                    "boot-first",
+                    1000,
+                    id,
+                    restore_peak()
+                )
+                .await,
+            Err(Error::Conflict)
+        );
+        assert_eq!(session.host_budgets().await.unwrap(), before);
+        assert!(session.get("new").await.unwrap().execution.is_none());
+    }
+    let grant = session
+        .authorize_execution_with_peak(
+            request.clone(),
+            "boot-first",
+            1000,
+            "oh-1-new",
+            restore_peak(),
+        )
+        .await
+        .unwrap();
+    session
+        .reserve_overhead("oh-1-other", restore_peak())
+        .await
+        .unwrap();
+    session
+        .retire_overhead("oh-1-other", &"a".repeat(64), &"d".repeat(64))
+        .await
+        .unwrap();
+    let next = session
+        .prepare_overhead_archive(&Default::default())
+        .await
+        .unwrap();
+    assert_eq!(next.reservations.len(), 1);
+    assert!(!next.reservations.contains_key("oh-1-new"));
+    session
+        .archive_overhead(next, &"e".repeat(64))
+        .await
+        .unwrap();
+    assert_eq!(
+        session
+            .authorize_execution_with_peak(request, "boot-first", 1500, "oh-1-new", restore_peak())
+            .await
+            .unwrap(),
+        grant
+    );
+    assert!(session
+        .retire_overhead("oh-1-new", &"a".repeat(64), &"f".repeat(64))
+        .await
+        .is_err());
+}

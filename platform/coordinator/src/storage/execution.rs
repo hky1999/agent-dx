@@ -229,7 +229,8 @@ impl Session {
                     .ok_or(Error::Conflict)?,
             };
             let peak_field = peak.as_ref().map(|(id, _)| format!("overhead:{id}"));
-            if let Some((_, reservation)) = &peak {
+            if let Some((id, reservation)) = &peak {
+                super::overhead_history::check_new_identity(&header, id)?;
                 let key = peak_field.as_ref().ok_or(Error::Conflict)?;
                 if raw.contains_key(key)
                     || raw.keys().filter(|k| k.starts_with("overhead:")).count() >= 512

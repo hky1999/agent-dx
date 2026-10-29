@@ -50,6 +50,19 @@ fn statuses(
     replacement: Option<&StoredEnvironment>,
 ) -> Result<BTreeMap<String, HostBudgetStatus>> {
     validate_budgets(budgets)?;
+    if let Some(history) = &raw
+        .get(HEADER)
+        .map(|v| decode::<Header>(v))
+        .transpose()?
+        .and_then(|h| h.overhead_history)
+    {
+        history.validate()?;
+        for id in &history.protected_ids {
+            if !raw.contains_key(&super::overhead::field(id)?) {
+                return Err(Error::Conflict);
+            }
+        }
+    }
     super::execution::validate_peak_links(raw, replacement)?;
     let mut out: BTreeMap<_, _> = budgets
         .iter()

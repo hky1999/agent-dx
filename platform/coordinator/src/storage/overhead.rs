@@ -86,6 +86,7 @@ impl Session {
                     Err(Error::Conflict)
                 };
             }
+            super::overhead_history::check_new_identity(&header, id)?;
             if header
                 .host_budgets
                 .as_ref()
