@@ -6,7 +6,7 @@ mod overhead_history;
 pub use overhead_history::{OverheadArchive, OverheadHistory};
 mod parking;
 pub use budget::{HostBudget, HostBudgetSnapshot, HostBudgetStatus, HostMemoryAccounts};
-pub use overhead::OverheadReservation;
+pub use overhead::{OverheadReservation, OverheadWithdrawal, OverheadWithdrawalFence};
 pub use parking::ParkingJournal;
 mod claims;
 pub use claims::{ClaimOutcome, LocalClaim};

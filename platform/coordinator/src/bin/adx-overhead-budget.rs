@@ -148,6 +148,20 @@ async fn execute() -> Result<(), Box<dyn std::error::Error>> {
         );
         return Ok(());
     }
+    if command.op == "withdraw_before_effect" {
+        let withdrawal = session
+            .withdraw_overhead_before_effect(
+                &command.id,
+                command.reservation.ok_or("original reservation required")?,
+                &command.retirement_proof_sha256,
+            )
+            .await?;
+        println!(
+            "{}",
+            serde_json::json!({"epoch":session.epoch(),"withdrawal":withdrawal,"hosts":session.host_budgets().await?,"reservations":session.overhead_reservations().await?,"history":session.overhead_history().await?})
+        );
+        return Ok(());
+    }
     match command.op.as_str() {
         "reserve" => {
             session

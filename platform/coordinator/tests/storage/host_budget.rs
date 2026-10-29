@@ -1105,6 +1105,15 @@ async fn queued_restore_peak_is_atomic_and_replays_original_deadline() {
             .await,
         Err(Error::Conflict)
     );
+    let before_withdrawal = session.revision().await.unwrap();
+    assert_eq!(
+        session
+            .withdraw_overhead_before_effect("peak-one", restore_peak(), &"b".repeat(64))
+            .await,
+        Err(Error::Conflict),
+        "an undispatched-intent attestation cannot free a pending restore peak"
+    );
+    assert_eq!(session.revision().await.unwrap(), before_withdrawal);
     session.commit(completed_execution(&grant)).await.unwrap();
     session
         .retire_overhead("peak-one", &"a".repeat(64), &"b".repeat(64))

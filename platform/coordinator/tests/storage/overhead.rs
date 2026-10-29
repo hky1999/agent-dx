@@ -441,3 +441,419 @@ async fn overhead_archive_protects_live_custody_predecessor_without_reopening_id
         .unwrap()
         .contains_key("cold-predecessor"));
 }
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn overhead_predispatch_withdrawal_closes_absent_reservation() {
+    let (_rig, session) = setup().await;
+    let original = hold(20, 32);
+    let result = session
+        .withdraw_overhead_before_effect("withdraw-absent", original.clone(), &"c".repeat(64))
+        .await;
+    assert!(
+        result.is_ok(),
+        "an absent pre-dispatch intent must be closed against a late reserve: {result:?}"
+    );
+    assert_eq!(
+        session.reserve_overhead("withdraw-absent", original).await,
+        Err(Error::Conflict)
+    );
+    assert_eq!(
+        session.host_budgets().await.unwrap()["host"].held,
+        Resources::default()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn overhead_withdrawal_replays_full_intent_but_rejects_changed_proof_or_owner() {
+    use adx_coordinator::storage::OverheadWithdrawalFence;
+    let (_rig, session) = setup().await;
+    let original = hold(20, 32);
+    session
+        .reserve_overhead("checkpoint-close", original.clone())
+        .await
+        .unwrap();
+    let first = session
+        .withdraw_overhead_before_effect("checkpoint-close", original.clone(), &"c".repeat(64))
+        .await
+        .unwrap();
+    assert_eq!(first.fence, OverheadWithdrawalFence::RetiredReservation);
+    let revision = session.revision().await.unwrap();
+    assert_eq!(
+        session
+            .withdraw_overhead_before_effect("checkpoint-close", original.clone(), &"c".repeat(64))
+            .await
+            .unwrap(),
+        first
+    );
+    assert_eq!(session.revision().await.unwrap(), revision);
+    let mut changed = original.clone();
+    changed.resources.memory_bytes += 1;
+    assert_eq!(
+        session
+            .withdraw_overhead_before_effect("checkpoint-close", changed, &"c".repeat(64))
+            .await,
+        Err(Error::Conflict)
+    );
+    let mut changed = original.clone();
+    changed.owner_sha256 = "d".repeat(64);
+    assert_eq!(
+        session
+            .withdraw_overhead_before_effect("checkpoint-close", changed, &"c".repeat(64))
+            .await,
+        Err(Error::Conflict)
+    );
+    assert_eq!(
+        session
+            .withdraw_overhead_before_effect("checkpoint-close", original.clone(), &"d".repeat(64))
+            .await,
+        Err(Error::Conflict)
+    );
+    assert_eq!(
+        session.reserve_overhead("checkpoint-close", original).await,
+        Err(Error::Conflict)
+    );
+    assert_eq!(
+        session.host_budgets().await.unwrap()["host"].held,
+        Resources::default()
+    );
+    assert_eq!(session.revision().await.unwrap(), revision);
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn overhead_withdrawal_never_needs_positive_capacity_or_changes_neighbors() {
+    let (_rig, session) = setup().await;
+    session
+        .reserve_overhead("full-host", hold(100, 128))
+        .await
+        .unwrap();
+    let before = session.host_budgets().await.unwrap();
+    let row = session.overhead_reservations().await.unwrap()["full-host"].clone();
+    assert_eq!(
+        session
+            .reserve_overhead("never-admitted", hold(20, 32))
+            .await,
+        Err(Error::NoCapacity)
+    );
+    session
+        .withdraw_overhead_before_effect("never-admitted", hold(20, 32), &"c".repeat(64))
+        .await
+        .unwrap();
+    assert_eq!(session.host_budgets().await.unwrap(), before);
+    assert_eq!(
+        session.overhead_reservations().await.unwrap()["full-host"],
+        row
+    );
+    assert_eq!(
+        session
+            .reserve_overhead("never-admitted", hold(20, 32))
+            .await,
+        Err(Error::Conflict)
+    );
+    assert_eq!(
+        session
+            .retire_overhead("still-absent", &"a".repeat(64), &"c".repeat(64))
+            .await,
+        Err(Error::NotFound),
+        "ordinary retirement keeps its existing missing-row contract"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn overhead_withdrawal_validates_before_creating_any_closure() {
+    let (_rig, session) = setup().await;
+    let revision = session.revision().await.unwrap();
+    let mut bad = hold(20, 32);
+    bad.host_id = "foreign".into();
+    assert_eq!(
+        session
+            .withdraw_overhead_before_effect("absent-invalid", bad, &"c".repeat(64))
+            .await,
+        Err(Error::Conflict)
+    );
+    let mut bad = hold(20, 32);
+    bad.retirement_proof_sha256 = Some("b".repeat(64));
+    assert_eq!(
+        session
+            .withdraw_overhead_before_effect("absent-invalid", bad, &"c".repeat(64))
+            .await,
+        Err(Error::Conflict)
+    );
+    assert_eq!(
+        session
+            .withdraw_overhead_before_effect("absent-invalid", hold(20, 32), "unknown")
+            .await,
+        Err(Error::Invalid("SHA256 required".into()))
+    );
+    assert!(session
+        .withdraw_overhead_before_effect("bad/id", hold(20, 32), &"c".repeat(64))
+        .await
+        .is_err());
+    assert_eq!(session.revision().await.unwrap(), revision);
+    assert!(session.overhead_reservations().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn overhead_withdrawal_wins_or_closes_concurrent_late_reserve() {
+    let (_rig, session) = setup().await;
+    for index in 0..8 {
+        let id = format!("late-intent-{index}");
+        let original = hold(20, 32);
+        let proof = "c".repeat(64);
+        let (late, closure) = tokio::join!(
+            session.reserve_overhead(&id, original.clone()),
+            session.withdraw_overhead_before_effect(&id, original.clone(), &proof)
+        );
+        assert!(matches!(late, Ok(()) | Err(Error::Conflict)), "{late:?}");
+        let receipt = closure.unwrap();
+        assert_eq!(receipt.reservation, original);
+        assert_eq!(receipt.reservation_id, id);
+        assert_eq!(
+            session.overhead_reservations().await.unwrap()[&id]
+                .retirement_proof_sha256
+                .as_deref(),
+            Some(proof.as_str())
+        );
+        assert_eq!(
+            session.reserve_overhead(&id, original).await,
+            Err(Error::Conflict)
+        );
+        assert_eq!(
+            session.host_budgets().await.unwrap()["host"].held,
+            Resources::default()
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn overhead_withdrawal_is_durable_across_aof_and_epoch_restart() {
+    let (mut rig, session) = setup().await;
+    let original = hold(20, 32);
+    let first = session
+        .withdraw_overhead_before_effect("durable-withdraw", original.clone(), &"c".repeat(64))
+        .await
+        .unwrap();
+    rig.crash();
+    rig.start().await;
+    let store = rig.store().await;
+    let attached = store
+        .attach_overhead_session(session.epoch())
+        .await
+        .unwrap();
+    assert_eq!(
+        attached
+            .withdraw_overhead_before_effect("durable-withdraw", original.clone(), &"c".repeat(64))
+            .await
+            .unwrap(),
+        first
+    );
+    assert_eq!(
+        attached
+            .reserve_overhead("durable-withdraw", original.clone())
+            .await,
+        Err(Error::Conflict)
+    );
+    let next = store.begin(1).await.unwrap();
+    let stale = session
+        .withdraw_overhead_before_effect("durable-withdraw", original.clone(), &"c".repeat(64))
+        .await;
+    assert!(matches!(
+        stale,
+        Err(Error::Conflict) | Err(Error::Unavailable(_))
+    ));
+    assert_eq!(
+        session
+            .withdraw_overhead_before_effect("durable-withdraw", original.clone(), &"c".repeat(64))
+            .await,
+        Err(Error::Conflict)
+    );
+    let replay = next
+        .withdraw_overhead_before_effect("durable-withdraw", original.clone(), &"c".repeat(64))
+        .await
+        .unwrap();
+    assert_eq!(replay.reservation, first.reservation);
+    assert_eq!(replay.epoch, next.epoch());
+    assert_ne!(replay.epoch, first.epoch);
+    assert_eq!(
+        next.reserve_overhead("durable-withdraw", original).await,
+        Err(Error::Conflict)
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn overhead_withdrawal_full_history_generation_stays_closed_after_archive() {
+    use adx_coordinator::storage::OverheadWithdrawalFence;
+    let (_rig, session) = setup().await;
+    session
+        .reserve_overhead("history-seed", hold(1, 1))
+        .await
+        .unwrap();
+    session
+        .retire_overhead("history-seed", &"a".repeat(64), &"b".repeat(64))
+        .await
+        .unwrap();
+    let seed = session
+        .prepare_overhead_archive(&Default::default())
+        .await
+        .unwrap();
+    session
+        .archive_overhead(seed, &"c".repeat(64))
+        .await
+        .unwrap();
+    for index in 0..512 {
+        let id = format!("oh-1-full-{index}");
+        session.reserve_overhead(&id, hold(1, 1)).await.unwrap();
+        session
+            .retire_overhead(&id, &"a".repeat(64), &"b".repeat(64))
+            .await
+            .unwrap();
+    }
+    let before = session.overhead_reservations().await.unwrap();
+    let revision = session.revision().await.unwrap();
+    let id = "oh-1-absent-original";
+    let proof = "d".repeat(64);
+    let closed = session
+        .withdraw_overhead_before_effect(id, hold(20, 32), &proof)
+        .await
+        .unwrap();
+    assert_eq!(closed.fence, OverheadWithdrawalFence::FullHistoryGeneration);
+    assert_eq!(closed.history_generation, Some(1));
+    assert_eq!(session.revision().await.unwrap(), revision);
+    assert_eq!(session.overhead_reservations().await.unwrap(), before);
+    assert_eq!(
+        session.reserve_overhead(id, hold(20, 32)).await,
+        Err(Error::NoCapacity)
+    );
+    let archive = session
+        .prepare_overhead_archive(&Default::default())
+        .await
+        .unwrap();
+    session
+        .archive_overhead(archive, &"e".repeat(64))
+        .await
+        .unwrap();
+    assert_eq!(
+        session.reserve_overhead(id, hold(20, 32)).await,
+        Err(Error::Conflict)
+    );
+    let replay = session
+        .withdraw_overhead_before_effect(id, hold(20, 32), &proof)
+        .await
+        .unwrap();
+    assert_eq!(replay.fence, OverheadWithdrawalFence::PastHistoryGeneration);
+    assert_eq!(replay.history_generation, Some(2));
+    assert!(session.overhead_reservations().await.unwrap().is_empty());
+    for invalid in [
+        "oh-3-future",
+        "oh-02-leading",
+        "oh-0-zero",
+        "legacy-unknown",
+        "oh-1-",
+    ] {
+        assert_eq!(
+            session
+                .withdraw_overhead_before_effect(invalid, hold(20, 32), &proof)
+                .await,
+            Err(Error::Conflict)
+        );
+    }
+    session
+        .reserve_overhead("oh-2-next", hold(20, 32))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn overhead_withdrawal_full_legacy_table_does_not_claim_future_identity_closed() {
+    let (_rig, session) = setup().await;
+    for index in 0..512 {
+        let id = format!("legacy-full-{index}");
+        session.reserve_overhead(&id, hold(1, 1)).await.unwrap();
+        session
+            .retire_overhead(&id, &"a".repeat(64), &"b".repeat(64))
+            .await
+            .unwrap();
+    }
+    let revision = session.revision().await.unwrap();
+    assert_eq!(
+        session
+            .withdraw_overhead_before_effect("oh-900-future", hold(20, 32), &"c".repeat(64))
+            .await,
+        Err(Error::NoCapacity)
+    );
+    assert_eq!(session.revision().await.unwrap(), revision);
+    assert_eq!(session.overhead_reservations().await.unwrap().len(), 512);
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn overhead_withdrawal_cli_closes_original_intent_without_advancing_epoch() {
+    use std::process::{Command, Stdio};
+    let (rig, session) = setup().await;
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config.json");
+    std::fs::write(
+        &config,
+        serde_json::to_vec(&serde_json::json!({
+            "redis_url": rig.url, "namespace": "test"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let original = hold(20, 32);
+    let command = serde_json::json!({
+        "op":"withdraw_before_effect", "epoch":session.epoch(),
+        "id":"cli-original", "reservation":original, "retirement_proof_sha256":"c".repeat(64)
+    });
+    let before_epoch = session.epoch();
+    let mut process = Command::new(env!("CARGO_BIN_EXE_adx-overhead-budget"))
+        .arg("--config")
+        .arg(config)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(
+        &mut process.stdin.take().unwrap(),
+        &serde_json::to_vec(&command).unwrap(),
+    )
+    .unwrap();
+    let output = process.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["epoch"], before_epoch);
+    assert_eq!(result["withdrawal"]["fence"], "retired_reservation");
+    assert_eq!(
+        result["withdrawal"]["reservation"],
+        serde_json::to_value(&original).unwrap()
+    );
+    assert_eq!(
+        result["reservations"]["cli-original"]["retirement_proof_sha256"],
+        "c".repeat(64)
+    );
+    assert_eq!(
+        session.reserve_overhead("cli-original", original).await,
+        Err(Error::Conflict)
+    );
+    assert_eq!(
+        rig.store()
+            .await
+            .attach_overhead_session(before_epoch)
+            .await
+            .unwrap()
+            .epoch(),
+        before_epoch
+    );
+}

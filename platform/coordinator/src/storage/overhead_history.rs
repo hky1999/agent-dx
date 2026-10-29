@@ -115,7 +115,7 @@ impl OverheadArchive {
     }
 }
 
-fn identity_generation(id: &str) -> Result<Option<u64>> {
+pub(super) fn identity_generation(id: &str) -> Result<Option<u64>> {
     let Some((generation, suffix)) = id.strip_prefix("oh-").and_then(|s| s.split_once('-')) else {
         return Ok(None);
     };
