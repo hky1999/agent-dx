@@ -165,16 +165,17 @@ impl Controller {
         };
         // Sandboxd accepts whole seconds. Share the workload-checkpoint
         // rounding contract so a positive subsecond remainder never becomes 0.
-        let captured = match super::workload_checkpoint::remaining_backend_timeout(Some(deadline)) {
-            Ok(timeout) => {
-                self.services
-                    .runtime
-                    .checkpoint_running(&self.record.runtime.id, &staged, timeout)
-                    .await
+        let captured =
+            match super::workload_checkpoint::remaining_backend_timeout(Some(deadline)) {
+                Ok(timeout) => {
+                    self.services
+                        .runtime
+                        .checkpoint_running(&self.record.runtime.id, &staged, timeout)
+                        .await
+                }
+                Err(error) => Err(error),
             }
-            Err(error) => Err(error),
-        }
-        .map_err(|error| step_error("runtime-capture", error));
+            .map_err(|error| step_error("runtime-capture", error));
         let captured = match captured {
             Ok(()) => services
                 .cooperation
