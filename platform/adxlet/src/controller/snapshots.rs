@@ -4,9 +4,46 @@ use adx_core::{
     snapshots::{snapshot_id, Snapshot, SnapshotState},
     LifecycleKind,
 };
-use std::time::Duration;
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    time::Duration,
+};
+use tokio::time::Instant;
+
+fn publication_jitter_ms(environment_id: &str, generation: u64) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    environment_id.hash(&mut hasher);
+    generation.hash(&mut hasher);
+    hasher.finish() % 17
+}
 
 impl Controller {
+    async fn publish_snapshot_state(&mut self, deadline: Instant) -> Result<OperationResult> {
+        let mut delay_ms = 10_u64;
+        let jitter_ms =
+            publication_jitter_ms(&self.record.spec.id, self.record.assignment.generation);
+        loop {
+            if Instant::now() >= deadline {
+                return Err(Error::Unavailable(
+                    "snapshot state publication timed out".into(),
+                ));
+            }
+            let result = tokio::time::timeout_at(deadline, self.sync())
+                .await
+                .map_err(|_| Error::Unavailable("snapshot state publication timed out".into()))??;
+            if result.durability == Durability::Published {
+                return Ok(result);
+            }
+            // Journaled is durable locally, but cannot authorize a reusable
+            // snapshot. Republish the same record; never repeat capture or
+            // advance its revision while waiting for Coordinator acceptance.
+            let delay = Duration::from_millis(delay_ms + jitter_ms);
+            tokio::time::sleep_until(deadline.min(Instant::now() + delay)).await;
+            delay_ms = (delay_ms * 2).min(250);
+        }
+    }
+
     pub(super) async fn snapshot(&mut self, request: SnapshotRequest) -> Result<SnapshotResult> {
         let id = snapshot_id(
             &self.record.spec.tenant_id,
@@ -19,6 +56,7 @@ impl Controller {
         {
             return Err(Error::Conflict);
         }
+        let deadline = Instant::now() + Duration::from_secs(request.timeout_seconds);
         let services = self
             .services
             .checkpoint
@@ -40,12 +78,7 @@ impl Controller {
                 {
                     return Err(Error::Conflict);
                 }
-                let environment = self.sync().await?;
-                if environment.durability != Durability::Published {
-                    return Err(Error::Unavailable(
-                        "snapshot source publication pending".into(),
-                    ));
-                }
+                let environment = self.publish_snapshot_state(deadline).await?;
                 return Ok(SnapshotResult {
                     snapshot,
                     environment,
@@ -94,11 +127,7 @@ impl Controller {
             }
         }
         self.record.revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
-        if self.sync().await?.durability != Durability::Published {
-            return Err(Error::Unavailable(
-                "capture input reservation publication pending".into(),
-            ));
-        }
+        self.publish_snapshot_state(deadline).await?;
         if let Err(error) = services
             .cooperation
             .prepare(&self.record, &request.operation_id)
@@ -134,16 +163,18 @@ impl Controller {
             );
             error
         };
-        let captured = self
-            .services
-            .runtime
-            .checkpoint_running(
-                &self.record.runtime.id,
-                &staged,
-                Duration::from_secs(request.timeout_seconds),
-            )
-            .await
-            .map_err(|error| step_error("runtime-capture", error));
+        // Sandboxd accepts whole seconds. Share the workload-checkpoint
+        // rounding contract so a positive subsecond remainder never becomes 0.
+        let captured = match super::workload_checkpoint::remaining_backend_timeout(Some(deadline)) {
+            Ok(timeout) => {
+                self.services
+                    .runtime
+                    .checkpoint_running(&self.record.runtime.id, &staged, timeout)
+                    .await
+            }
+            Err(error) => Err(error),
+        }
+        .map_err(|error| step_error("runtime-capture", error));
         let captured = match captured {
             Ok(()) => services
                 .cooperation
@@ -173,7 +204,7 @@ impl Controller {
             self.hold_artifact(captured, original);
         }
         self.record.revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
-        self.sync()
+        self.publish_snapshot_state(deadline)
             .await
             .map_err(|error| step_error("capture-state-commit", error))?;
         snapshot.artifact = services
@@ -191,17 +222,9 @@ impl Controller {
             .map_err(|error| step_error("prepare-artifact-hold", error))?;
         self.hold_artifact(snapshot.artifact.clone(), access);
         self.record.revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
-        if self
-            .sync()
+        self.publish_snapshot_state(deadline)
             .await
-            .map_err(|error| step_error("artifact-hold-commit", error))?
-            .durability
-            != Durability::Published
-        {
-            return Err(Error::Unavailable(
-                "snapshot input reference publication pending".into(),
-            ));
-        }
+            .map_err(|error| step_error("artifact-hold-commit", error))?;
         let snapshot = catalog.publish(snapshot.clone()).await?;
         services.store.committed(&snapshot.artifact).await?;
         if !retains_capture {
@@ -217,12 +240,7 @@ impl Controller {
             LifecycleKind::Snapshot,
         );
         self.durability = None;
-        let environment = self.sync().await?;
-        if environment.durability != Durability::Published {
-            return Err(Error::Unavailable(
-                "snapshot source publication pending".into(),
-            ));
-        }
+        let environment = self.publish_snapshot_state(deadline).await?;
         Ok(SnapshotResult {
             snapshot,
             environment,
@@ -278,5 +296,41 @@ impl super::Controller {
             origin: Some(origin),
         });
         self.create().await
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+
+    #[test]
+    fn publication_jitter_distinguishes_environments_with_the_same_generation() {
+        let values: std::collections::BTreeSet<_> = (0..64)
+            .map(|index| publication_jitter_ms(&format!("environment-{index}"), 1))
+            .collect();
+        assert!(values.len() > 1);
+        assert!(values.iter().all(|value| *value < 17));
+        assert_eq!(
+            publication_jitter_ms("environment-a", 1),
+            publication_jitter_ms("environment-a", 1)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn capture_budget_rounds_up_without_reviving_an_expired_deadline() {
+        use super::super::workload_checkpoint::remaining_backend_timeout;
+        let now = Instant::now();
+        assert_eq!(
+            remaining_backend_timeout(Some(now + Duration::from_millis(1))).unwrap(),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            remaining_backend_timeout(Some(now + Duration::from_millis(1500))).unwrap(),
+            Duration::from_secs(2)
+        );
+        assert!(matches!(
+            remaining_backend_timeout(Some(now)),
+            Err(Error::Unavailable(_))
+        ));
     }
 }
